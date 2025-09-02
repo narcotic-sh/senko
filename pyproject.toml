@@ -1,0 +1,150 @@
+[build-system]
+requires = ["scikit-build-core"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "senko"
+version = "0.1.0"
+description = "Very fast speaker diarization"
+readme = "README.md"
+requires-python = ">=3.9,<3.12" # Have only tested with 3.11.13 but probably works fine for all versions in this range
+license = "MIT"
+license-files = ["LICENSE", "THIRD_PARTY_LICENSES"]
+authors = [
+    {name = "Hamza Qayyum", email = "mhamzaqayyum@icloud.com"}
+]
+
+keywords = [
+    "speaker-diarization",
+    "audio-processing",
+    "speech-processing",
+    "voice-activity-detection",
+    "speaker-verification",
+    "speech-analysis",
+    "cuda",
+    "gpu",
+    "machine-learning",
+    "audio-ai",
+    "pyannote",
+    "silero-vad",
+    "speaker-embeddings"
+]
+
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Education",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: C++",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+    "Topic :: Multimedia :: Sound/Audio :: Analysis",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Environment :: GPU :: NVIDIA CUDA",
+]
+
+dependencies = [
+    "numpy",
+    "scikit-learn",
+    "umap-learn",
+    "hdbscan",
+    "numba",
+    "llvmlite",
+    "pyyaml",
+    "soundfile",
+    "torch",
+    "silero-vad",
+    "termcolor",
+    "psutil",
+    "colour-science"
+]
+
+[project.optional-dependencies]
+# CUDA 12 capable driver + CUDA compute capability < 7.5
+nvidia-old = [
+    "torchaudio",
+    "pyannote.audio"
+]
+
+# CUDA 12 capable driver + CUDA compute capability >= 7.5
+nvidia = [
+    "torchaudio",
+    "pyannote.audio",
+    "cudf-cu12==25.8.*",
+    "dask-cudf-cu12==25.8.*",
+    "cuml-cu12==25.8.*",
+    "cugraph-cu12==25.8.*",
+    "nx-cugraph-cu12==25.8.*",
+    "cuxfilter-cu12==25.8.*",
+    "cucim-cu12==25.8.*",
+    "pylibraft-cu12==25.8.*",
+    "raft-dask-cu12==25.8.*",
+    "cuvs-cu12==25.8.*"
+]
+
+[project.urls]
+Homepage = "https://github.com/narcotic-sh/senko"
+Repository = "https://github.com/narcotic-sh/senko"
+Issues = "https://github.com/narcotic-sh/senko/issues"
+
+[tool.scikit-build]
+minimum-version = "0.10"
+wheel.packages = ["senko"]                  # where python source code is located to include in built wheel
+cmake.source-dir = "."                      # dir where CMakeLists.txt is located (project root)
+cmake.build-type = "Release"
+build-dir = "build"                         # dir where CMake will place build artifacts during compilation
+wheel.exclude = ["senko/fbank_extractor"]   # exclude C++ source files from the wheel since they get compiled into binary
+
+[tool.scikit-build.editable]
+mode = "redirect"                           # creates a .pth file pointing to senko/ for editable installs
+
+[tool.scikit-build.cmake.define]
+CMAKE_CXX_STANDARD = "20"
+CMAKE_CXX_STANDARD_REQUIRED = "ON"
+
+# PyTorch CUDA 12.9
+[[tool.uv.index]]
+name = "pytorch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
+explicit = true
+
+# PyTorch CUDA 12.6
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+# NVIDIA RAPIDS package index
+[[tool.uv.index]]
+name = "nvidia-rapids"
+url = "https://pypi.nvidia.com"
+explicit = true
+
+[tool.uv.sources]
+# Override torch/torchaudio for:
+#   nvidia -> use CUDA 12.9 torch
+#   nvidia-old -> use CUDA 12.6 torch
+torch = [
+    { marker = "extra == 'nvidia'", index = "pytorch-cu129" },
+    { marker = "extra != 'nvidia' and extra == 'nvidia-old'", index = "pytorch-cu126" },
+]
+torchaudio = [
+    { marker = "extra == 'nvidia'", index = "pytorch-cu129" },
+    { marker = "extra != 'nvidia' and extra == 'nvidia-old'", index = "pytorch-cu126" },
+]
+
+# RAPIDS packages
+cudf-cu12 = { index = "nvidia-rapids" }
+dask-cudf-cu12 = { index = "nvidia-rapids" }
+cuml-cu12 = { index = "nvidia-rapids" }
+cugraph-cu12 = { index = "nvidia-rapids" }
+nx-cugraph-cu12 = { index = "nvidia-rapids" }
+cuxfilter-cu12 = { index = "nvidia-rapids" }
+cucim-cu12 = { index = "nvidia-rapids" }
+pylibraft-cu12 = { index = "nvidia-rapids" }
+raft-dask-cu12 = { index = "nvidia-rapids" }
+cuvs-cu12 = { index = "nvidia-rapids" }

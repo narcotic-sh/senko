@@ -1,0 +1,11 @@
+# Adapted from https://github.com/modelscope/3D-Speaker/blob/main/egs/3dspeaker/speaker-diarization/conf/diar.yaml
+
+cluster:
+  args:
+    cluster_type: umap_hdbscan
+    mer_cos: 0.875
+    n_neighbors: 40
+    n_components: 60
+    min_samples: 20
+    min_cluster_size: 10
+    metric: 'cosine'

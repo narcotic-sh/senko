@@ -1,0 +1,11 @@
+# Adapted from https://github.com/modelscope/3D-Speaker/blob/main/egs/3dspeaker/speaker-diarization/conf/diar.yaml
+
+cluster:
+  args:
+    cluster_type: spectral
+    mer_cos: 0.875
+    min_num_spks: 1
+    max_num_spks: 15
+    min_cluster_size: 4
+    oracle_num: null
+    pval: 0.012
