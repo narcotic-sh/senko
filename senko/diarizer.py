@@ -291,6 +291,9 @@ class Diarizer:
 
         big_tensor = torch.from_numpy(features_flat).to(self.device)
 
+        # Convert subsegment_offsets to integers for slicing
+        subsegment_offsets = [int(offset) for offset in subsegment_offsets]
+
         feature_tensors = []
         for i, (frames, offset) in enumerate(zip(frames_per_subsegment, subsegment_offsets)):
             if frames == 0:
