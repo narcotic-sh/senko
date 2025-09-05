@@ -11,16 +11,16 @@ This pipeline is used in the [Zanshin](https://github.com/narcotic-sh/zanshin) m
 
 ## Usage
 ```python
-from senko import Diarizer
+import senko
 import json
 
-diarizer = Diarizer(torch_device='auto', warmup=True, quiet=False)
+diarizer = senko.Diarizer(torch_device='auto', warmup=True, quiet=False)
 result = diarizer.diarize('audio.wav', generate_colors=False) # 16kHz mono 16-bit wav
 
 with open('./audio_diarized.json', 'w') as f:
     json.dump(result["merged_segments"], f, indent=2)
 ```
-See `examples/diarize.py` and `DOCS.md`.
+See `examples/diarize.py` for an interactive script, and also read `DOCS.md`.
 
 ## Installation
 Senko has been tested to work on Linux, macOS, and WSL, with Python version `3.11.13`.
