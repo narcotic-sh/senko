@@ -11,8 +11,7 @@ This pipeline is used in the [Zanshin](https://github.com/narcotic-sh/zanshin) m
 
 ## Usage
 ```python
-import senko
-import json
+import senko, json
 
 diarizer = senko.Diarizer(torch_device='auto', warmup=True, quiet=False)
 result = diarizer.diarize('audio.wav', generate_colors=False) # 16kHz mono 16-bit wav
