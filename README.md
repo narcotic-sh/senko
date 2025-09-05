@@ -83,7 +83,7 @@ As for <code>mps</code>, the only part of the pipeline that runs on the GPU is t
 <details>
 <summary>Known limitations?</summary>
 <br>
-- The pipeline works best when the audio recording quality is good. Ideal setting: professional podcast studio. Heavy background noise, background music, or a generally low fidelity recording will degrade the diarization performance significantly.
+- The pipeline works best when the audio recording quality is good. Ideal setting: professional podcast studio. Heavy background noise, background music, or a generally low fidelity recording will degrade the diarization performance significantly. Note that it's also possible to have generally good recording quality but still low fidelity recorded voice quality; an example is <a href="https://www.youtube.com/watch?v=89K8-4tHhgc">this</a>.
 <br><br>
 - It is rare but possible that voices that sound very similar get clustered as one voice. This can happen if the voices are genuinely extremely similar, or, more commonly, if the audio recording fidelity is low.
 <br><br>
