@@ -2,8 +2,8 @@
 
 ### `Diarizer`
 ```python
-from senko import Diarizer
-diarizer = Diarizer(torch_device='auto', warmup=True, quiet=True)
+import senko
+diarizer = senko.Diarizer(torch_device='auto', warmup=True, quiet=True)
 ```
 - `torch_device`: Device to use for PyTorch operations (`auto`, `cuda`, `mps`, `cpu`)
     - `auto` automatically selects `cuda` if available, if not, then `mps` (Apple Silicon), if not, then `cpu`
@@ -16,7 +16,7 @@ diarizer = Diarizer(torch_device='auto', warmup=True, quiet=True)
 result_data = diarizer.diarize(wav_path='audio.wav', generate_colors=False)
 ```
 #### Parameters
-- `wav_path`: Path to the audio file (16 KHz mono WAV format)
+- `wav_path`: Path to the audio file (16kHz mono 16-bit WAV format)
 - `generate_colors`: Whether to generate speaker color sets for visualization
 
 #### Returns
@@ -37,10 +37,12 @@ Dictionary (`result_data`) containing keys:
     - Keys: `total_time`, `vad_time`, `fbank_time`, `embeddings_time`, `clustering_time`
 - `speaker_color_sets`: 10 sets of speaker colors (if requested)
 
+#### Raises
+- `senko.AudioFormatError` if audio file is not in the required 16kHz mono 16-bit WAV format
+
 ### `speaker_similarity()`
 ```python
-from senko import speaker_similarity
-if speaker_similarity(centroid1, centroid2) >= 0.875:
+if senko.speaker_similarity(centroid1, centroid2) >= 0.875:
     print('Speakers are the same')
 ```
 Calculate cosine similarity between two speaker centroids (voice fingerprints).

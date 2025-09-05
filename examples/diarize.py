@@ -4,9 +4,9 @@
 
 import os
 import json
+import senko
 import argparse
 from pathlib import Path
-from senko import Diarizer, speaker_similarity
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Senko example diarization script')
@@ -16,7 +16,7 @@ if __name__ == '__main__':
                        help='Torch device to use for processing (default: auto)')
     args = parser.parse_args()
 
-    diarizer = Diarizer(torch_device=args.device, warmup=True, quiet=False)
+    diarizer = senko.Diarizer(torch_device=args.device, warmup=True, quiet=False)
     print("Diarizer warmed up and ready!\n")
 
     while True:
@@ -37,8 +37,8 @@ if __name__ == '__main__':
         try:
             # Run diarization
             result_data = diarizer.diarize(wav_path, generate_colors=True)
-            if result_data is None:
-                print("No speakers detected in the audio!")
+
+            if result_data is None: # No speakers detected
                 continue
 
             # Extract everything diarize() returns (for demonstration)
@@ -51,7 +51,7 @@ if __name__ == '__main__':
             speaker_color_sets = result_data["speaker_color_sets"]
 
             # Compute cosine similarity between two speakers like this
-            # similarity = speaker_similarity(centroids['SPEAKER_01'], centroids['SPEAKER_02'])
+            # similarity = senko.speaker_similarity(centroids['SPEAKER_01'], centroids['SPEAKER_02'])
 
             # Create result directory if it doesn't exist
             result_dir = Path("./result")
@@ -67,6 +67,11 @@ if __name__ == '__main__':
                     "merged_segments": merged_segments,
                     "speaker_color_sets": speaker_color_sets
                 }, f, indent=2)
+
+
+        except senko.AudioFormatError:
+            # Error message already printed by diarizer
+            continue
 
         except Exception as e:
             print(f"Error processing file: {str(e)}")

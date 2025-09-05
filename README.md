@@ -15,7 +15,7 @@ from senko import Diarizer
 import json
 
 diarizer = Diarizer(torch_device='auto', warmup=True, quiet=False)
-result = diarizer.diarize('audio.wav', generate_colors=False) # 16 KHz mono wav
+result = diarizer.diarize('audio.wav', generate_colors=False) # 16kHz mono 16-bit wav
 
 with open('./audio_diarized.json', 'w') as f:
     json.dump(result["merged_segments"], f, indent=2)

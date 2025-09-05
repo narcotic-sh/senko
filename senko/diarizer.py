@@ -11,6 +11,7 @@ warnings.filterwarnings("ignore", message=".*torio.io._streaming_media_decoder.S
 import os
 import yaml
 import time
+import wave
 import torch
 import ctypes
 import psutil
@@ -20,6 +21,10 @@ from termcolor import colored
 from . import paths
 from .colors import generate_speaker_colors
 from .utils import time_method, suppress_stdout, timed_operation
+
+class AudioFormatError(Exception):
+    """Raised when audio file is not in the required 16kHz mono 16-bit WAV format"""
+    pass
 
 class Diarizer:
     def __init__(self, torch_device='auto', warmup=True, quiet=True):
@@ -158,11 +163,26 @@ class Diarizer:
         # Print filename
         self._print(f"\n    \033[38;2;120;167;214m{os.path.basename(wav_path)}\033[0m")
 
+        # Verify correct format (16kHz mono 16-bit WAV)
+        with wave.open(wav_path, 'rb') as wav_file:
+            channels = wav_file.getnchannels()
+            sample_rate = wav_file.getframerate()
+            bit_depth = wav_file.getsampwidth() * 8  # getsampwidth returns bytes, multiply by 8 for bits
+
+            if channels != 1 or sample_rate != 16000 or bit_depth != 16:
+                error_msg = f"\tError: Audio file must be 16kHz mono 16-bit WAV format.\n"
+                error_msg += f"\tCurrent format: {sample_rate}Hz, {channels} channel(s), {bit_depth}-bit\n\n"
+                error_msg += "\tTo convert your file to the correct format, run:\n"
+                error_msg += f"\tffmpeg -i {wav_path} -acodec pcm_s16le -ac 1 -ar 16000 {os.path.splitext(wav_path)[0]}_mono.wav\n"
+                self._print(colored(error_msg, 'red'))
+                raise AudioFormatError(f"Audio file must be 16kHz mono 16-bit WAV format. Current: {sample_rate}Hz, {channels} channel(s), {bit_depth}-bit")
+
         # VAD (voice activity detection)
         vad_segments = self._perform_vad(wav_path)
 
         if not vad_segments:
-            return None  # No speech detected
+            self._print(colored("\n    No speakers detected in the audio!\n", 'yellow'))
+            return None
 
         # Generate subsegments
         subsegments = self._generate_subsegments(vad_segments)
