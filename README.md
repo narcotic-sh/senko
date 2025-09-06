@@ -19,12 +19,21 @@ result = diarizer.diarize('audio.wav', generate_colors=False) # 16kHz mono 16-bi
 with open('./audio_diarized.json', 'w') as f:
     json.dump(result["merged_segments"], f, indent=2)
 ```
-See `examples/diarize.py` for an interactive script, and also read `DOCS.md`.
+See `examples/diarize.py` for an interactive script, and also read `DOCS.md`
 
 ## Installation
 Senko has been tested to work on Linux, macOS, and WSL, with Python version `3.11.13`.
 
-The official install method is using [uv](https://docs.astral.sh/uv/#installation). Have `clang` installed as well if on Linux/WSL.
+Pre-requisites:
+- `clang` - on Linux/WSL, a seperate install; on macOS, have the Xcode Developer Tools installed
+- [`uv`](https://docs.astral.sh/uv/#installation)
+
+Create a Python virtual environment and activate it
+```
+uv venv --python 3.11.13 .venv
+source .venv/bin/activate
+```
+Then install Senko
 ```bash
 # For NVIDIA GPUs with CUDA compute capability >= 7.5 (~GTX 16 series and newer)
 uv pip install "git+https://github.com/narcotic-sh/senko.git[nvidia]"
