@@ -1,7 +1,9 @@
 import os
 import sys
 import time
+import json
 import numpy as np
+from pathlib import Path
 from termcolor import colored
 from contextlib import contextmanager
 
@@ -32,6 +34,7 @@ def time_method(stats_key, stage_name=None, last=False):
         return wrapper
     return decorator
 
+
 @contextmanager
 def suppress_stdout():
     with open(os.devnull, "w") as devnull:
@@ -41,6 +44,7 @@ def suppress_stdout():
             yield
         finally:
             sys.stdout = old_stdout
+
 
 @contextmanager
 def timed_operation(description, quiet=False):
@@ -53,6 +57,7 @@ def timed_operation(description, quiet=False):
         if not quiet:
             elapsed = time.time() - start_time
             print(colored(" done", 'green'), colored(f"[{elapsed:.1f}s]", 'dark_grey'))
+
 
 def speaker_similarity(centroid1, centroid2):
     # Ensure inputs are numpy arrays
@@ -72,3 +77,18 @@ def speaker_similarity(centroid1, centroid2):
 
     # Clamp to [-1, 1] to handle floating point errors
     return np.clip(similarity, -1.0, 1.0)
+
+
+def save_json(segments, output_path):
+    with open(output_path, 'w') as f:
+        json.dump(segments, f, indent=2)
+
+
+def save_rttm(segments, wav_path, output_path):
+    file_id = Path(wav_path).stem
+    with open(output_path, 'w') as f:
+        for segment in segments:
+            duration = segment['end'] - segment['start']
+            # RTTM format: SPEAKER file_id channel start duration <NA> <NA> speaker_id <NA> <NA>
+            rttm_line = f"SPEAKER {file_id} 1 {segment['start']:.3f} {duration:.3f} <NA> <NA> {segment['speaker']} <NA> <NA>\n"
+            f.write(rttm_line)

@@ -14,10 +14,13 @@ This pipeline is used in the [Zanshin](https://github.com/narcotic-sh/zanshin) m
 import senko, json
 
 diarizer = senko.Diarizer(torch_device='auto', warmup=True, quiet=False)
-result = diarizer.diarize('audio.wav', generate_colors=False) # 16kHz mono 16-bit wav
 
-with open('./audio_diarized.json', 'w') as f:
-    json.dump(result["merged_segments"], f, indent=2)
+wav_path = 'audio.wav'  # 16kHz mono 16-bit wav
+
+result = diarizer.diarize(wav_path, generate_colors=False)
+
+senko.save_json(result["merged_segments"], 'audio_diarized.json')
+senko.save_rttm(result["merged_segments"], wav_path, 'audio_diarized.rttm')
 ```
 See `examples/diarize.py` for an interactive script, and also read `DOCS.md`
 

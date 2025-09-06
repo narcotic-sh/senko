@@ -16,3 +16,6 @@ result/
 *.mp3
 
 **/CLAUDE.md
+
+*.json
+*.rttm

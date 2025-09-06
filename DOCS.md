@@ -53,6 +53,27 @@ Calculate cosine similarity between two speaker centroids (voice fingerprints).
 #### Returns
 - `float`: Cosine similarity score between -1 and 1 (<1 rarely if ever happens with speaker embeddings)
 
+### `save_json()`
+```python
+senko.save_json(segments, output_path)
+```
+Save diarization segments to a JSON file.
+#### Parameters
+- `segments`: List of segment dictionaries with keys `start`, `end`, `speaker`
+  - Typically `result["raw_segments"]` or `result["merged_segments"]` from `diarize()`
+- `output_path`: Path where the JSON file will be saved
+
+### `save_rttm()`
+```python
+senko.save_rttm(segments, wav_path, output_path)
+```
+Save diarization segments in RTTM (Rich Transcription Time Marked) format, compatible with standard diarization evaluation tools.
+#### Parameters
+- `segments`: List of segment dictionaries with keys `start`, `end`, `speaker`
+  - Typically `result["raw_segments"]` or `result["merged_segments"]` from `diarize()`
+- `wav_path`: Path to the original audio file (used to extract file ID for RTTM format)
+- `output_path`: Path where the RTTM file will be saved
+
 ### Output Format
 Speaker segments (`raw_segments`/`merged_segments`):
 ```
