@@ -27,7 +27,7 @@ class AudioFormatError(Exception):
     pass
 
 class Diarizer:
-    def __init__(self, torch_device='auto', vad='auto', warmup=True, quiet=True):
+    def __init__(self, torch_device='auto', vad='auto', clustering='auto', warmup=True, quiet=True):
 
         self.quiet = quiet
         self.logical_cores = psutil.cpu_count(logical=True)
@@ -142,7 +142,27 @@ class Diarizer:
             self.spectral_config = yaml.safe_load(spectral_yaml)
             self.umap_config = yaml.safe_load(umap_hdbscan_yaml)
 
-            if self.device.type == 'cuda' and torch.cuda.get_device_capability()[0] >= 7:  # GPUs with CUDA compute capability < 7.0 will have Pyannote do VAD but clustering will be on CPU
+            # Determine clustering location based on parameter or auto-selection
+            if self.device.type != 'cuda':
+                # Non-CUDA devices always use CPU clustering
+                use_gpu_clustering = False
+            else:
+                # CUDA devices can choose between GPU and CPU clustering
+                cuda_compute_capable = torch.cuda.get_device_capability()[0] >= 7
+                if clustering == 'auto':
+                    use_gpu_clustering = cuda_compute_capable
+                elif clustering.lower() == 'gpu':
+                    if cuda_compute_capable:
+                        use_gpu_clustering = True
+                    else:
+                        self._print(f"Warning: GPU clustering requested but CUDA compute capability < 7.0. Falling back to CPU clustering.")
+                        use_gpu_clustering = False
+                elif clustering.lower() == 'cpu':
+                    use_gpu_clustering = False
+                else:
+                    raise ValueError(f"Invalid clustering type: {clustering}. Must be 'auto', 'gpu', or 'cpu'")
+
+            if use_gpu_clustering:
                 from .cluster.cluster_gpu import CommonClustering as ClusteringClass
                 self.clustering_location = 'gpu'
             else:
@@ -151,6 +171,8 @@ class Diarizer:
 
             self.spectral_cluster = ClusteringClass(**self.spectral_config['cluster']['args'])
             self.umap_cluster = ClusteringClass(**self.umap_config['cluster']['args'])
+
+        self._print(f'Using {self.clustering_location.upper()} clustering')
 
         # Warmup clustering objects
         if warmup:

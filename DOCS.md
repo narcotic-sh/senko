@@ -3,7 +3,7 @@
 ### `Diarizer`
 ```python
 import senko
-diarizer = senko.Diarizer(torch_device='auto', vad='auto', warmup=True, quiet=True)
+diarizer = senko.Diarizer(torch_device='auto', vad='auto', clustering='auto', warmup=True, quiet=True)
 ```
 - `torch_device`: Device to use for PyTorch operations (`auto`, `cuda`, `mps`, `cpu`)
     - `auto` automatically selects `cuda` if available, if not, then `mps` (Apple Silicon), if not, then `cpu`
@@ -11,6 +11,11 @@ diarizer = senko.Diarizer(torch_device='auto', vad='auto', warmup=True, quiet=Tr
     - `auto` automatically selects `pyannote` for `cuda`, `silero` for everything else
     - `pyannote` uses Pyannote VAD (requires `cuda` for optimal performance)
     - `silero` uses Silero VAD (works on all devices, runs on CPU)
+- `clustering`: Clustering location when `torch_device` == `cuda` (`auto`, `gpu`, `cpu`)
+    - Only applies to CUDA devices; non-CUDA devices always use CPU clustering
+    - `auto` uses GPU clustering for CUDA devices with compute capability >= 7.0, CPU clustering otherwise
+    - `gpu` uses GPU clustering on CUDA devices with compute capability >= 7.0, falls back to CPU clustering with warning otherwise
+    - `cpu` forces CPU clustering on CUDA devices
 - `warmup`: Warm up CAM++ embeddings model and clustering objects during initialization
     - If warmup is not done, the first few runs of the pipeline will be a bit slower
 - `quiet`: Suppress progress updates and all other output to stdout

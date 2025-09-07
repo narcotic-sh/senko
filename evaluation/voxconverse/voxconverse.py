@@ -322,6 +322,8 @@ def main():
                        help='Device for Senko processing')
     parser.add_argument('--vad', choices=['auto', 'pyannote', 'silero'], default='auto',
                        help='VAD system to use (auto=pyannote for CUDA, silero otherwise)')
+    parser.add_argument('--clustering', choices=['auto', 'gpu', 'cpu'], default='auto',
+                       help='Clustering location (auto=gpu for CUDA compute >=7.0, cpu otherwise)')
     parser.add_argument('--results_dir', type=Path, default='./senko_evaluation_results',
                        help='Directory to save results')
     parser.add_argument('--subset', choices=['dev', 'test', 'both'], default='both',
@@ -345,8 +347,8 @@ def main():
         sys.exit(1)
 
     # Initialize Senko diarizer
-    print(f"Initializing Senko diarizer (device: {args.device}, vad: {args.vad})...")
-    diarizer = senko.Diarizer(torch_device=args.device, vad=args.vad, warmup=True, quiet=False)
+    print(f"Initializing Senko diarizer (device: {args.device}, vad: {args.vad}, clustering: {args.clustering})...")
+    diarizer = senko.Diarizer(torch_device=args.device, vad=args.vad, clustering=args.clustering, warmup=True, quiet=False)
     print("Diarizer ready!")
 
     # Setup dataset
