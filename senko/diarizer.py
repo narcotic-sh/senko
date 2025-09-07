@@ -27,7 +27,7 @@ class AudioFormatError(Exception):
     pass
 
 class Diarizer:
-    def __init__(self, torch_device='auto', warmup=True, quiet=True):
+    def __init__(self, torch_device='auto', vad='auto', warmup=True, quiet=True):
 
         self.quiet = quiet
         self.logical_cores = psutil.cpu_count(logical=True)
@@ -43,8 +43,17 @@ class Diarizer:
         ## VAD ##
         #########
 
-        if self.device.type == 'cuda':
+        # Determine VAD model type based on parameter or auto-selection
+        if vad == 'auto':
+            self.vad_model_type = 'Pyannote' if self.device.type == 'cuda' else 'Silero'
+        elif vad.lower() == 'pyannote':
             self.vad_model_type = 'Pyannote'
+        elif vad.lower() == 'silero':
+            self.vad_model_type = 'Silero'
+        else:
+            raise ValueError(f"Invalid VAD type: {vad}. Must be 'auto', 'pyannote', or 'silero'")
+
+        if self.vad_model_type == 'Pyannote':
             try:
                 from pyannote.audio.utils.reproducibility import ReproducibilityWarning
                 warnings.filterwarnings("ignore", category=ReproducibilityWarning)
@@ -61,8 +70,7 @@ class Diarizer:
                 "min_duration_off": 0.1   # Fill non-speech regions shorter than 100ms
             })
             self.vad_pipeline.to(self.device)
-        else:
-            self.vad_model_type = 'Silero'
+        else:  # Silero
             from silero_vad import load_silero_vad, read_audio, get_speech_timestamps
             self.vad_model = load_silero_vad()
             self.read_audio = read_audio

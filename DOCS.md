@@ -3,10 +3,14 @@
 ### `Diarizer`
 ```python
 import senko
-diarizer = senko.Diarizer(torch_device='auto', warmup=True, quiet=True)
+diarizer = senko.Diarizer(torch_device='auto', vad='auto', warmup=True, quiet=True)
 ```
 - `torch_device`: Device to use for PyTorch operations (`auto`, `cuda`, `mps`, `cpu`)
     - `auto` automatically selects `cuda` if available, if not, then `mps` (Apple Silicon), if not, then `cpu`
+- `vad`: Voice Activity Detection model to use (`auto`, `pyannote`, `silero`)
+    - `auto` automatically selects `pyannote` for `cuda`, `silero` for everything else
+    - `pyannote` uses Pyannote VAD (requires `cuda` for optimal performance)
+    - `silero` uses Silero VAD (works on all devices, runs on CPU)
 - `warmup`: Warm up CAM++ embeddings model and clustering objects during initialization
     - If warmup is not done, the first few runs of the pipeline will be a bit slower
 - `quiet`: Suppress progress updates and all other output to stdout

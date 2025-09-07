@@ -22,6 +22,8 @@ import os
 import sys
 import json
 import argparse
+import librosa
+import soundfile as sf
 from pathlib import Path
 from typing import Dict, List, Tuple
 import warnings
@@ -32,6 +34,27 @@ import numpy as np
 from pyannote.core import Annotation, Segment
 from pyannote.metrics.diarization import DiarizationErrorRate
 
+def get_audio_duration(audio_file: Path) -> float:
+    """
+    Get the duration of an audio file in seconds.
+
+    Args:
+        audio_file: Path to audio file
+
+    Returns:
+        Duration in seconds
+    """
+    try:
+        duration = librosa.get_duration(path=str(audio_file))
+        return duration
+    except ImportError:
+        # Fallback to soundfile if librosa not available
+        try:
+            info = sf.info(str(audio_file))
+            return info.duration
+        except ImportError:
+            print("Warning: Neither librosa nor soundfile available to get audio duration")
+            return None
 
 def load_rttm_file(rttm_path: Path, uri: str = None) -> Annotation:
     """
@@ -178,13 +201,6 @@ def preprocess_audio_for_senko(audio_file: Path, output_dir: Path) -> Path:
     Returns:
         Path to preprocessed WAV file
     """
-    try:
-        import librosa
-        import soundfile as sf
-    except ImportError:
-        print("Warning: librosa and soundfile not available for audio preprocessing")
-        print("Assuming audio is already in correct format...")
-        return audio_file
 
     output_file = output_dir / f"{audio_file.stem}_processed.wav"
 
@@ -262,12 +278,20 @@ def evaluate_file(audio_file: Path, rttm_file: Path, diarizer,
         components = metric(reference, hypothesis, detailed=True)
         der = components['diarization error rate']
 
+        # Get audio duration and calculate RTF
+        audio_duration = get_audio_duration(processed_audio)
+        rtf = None
+        if audio_duration and timing_stats.get('total_time'):
+            rtf = timing_stats['total_time'] / audio_duration
+
         print(f"  Senko speakers: {senko_speakers}, Reference speakers: {reference_speakers}")
         print(f"  Processing time: {timing_stats.get('total_time', 0):.2f}s")
+        if audio_duration:
+            print(f"  Audio duration: {audio_duration:.2f}s, RTF: {rtf:.3f}")
         print(f"  DER: {der:.3f}")
         print(f"  Components: FA={components.get('false alarm', 0):.1f}, "
-              f"Miss={components.get('missed detection', 0):.1f}, "
-              f"Conf={components.get('confusion', 0):.1f}")
+            f"Miss={components.get('missed detection', 0):.1f}, "
+            f"Conf={components.get('confusion', 0):.1f}")
 
         return {
             'file_id': file_id,
@@ -275,6 +299,8 @@ def evaluate_file(audio_file: Path, rttm_file: Path, diarizer,
             'senko_speakers': senko_speakers,
             'reference_speakers': reference_speakers,
             'processing_time': timing_stats.get('total_time', 0),
+            'audio_duration': audio_duration,
+            'rtf': rtf,
             'components': components,
             'error': None
         }
@@ -294,6 +320,8 @@ def main():
     parser = argparse.ArgumentParser(description='Evaluate Senko on VoxConverse dataset')
     parser.add_argument('--device', choices=['cuda', 'mps', 'cpu', 'auto'], default='auto',
                        help='Device for Senko processing')
+    parser.add_argument('--vad', choices=['auto', 'pyannote', 'silero'], default='auto',
+                       help='VAD system to use (auto=pyannote for CUDA, silero otherwise)')
     parser.add_argument('--results_dir', type=Path, default='./senko_evaluation_results',
                        help='Directory to save results')
     parser.add_argument('--subset', choices=['dev', 'test', 'both'], default='both',
@@ -317,8 +345,8 @@ def main():
         sys.exit(1)
 
     # Initialize Senko diarizer
-    print(f"Initializing Senko diarizer (device: {args.device})...")
-    diarizer = senko.Diarizer(torch_device=args.device, warmup=True, quiet=False)
+    print(f"Initializing Senko diarizer (device: {args.device}, vad: {args.vad})...")
+    diarizer = senko.Diarizer(torch_device=args.device, vad=args.vad, warmup=True, quiet=False)
     print("Diarizer ready!")
 
     # Setup dataset
@@ -386,9 +414,16 @@ def main():
             median_der = np.median([r['der'] for r in successful_results])
             global_der = abs(global_metrics[subset])
 
-            # Processing time stats
+            # Processing time and RTF stats
             times = [r.get('processing_time', 0) for r in successful_results if r.get('processing_time')]
+            rtfs = [r.get('rtf', 0) for r in successful_results if r.get('rtf') is not None]
+            audio_durations = [r.get('audio_duration', 0) for r in successful_results if r.get('audio_duration')]
+
             mean_time = np.mean(times) if times else 0
+            mean_rtf = np.mean(rtfs) if rtfs else None
+            total_audio_duration = sum(audio_durations) if audio_durations else 0
+            total_processing_time = sum(times) if times else 0
+            global_rtf = total_processing_time / total_audio_duration if total_audio_duration > 0 else None
 
             print(f"\n{subset.upper()} SET:")
             print(f"  Files processed successfully: {len(successful_results)}/{len(results[subset])}")
@@ -396,6 +431,14 @@ def main():
             print(f"  Median DER: {median_der:.3f}")
             print(f"  Global DER (accumulated): {global_der:.3f}")
             print(f"  Average processing time: {mean_time:.2f}s")
+            if mean_rtf is not None:
+                print(f"  Average RTF: {mean_rtf:.3f}")
+                if rtfs:
+                    print(f"  RTF range: {min(rtfs):.3f} - {max(rtfs):.3f}")
+            if global_rtf is not None:
+                print(f"  Global RTF (total_time/total_audio): {global_rtf:.3f}")
+                print(f"  Total audio processed: {total_audio_duration/60:.1f} minutes")
+                print(f"  Total processing time: {total_processing_time/60:.1f} minutes")
 
             # Speaker count analysis
             senko_counts = [r['senko_speakers'] for r in successful_results if r['senko_speakers'] is not None]
@@ -410,7 +453,11 @@ def main():
                 'median_der': median_der,
                 'successful_files': len(successful_results),
                 'total_files': len(results[subset]),
-                'mean_processing_time': mean_time
+                'mean_processing_time': mean_time,
+                'mean_rtf': mean_rtf,
+                'global_rtf': global_rtf,
+                'total_audio_duration': total_audio_duration,
+                'total_processing_time': total_processing_time
             }
 
     # Save detailed results
