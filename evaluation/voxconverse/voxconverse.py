@@ -2,7 +2,7 @@
 # uv pip install pyannote.metrics pyannote.core librosa soundfile
 
 # Then run this script like so:
-# python voxconverse.py --subset test
+# python voxconverse.py --subset test --vad auto|silero|pyannote
 
 """
 Senko Evaluation Script for VoxConverse Dataset
@@ -432,11 +432,11 @@ def main():
             print(f"  Global DER (accumulated): {global_der:.3f}")
             print(f"  Average processing time: {mean_time:.2f}s")
             if mean_rtf is not None:
-                print(f"  Average RTF: {mean_rtf:.3f}")
+                print(f"  Average RTF: {mean_rtf:.7f}")
                 if rtfs:
-                    print(f"  RTF range: {min(rtfs):.3f} - {max(rtfs):.3f}")
+                    print(f"  RTF range: {min(rtfs):.7f} - {max(rtfs):.7f}")
             if global_rtf is not None:
-                print(f"  Global RTF (total_time/total_audio): {global_rtf:.3f}")
+                print(f"  Global RTF (total_time/total_audio): {global_rtf:.7f}")
                 print(f"  Total audio processed: {total_audio_duration/60:.1f} minutes")
                 print(f"  Total processing time: {total_processing_time/60:.1f} minutes")
 
