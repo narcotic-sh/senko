@@ -1,13 +1,15 @@
 # Senko
 > 閃光 (senkō) - a flash of light
 
-A very fast speaker diarization pipeline.
+A very fast and accurate speaker diarization pipeline.
 
 1 hour of audio processed in 5 seconds (RTX 4090, Ryzen 9 7950X). ~17x faster than [Pyannote 3.1](https://huggingface.co/pyannote/speaker-diarization-3.1).
 
-On M3 Macbook Air, 1 hour in 23.5 seconds (~14x faster).
+On Apple M3, 1 hour in 23.5 seconds (~14x faster).
 
-This pipeline is used in the [Zanshin](https://github.com/narcotic-sh/zanshin) media player.
+The pipeline achieves a best score of 10.5% DER on VoxConverse, 9.3% on AISHELL-4, and 24.9% on AMI (IHM/SDM).
+
+Senko powers the [Zanshin](https://github.com/narcotic-sh/zanshin) media player.
 
 ## Usage
 ```python
@@ -50,15 +52,31 @@ For NVIDIA, make sure the installed driver is CUDA 12 capable (should see `CUDA 
 
 For setting up Senko for development, see `DEV_SETUP.md`.
 
+## Accuracy
+Settings `collar=0.25` and `skip_overlap=False` were used for all evaluations.
+
+<center>
+
+| Benchmark | Best DER |
+|:--------:|:-----:|
+| VoxConverse | 10.5% |
+| AISHELL-4 | 9.3% |
+| AMI (IHM) | 24.9% |
+| AMI (SDM) | 24.9% |
+
+</center>
+
+See the [evaluation](/evaluation) folder for more details.
+
 ## Technical Details
 Senko is a modified version of the speaker diarization pipeline found in the excellent [3D-Speaker](https://github.com/modelscope/3D-Speaker/tree/main/egs/3dspeaker/speaker-diarization) project.
 It consists of four stages: VAD (voice activity detection), Fbank feature extraction, speaker embeddings generation, and clustering (spectral or UMAP+HDBSCAN).
 
 The following modifications have been made:
-- VAD model has been swapped from FSMN-VAD to either Pyannote [segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0) (when running on NVIDIA) or [Silero VAD](https://github.com/snakers4/silero-vad) (non-NVIDIA)
+- VAD model has been swapped from FSMN-VAD to either Pyannote [segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0) or [Silero VAD](https://github.com/snakers4/silero-vad)
 - Fbank feature extraction is done fully upfront, in C++, using all available CPU cores
 - Batched inference of CAM++ embeddings model
-- Clustering when on NVIDIA (with a GPU of CUDA compute capability 7.0+) is done through [RAPIDS](https://docs.rapids.ai/api/cuml/stable/zero-code-change/)
+- Clustering when on NVIDIA (with a GPU of CUDA compute capability 7.0+) can be done on the GPU through [RAPIDS](https://docs.rapids.ai/api/cuml/stable/zero-code-change/)
 
 ## FAQ
 <details>
@@ -68,6 +86,11 @@ Absolutely. The <a href="https://github.com/narcotic-sh/zanshin">Zanshin</a> med
 <br>
 <br>
 You can also load in the diarization data that Senko generates manually into Zanshin if you want. First, turn off diarization in Zanshin by going into Settings and turning off <code>Identify Speakers</code>. Then, after you add a media item, click on it and on the player page press the <code>H</code> key. In the textbox that appears, paste the contents of the output JSON file that <code>examples/diarize.py</code> generates.
+</details>
+<details>
+<summary>What languages does Senko support?</summary>
+<br>
+Generally the pipeline should work for any language, as it relies on acoustic patterns as opposed to words or speech patterns. That being said, the embeddings model used in this pipeline was trained on a mix of English and Mandarin Chinese. So the pipeline will likely work best on English and Mandarin Chinese.
 </details>
 <details>
 <summary>Are overlapping speaker segments detected correctly?</summary>
@@ -82,13 +105,13 @@ On a Ryzen 9 9950X it takes 42 seconds to process 1 hour of audio.
 <details>
 <summary>Does the entire pipeline run fully on the GPU, if available?</summary>
 <br>
-With <code>cuda</code>, all parts of the pipeline except Fbank feature extraction (which always runs on the CPU) do run on the GPU. However, CPU performance still significantly impacts overall speed even for the GPU-accelerated stages.
+With <code>cuda</code>, all parts of the pipeline except Fbank feature extraction (which always runs on the CPU) do, by default, run on the GPU (though you can override this behaviour using the <code>vad</code> and <code>clustering</code> arguments of the <code>Diarizer</code> object). However, CPU performance still significantly impacts overall speed even for the GPU-accelerated stages.
 <br><br>
 During the embeddings generation phase, for example, while the actual model inference happens on the GPU with minimal CPU-GPU memory transfers (just input/output), the CPU handles all the orchestration work: Python loops for batching, tensor preparation, padding operations dispatch, and managing the inference pipeline. All this orchestration runs single-threaded on the CPU. This means a faster CPU will improve performance even when using a powerful GPU, as the CPU coordinates all the GPU operations.
 <br><br>
 Therefore, for optimal performance, pair a fast GPU with a fast CPU. The CPU bottleneck becomes more noticeable with very fast GPUs (ex. RTX 4090) where the GPU can execute the batch preparation and inference faster than the CPU can orchestrate/dispatch these operations.
 <br><br>
-As for <code>mps</code>, the only part of the pipeline that runs on the GPU is the embeddings gen phase. All other parts run on the CPU.
+As for <code>mps</code>, by default, the only part of the pipeline that runs on the GPU is the embeddings gen phase. All other parts run on the CPU. You <i>can</i> get VAD running on the GPU by setting <code>vad="pyannote"</code> in the <code>Diarizer</code> object instantiation. However, Pyannote VAD only runs fast on <code>cuda</code>, not <code>mps</code>. Therefore it is best to leave <code>vad="silero"</code> when on <code>mps</code>, which is the default.
 </details>
 <details>
 <summary>Known limitations?</summary>
@@ -97,9 +120,9 @@ As for <code>mps</code>, the only part of the pipeline that runs on the GPU is t
 <br><br>
 - It is rare but possible that voices that sound very similar get clustered as one voice. This can happen if the voices are genuinely extremely similar, or, more commonly, if the audio recording fidelity is low.
 <br><br>
-- The same voice but recorded with >1 microphones or in >1 recording settings (within the same audio file) will often get detected as >1 speakers.
+- The same voice recorded with >1 microphones or in >1 recording settings within the same audio file will often get detected as >1 speakers.
 <br><br>
-- Diarization performance (as in quality, not just speed) on NVIDIA is a bit better than on Mac and CPU. This is due to RAPIDS clustering yielding slightly better results than CPU clustering.
+- If a single person makes >1 voices in the same recording (as in change the auditory texture/tone of their voice; like if they do an impression of someone else, for example), their speech will almost certainly get detected as >1 speakers.
 </details>
 
 ## Community & Support
@@ -111,7 +134,6 @@ Join the [Discord](https://discord.gg/Nf7m5Ftk3c) server to ask questions, sugge
 - Support for Intel and AMD GPUs
 - Experiment with `torch.compile()` (faster than current JIT tracing TorchScript approach?)
 - Experiment with Modular [MAX](https://www.modular.com/blog/bring-your-own-pytorch-model) engine (faster CPU inference speed?)
-- Measure DER (diarization error rate) of pipeline
 - Experiment with [Resonate](https://alexandrefrancois.org/Resonate/) for superior audio feature extraction
 - Background noise removal ([DeepFilterNet](https://github.com/Rikorose/DeepFilterNet))
 - Live progress reporting

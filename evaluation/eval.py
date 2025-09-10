@@ -1,21 +1,25 @@
-# Have senko installed, and also install the following:
-# uv pip install pyannote.metrics pyannote.core librosa soundfile
-
-# Then run this script like so:
-# python voxconverse.py --subset test --vad auto|silero|pyannote
+# uv pip install "git+https://github.com/narcotic-sh/senko.git[nvidia|nvidia-old]" pyannote.metrics pyannote.core librosa soundfile matplotlib
+# python eval.py --vad auto|silero|pyannote --clustering auto|cpu|gpu
 
 """
-Senko Evaluation Script for VoxConverse Dataset
-This script evaluates Senko speaker diarization performance on the VoxConverse dataset
-using pyannote.metrics for computing the Diarization Error Rate (DER).
+Evaluation settings used:
+    collar=0.25, skip_overlap=False
 
 Expected directory structure:
-./dev/
-  audio/*.wav
-  *.rttm
 ./test/
   audio/*.wav
   *.rttm
+
+VoxConverse:
+    The wav and rttm files for the dataset were found here: https://github.com/joonson/voxconverse
+    The rttm files are in the repo, and the wav files for the test set are provided as a zip download in the repo README
+
+AISHELL-4:
+    flac and rttm files for the dataset were found here: https://www.openslr.org/111/
+    The flac files were then converted into 16kHz 16-bit mono wav's using ffmpeg
+
+AMI:
+    ami.py was used to download the test set
 """
 
 import os
@@ -122,12 +126,12 @@ def segments_to_annotation(segments: List[Dict], uri: str) -> Annotation:
     return annotation
 
 
-def find_audio_and_rttm_files(subset_dir: Path) -> List[Tuple[Path, Path]]:
+def find_audio_and_rttm_files(test_dir: Path) -> List[Tuple[Path, Path]]:
     """
-    Find corresponding audio and RTTM files in a subset directory (dev or test).
+    Find corresponding audio and RTTM files in the test directory.
 
     Args:
-        subset_dir: Path to subset directory (dev or test)
+        test_dir: Path to test directory
 
     Returns:
         List of (audio_file, rttm_file) tuples
@@ -135,7 +139,7 @@ def find_audio_and_rttm_files(subset_dir: Path) -> List[Tuple[Path, Path]]:
     file_pairs = []
 
     # Look for audio files in audio/ subdirectory
-    audio_dir = subset_dir / "audio"
+    audio_dir = test_dir / "audio"
     if not audio_dir.exists():
         print(f"Warning: {audio_dir} does not exist")
         return file_pairs
@@ -147,9 +151,9 @@ def find_audio_and_rttm_files(subset_dir: Path) -> List[Tuple[Path, Path]]:
     for audio_file in audio_files:
         # Try different possible locations for RTTM files
         rttm_candidates = [
-            subset_dir / f"{audio_file.stem}.rttm",  # In subset root
+            test_dir / f"{audio_file.stem}.rttm",  # In test root
             audio_dir / f"{audio_file.stem}.rttm",   # In audio dir
-            subset_dir / "rttm" / f"{audio_file.stem}.rttm",  # In rttm subdir
+            test_dir / "rttm" / f"{audio_file.stem}.rttm",  # In rttm subdir
         ]
 
         for rttm_file in rttm_candidates:
@@ -162,32 +166,27 @@ def find_audio_and_rttm_files(subset_dir: Path) -> List[Tuple[Path, Path]]:
     return file_pairs
 
 
-def setup_voxconverse_dataset(base_dir: Path = None) -> Dict[str, List[Tuple[Path, Path]]]:
+def setup_dataset(base_dir: Path = None) -> List[Tuple[Path, Path]]:
     """
-    Setup VoxConverse dataset from dev and test directories.
+    Setup dataset from test directory.
 
     Args:
-        base_dir: Base directory containing dev and test folders (defaults to current directory)
+        base_dir: Base directory containing test folder (defaults to current directory)
 
     Returns:
-        Dictionary with 'dev' and 'test' keys containing lists of (audio_file, rttm_file) tuples
+        List of (audio_file, rttm_file) tuples
     """
     if base_dir is None:
         base_dir = Path.cwd()
 
-    datasets = {}
-
-    for subset in ['dev', 'test']:
-        subset_dir = base_dir / subset
-        if subset_dir.exists():
-            file_pairs = find_audio_and_rttm_files(subset_dir)
-            datasets[subset] = file_pairs
-            print(f"Found {len(file_pairs)} {subset} file pairs")
-        else:
-            print(f"Warning: {subset_dir} does not exist")
-            datasets[subset] = []
-
-    return datasets
+    test_dir = base_dir / "test"
+    if test_dir.exists():
+        file_pairs = find_audio_and_rttm_files(test_dir)
+        print(f"Found {len(file_pairs)} test file pairs")
+        return file_pairs
+    else:
+        print(f"Error: {test_dir} does not exist")
+        return []
 
 
 def preprocess_audio_for_senko(audio_file: Path, output_dir: Path) -> Path:
@@ -273,7 +272,7 @@ def evaluate_file(audio_file: Path, rttm_file: Path, diarizer,
         output_rttm = results_dir / f"{file_id}_senko.rttm"
         senko.save_rttm(merged_segments, str(processed_audio), str(output_rttm))
 
-        # Calculate DER with 0.25s collar (standard for VoxConverse)
+        # Calculate DER with 0.25s collar
         metric = DiarizationErrorRate(collar=0.25, skip_overlap=False)
         components = metric(reference, hypothesis, detailed=True)
         der = components['diarization error rate']
@@ -317,7 +316,7 @@ def evaluate_file(audio_file: Path, rttm_file: Path, diarizer,
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Evaluate Senko on VoxConverse dataset')
+    parser = argparse.ArgumentParser(description='Evaluate Senko speaker diarization')
     parser.add_argument('--device', choices=['cuda', 'mps', 'cpu', 'auto'], default='auto',
                        help='Device for Senko processing')
     parser.add_argument('--vad', choices=['auto', 'pyannote', 'silero'], default='auto',
@@ -326,8 +325,6 @@ def main():
                        help='Clustering location (auto=gpu for CUDA compute >=7.0, cpu otherwise)')
     parser.add_argument('--results_dir', type=Path, default='./senko_evaluation_results',
                        help='Directory to save results')
-    parser.add_argument('--subset', choices=['dev', 'test', 'both'], default='both',
-                       help='Which subset to evaluate')
     parser.add_argument('--max_files', type=int, default=None,
                        help='Maximum number of files to process (for testing)')
     parser.add_argument('--no_preprocess', action='store_true',
@@ -338,12 +335,12 @@ def main():
     # Create results directory
     args.results_dir.mkdir(exist_ok=True)
 
-    # Check that dev and test directories exist
-    if not Path("dev").exists() and not Path("test").exists():
-        print("Error: Neither 'dev' nor 'test' directories found in current directory!")
-        print("Please ensure you have extracted the VoxConverse dataset:")
-        print("  ./dev/audio/*.wav and ./dev/*.rttm")
-        print("  ./test/audio/*.wav and ./test/*.rttm")
+    # Check that test directory exists
+    if not Path("test").exists():
+        print("Error: 'test' directory not found in current directory!")
+        print("Please ensure you have the following structure:")
+        print("  ./test/audio/*.wav")
+        print("  ./test/*.rttm")
         sys.exit(1)
 
     # Initialize Senko diarizer
@@ -352,39 +349,30 @@ def main():
     print("Diarizer ready!")
 
     # Setup dataset
-    datasets = setup_voxconverse_dataset()
+    file_pairs = setup_dataset()
 
-    # Collect all file pairs based on subset selection
-    all_file_pairs = []
-    if args.subset in ['dev', 'both'] and 'dev' in datasets:
-        all_file_pairs.extend([(f, r, 'dev') for f, r in datasets['dev']])
-    if args.subset in ['test', 'both'] and 'test' in datasets:
-        all_file_pairs.extend([(f, r, 'test') for f, r in datasets['test']])
-
-    if not all_file_pairs:
+    if not file_pairs:
         print("Error: No audio/RTTM file pairs found!")
         sys.exit(1)
 
     # Limit number of files if specified
     if args.max_files:
-        all_file_pairs = all_file_pairs[:args.max_files]
+        file_pairs = file_pairs[:args.max_files]
 
-    print(f"\nEvaluating {len(all_file_pairs)} files...")
+    print(f"\nEvaluating {len(file_pairs)} files...")
 
     # Evaluate each file
-    results = {'dev': [], 'test': []}
-    global_metrics = {'dev': DiarizationErrorRate(collar=0.25, skip_overlap=False),
-                     'test': DiarizationErrorRate(collar=0.25, skip_overlap=False)}
+    results = []
+    global_metric = DiarizationErrorRate(collar=0.25, skip_overlap=False)
 
-    for i, (audio_file, rttm_file, subset) in enumerate(all_file_pairs):
-        print(f"\n=== {subset.upper()} File {i+1}/{len(all_file_pairs)} ===")
+    for i, (audio_file, rttm_file) in enumerate(file_pairs):
+        print(f"\n=== File {i+1}/{len(file_pairs)} ===")
 
         result = evaluate_file(
             audio_file, rttm_file, diarizer, args.results_dir,
             preprocess_audio=not args.no_preprocess
         )
-        result['subset'] = subset
-        results[subset].append(result)
+        results.append(result)
 
         # Add to global metric if successful
         if result['der'] is not None:
@@ -394,7 +382,7 @@ def main():
                 senko_rttm = args.results_dir / f"{result['file_id']}_senko.rttm"
                 if senko_rttm.exists():
                     hypothesis = load_rttm_file(senko_rttm, result['file_id'])
-                    global_metrics[subset](reference, hypothesis)
+                    global_metric(reference, hypothesis)
             except Exception as e:
                 print(f"Warning: Could not add {result['file_id']} to global metric: {e}")
 
@@ -403,64 +391,61 @@ def main():
     print("EVALUATION RESULTS")
     print(f"{'='*60}")
 
-    summary = {}
+    successful_results = [r for r in results if r['der'] is not None]
 
-    for subset in ['dev', 'test']:
-        if not results[subset]:
-            continue
+    if successful_results:
+        mean_der = np.mean([r['der'] for r in successful_results])
+        median_der = np.median([r['der'] for r in successful_results])
+        global_der = abs(global_metric)
 
-        successful_results = [r for r in results[subset] if r['der'] is not None]
+        # Processing time and RTF stats
+        times = [r.get('processing_time', 0) for r in successful_results if r.get('processing_time')]
+        rtfs = [r.get('rtf', 0) for r in successful_results if r.get('rtf') is not None]
+        audio_durations = [r.get('audio_duration', 0) for r in successful_results if r.get('audio_duration')]
 
-        if successful_results:
-            mean_der = np.mean([r['der'] for r in successful_results])
-            median_der = np.median([r['der'] for r in successful_results])
-            global_der = abs(global_metrics[subset])
+        mean_time = np.mean(times) if times else 0
+        mean_rtf = np.mean(rtfs) if rtfs else None
+        total_audio_duration = sum(audio_durations) if audio_durations else 0
+        total_processing_time = sum(times) if times else 0
+        global_rtf = total_processing_time / total_audio_duration if total_audio_duration > 0 else None
 
-            # Processing time and RTF stats
-            times = [r.get('processing_time', 0) for r in successful_results if r.get('processing_time')]
-            rtfs = [r.get('rtf', 0) for r in successful_results if r.get('rtf') is not None]
-            audio_durations = [r.get('audio_duration', 0) for r in successful_results if r.get('audio_duration')]
+        print(f"\nTEST SET RESULTS:")
+        print(f"  Files processed successfully: {len(successful_results)}/{len(results)}")
+        print(f"  Mean DER (per-file average): {mean_der:.3f}")
+        print(f"  Median DER: {median_der:.3f}")
+        print(f"  Global DER (accumulated): {global_der:.3f}")
+        print(f"  Average processing time: {mean_time:.2f}s")
+        if mean_rtf is not None:
+            print(f"  Average RTF: {mean_rtf:.7f}")
+            if rtfs:
+                print(f"  RTF range: {min(rtfs):.7f} - {max(rtfs):.7f}")
+        if global_rtf is not None:
+            print(f"  Global RTF (total_time/total_audio): {global_rtf:.7f}")
+            print(f"  Total audio processed: {total_audio_duration/60:.1f} minutes")
+            print(f"  Total processing time: {total_processing_time/60:.1f} minutes")
 
-            mean_time = np.mean(times) if times else 0
-            mean_rtf = np.mean(rtfs) if rtfs else None
-            total_audio_duration = sum(audio_durations) if audio_durations else 0
-            total_processing_time = sum(times) if times else 0
-            global_rtf = total_processing_time / total_audio_duration if total_audio_duration > 0 else None
+        # Speaker count analysis
+        senko_counts = [r['senko_speakers'] for r in successful_results if r['senko_speakers'] is not None]
+        ref_counts = [r['reference_speakers'] for r in successful_results if r['reference_speakers'] is not None]
+        if senko_counts and ref_counts:
+            print(f"  Average Senko speakers: {np.mean(senko_counts):.1f}")
+            print(f"  Average reference speakers: {np.mean(ref_counts):.1f}")
 
-            print(f"\n{subset.upper()} SET:")
-            print(f"  Files processed successfully: {len(successful_results)}/{len(results[subset])}")
-            print(f"  Mean DER (per-file average): {mean_der:.3f}")
-            print(f"  Median DER: {median_der:.3f}")
-            print(f"  Global DER (accumulated): {global_der:.3f}")
-            print(f"  Average processing time: {mean_time:.2f}s")
-            if mean_rtf is not None:
-                print(f"  Average RTF: {mean_rtf:.7f}")
-                if rtfs:
-                    print(f"  RTF range: {min(rtfs):.7f} - {max(rtfs):.7f}")
-            if global_rtf is not None:
-                print(f"  Global RTF (total_time/total_audio): {global_rtf:.7f}")
-                print(f"  Total audio processed: {total_audio_duration/60:.1f} minutes")
-                print(f"  Total processing time: {total_processing_time/60:.1f} minutes")
-
-            # Speaker count analysis
-            senko_counts = [r['senko_speakers'] for r in successful_results if r['senko_speakers'] is not None]
-            ref_counts = [r['reference_speakers'] for r in successful_results if r['reference_speakers'] is not None]
-            if senko_counts and ref_counts:
-                print(f"  Average Senko speakers: {np.mean(senko_counts):.1f}")
-                print(f"  Average reference speakers: {np.mean(ref_counts):.1f}")
-
-            summary[subset] = {
-                'global_der': global_der,
-                'mean_der': mean_der,
-                'median_der': median_der,
-                'successful_files': len(successful_results),
-                'total_files': len(results[subset]),
-                'mean_processing_time': mean_time,
-                'mean_rtf': mean_rtf,
-                'global_rtf': global_rtf,
-                'total_audio_duration': total_audio_duration,
-                'total_processing_time': total_processing_time
-            }
+        summary = {
+            'global_der': global_der,
+            'mean_der': mean_der,
+            'median_der': median_der,
+            'successful_files': len(successful_results),
+            'total_files': len(results),
+            'mean_processing_time': mean_time,
+            'mean_rtf': mean_rtf,
+            'global_rtf': global_rtf,
+            'total_audio_duration': total_audio_duration,
+            'total_processing_time': total_processing_time
+        }
+    else:
+        print("\nNo files were successfully processed!")
+        summary = {}
 
     # Save detailed results
     results_file = args.results_dir / 'evaluation_results.json'
@@ -468,11 +453,7 @@ def main():
         json.dump({
             'summary': summary,
             'device': args.device,
-            'subset_evaluated': args.subset,
-            'file_results': {
-                'dev': results['dev'],
-                'test': results['test']
-            }
+            'file_results': results
         }, f, indent=2)
 
     print(f"\nDetailed results saved to: {results_file}")
