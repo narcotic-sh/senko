@@ -32,7 +32,7 @@ A dataset of meeting recordings in Mandarin Chinese.
 ### AMI
 A dataset of meeting recordings in English, with participants recorded using headset and distant microphones.
 
-### IHM (Individual Headset Microphone)
+#### IHM (Individual Headset Microphone)
 
 <center>
 
@@ -44,7 +44,7 @@ A dataset of meeting recordings in English, with participants recorded using hea
 
 </center>
 
-### SDM (Single Distant Microphone)
+#### SDM (Single Distant Microphone)
 
 <center>
 
