@@ -1,5 +1,5 @@
 # Example Senko usage script. Run like so:
-# python diarize.py --device cuda|mps|cpu
+# python diarize.py --device cuda|coreml|cpu
 # Diarization output (cleaned/merged, not raw) along with generated speaker color sets will be saved in ./results
 
 import os
@@ -11,12 +11,12 @@ from pathlib import Path
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Senko example diarization script')
     parser.add_argument('--device',
-                       choices=['cuda', 'mps', 'cpu', 'auto'],
+                       choices=['auto', 'cuda', 'coreml', 'cpu'],
                        default='auto',
                        help='Torch device to use for processing (default: auto)')
     args = parser.parse_args()
 
-    diarizer = senko.Diarizer(torch_device=args.device, warmup=True, quiet=False)
+    diarizer = senko.Diarizer(device=args.device, warmup=True, quiet=False)
     print("Diarizer warmed up and ready!\n")
 
     while True:

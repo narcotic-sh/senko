@@ -1,3 +1,4 @@
+
 import warnings
 warnings.filterwarnings("ignore", message=".*Matplotlib.*")
 warnings.filterwarnings("ignore", message=".*force_all_finite.*", category=FutureWarning)
@@ -18,42 +19,45 @@ import psutil
 import numpy as np
 from termcolor import colored
 
-from . import paths
+from . import config
 from .colors import generate_speaker_colors
-from .utils import time_method, suppress_stdout, timed_operation
+from .utils import time_method, suppress_stdout_stderr, timed_operation
 
 class AudioFormatError(Exception):
     """Raised when audio file is not in the required 16kHz mono 16-bit WAV format"""
     pass
 
 class Diarizer:
-    def __init__(self, torch_device='auto', vad='auto', clustering='auto', warmup=True, quiet=True):
+    def __init__(self, device='auto', vad='auto', clustering='auto', warmup=True, quiet=True):
 
         self.quiet = quiet
         self.logical_cores = psutil.cpu_count(logical=True)
 
-        ##################
-        ## Torch device ##
-        ##################
+        ############
+        ## Device ##
+        ############
 
-        self.device = (torch.device("cuda") if torch.cuda.is_available() else torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")) if torch_device == 'auto' else torch.device(torch_device)
-        self._print(f"Using Torch device: {self.device}")
+        if config.DARWIN:
+            self.device = 'coreml'
+            self.torch_device = None
+        else:
+            self.torch_device = (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")) if device == 'auto' else torch.device(device)
+            self.device = self.torch_device.type
+
+        self._print(f"Using device: {self.device}")
 
         #########
         ## VAD ##
         #########
 
-        # Determine VAD model type based on parameter or auto-selection
-        if vad == 'auto':
-            self.vad_model_type = 'Pyannote' if self.device.type == 'cuda' else 'Silero'
-        elif vad.lower() == 'pyannote':
-            self.vad_model_type = 'Pyannote'
-        elif vad.lower() == 'silero':
-            self.vad_model_type = 'Silero'
-        else:
+        if vad not in ['auto', 'pyannote', 'silero']:
             raise ValueError(f"Invalid VAD type: {vad}. Must be 'auto', 'pyannote', or 'silero'")
 
-        if self.vad_model_type == 'Pyannote':
+        # Determine VAD model type based on parameter or auto-selection
+        self.vad_model_type = ('pyannote' if self.device == 'cuda' else 'silero') if vad == 'auto' else vad.lower()
+
+        # Pyannote VAD
+        if self.vad_model_type == 'pyannote':
             try:
                 from pyannote.audio.utils.reproducibility import ReproducibilityWarning
                 warnings.filterwarnings("ignore", category=ReproducibilityWarning)
@@ -63,14 +67,16 @@ class Diarizer:
             from pyannote.audio.pipelines import VoiceActivityDetection
             from pyannote.audio import Model
 
-            model = Model.from_pretrained(paths.PYANNOTE_SEGMENTATION_MODEL_PATH, map_location=self.device)
+            model = Model.from_pretrained(config.PYANNOTE_SEGMENTATION_MODEL_PATH, map_location=self.torch_device)
             self.vad_pipeline = VoiceActivityDetection(segmentation=model)
             self.vad_pipeline.instantiate({
                 "min_duration_on": 0.25,  # Remove speech regions shorter than 250ms
                 "min_duration_off": 0.1   # Fill non-speech regions shorter than 100ms
             })
-            self.vad_pipeline.to(self.device)
-        else:  # Silero
+            self.vad_pipeline.to(self.torch_device)
+
+        # Silero VAD
+        else:
             from silero_vad import load_silero_vad, read_audio, get_speech_timestamps
             self.vad_model = load_silero_vad()
             self.read_audio = read_audio
@@ -78,14 +84,14 @@ class Diarizer:
 
         self._print(f'Using {self.vad_model_type} VAD')
 
-        # Silero sets torch threads to 1; set it back to make full use of all cores
+        # silero sets torch threads to 1; set it back to make full use of all cores
         self._set_torch_num_threads()
 
         ######################################
         ## Fbank feature extraction C++ lib ##
         ######################################
 
-        self.lib = ctypes.CDLL(paths.FBANK_LIB_PATH)
+        self.lib = ctypes.CDLL(config.FBANK_LIB_PATH)
 
         class FbankFeatures(ctypes.Structure):
             _fields_ = [
@@ -116,34 +122,48 @@ class Diarizer:
 
         # Load embeddings model
         with timed_operation("Loading embeddings model ........", self.quiet):
-            if self.device.type == 'cuda' or self.device.type == 'mps':
-                self.embeddings_model = torch.jit.load(paths.EMBEDDINGS_JIT_MODEL_PATH, map_location=self.device)
+            # CoreML
+            if self.device == 'coreml':
+                with suppress_stdout_stderr():
+                    import coremltools as ct
+                    self.embeddings_model = ct.models.MLModel(config.EMBEDDINGS_COREML_PATH)
+                    self.coreml_fixed_frames = 150
+                    self.coreml_batch_size = 16
+            # CUDA
+            elif self.device == 'cuda':
+                self.embeddings_model = torch.jit.load(config.EMBEDDINGS_JIT_CUDA_MODEL_PATH, map_location=self.torch_device)
                 self.embeddings_model.eval()
+            # CPU
             else:
-                from . camplusplus import CAMPPlus
+                from .camplusplus import CAMPPlus
                 self.embeddings_model = CAMPPlus(feat_dim=80, embedding_size=192)
-                self.embeddings_model.load_state_dict(torch.load(paths.EMBEDDINGS_PT_MODEL_PATH, map_location=self.device, weights_only=True))
+                self.embeddings_model.load_state_dict(torch.load(config.EMBEDDINGS_PT_MODEL_PATH, map_location=self.torch_device, weights_only=True))
                 self.embeddings_model.eval()
-                self.embeddings_model.to(self.device)
+                self.embeddings_model.to(self.torch_device)
 
         # Warm up embeddings model
         if warmup:
             with timed_operation("Warming up embeddings model .....", self.quiet):
-                with torch.no_grad():
+                if self.device == 'coreml':
                     for i in range(4):
-                        dummy = torch.randn(80, 148, 80, device=self.device)
-                        _ = self.embeddings_model(dummy)
+                        dummy_input = np.random.randn(self.coreml_batch_size, self.coreml_fixed_frames, 80).astype(np.float32)
+                        _ = self.embeddings_model.predict({'input_features': dummy_input})
+                else:
+                    with torch.no_grad():
+                        for i in range(4):
+                            dummy = torch.randn(80, 148, 80, device=self.torch_device)
+                            _ = self.embeddings_model(dummy)
 
         ################
         ## Clustering ##
         ################
 
-        with open(paths.SPECTRAL_YAML, 'r') as spectral_yaml, open(paths.UMAP_HDBSCAN_YAML, 'r') as umap_hdbscan_yaml:
+        with open(config.SPECTRAL_YAML, 'r') as spectral_yaml, open(config.UMAP_HDBSCAN_YAML, 'r') as umap_hdbscan_yaml:
             self.spectral_config = yaml.safe_load(spectral_yaml)
             self.umap_config = yaml.safe_load(umap_hdbscan_yaml)
 
             # Determine clustering location based on parameter or auto-selection
-            if self.device.type != 'cuda':
+            if self.device != 'cuda':
                 # Non-CUDA devices always use CPU clustering
                 use_gpu_clustering = False
             else:
@@ -178,7 +198,7 @@ class Diarizer:
         if warmup:
             with timed_operation("Warming up clustering objects ...", self.quiet):
                 dummy_embeddings = np.random.randn(5000, 192).astype(np.float32)
-                with suppress_stdout():
+                with suppress_stdout_stderr():
                     _ = self.spectral_cluster(dummy_embeddings)
                     _ = self.umap_cluster(dummy_embeddings)
 
@@ -220,6 +240,9 @@ class Diarizer:
         # Extract Fbank feature for each subsegment
         features_flat, frames_per_subsegment, subsegment_offsets, feature_dim = self._extract_fbank_features(wav_path, subsegments)
 
+        # Convert subsegment_offsets to integers for slicing
+        subsegment_offsets = [int(offset) for offset in subsegment_offsets]
+
         # Generate CAM++ speaker embedding for each subsegment feature
         embeddings = self._generate_embeddings(features_flat, frames_per_subsegment, subsegment_offsets, feature_dim)
 
@@ -257,13 +280,13 @@ class Diarizer:
 
     @time_method('vad_time', 'Voice activity detection')
     def _perform_vad(self, wav_path):
-        if self.vad_model_type == 'Pyannote':
+        if self.vad_model_type == 'pyannote':
             torch.backends.cuda.matmul.allow_tf32 = False
             torch.backends.cudnn.allow_tf32 = False
             vad_result = self.vad_pipeline(wav_path)
             segments = [(segment.start, segment.end) for segment in vad_result.get_timeline()]
 
-        # Silero
+        # silero
         else:
             self._set_torch_num_threads(1)  # silero vad is single threaded
 
@@ -284,7 +307,7 @@ class Diarizer:
         return segments
 
     def _generate_subsegments(self, vad_segments):
-        if self.vad_model_type == 'Pyannote':
+        if self.vad_model_type == 'pyannote':
             segment_duration = 1.45
             shift = segment_duration / 3.0
         else:
@@ -335,19 +358,20 @@ class Diarizer:
 
     @time_method('embeddings_time', 'Embeddings generation')
     def _generate_embeddings(self, features_flat, frames_per_subsegment, subsegment_offsets, feature_dim):
-        if self.vad_model_type == 'Pyannote':
+        if self.device == 'coreml':
+            return self._generate_embeddings_coreml(features_flat, frames_per_subsegment, subsegment_offsets, feature_dim)
+
+        if self.vad_model_type == 'pyannote':
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
 
-        big_tensor = torch.from_numpy(features_flat).to(self.device)
-
-        # Convert subsegment_offsets to integers for slicing
-        subsegment_offsets = [int(offset) for offset in subsegment_offsets]
+        # Move features to torch device
+        big_tensor = torch.from_numpy(features_flat).to(self.torch_device)
 
         feature_tensors = []
         for i, (frames, offset) in enumerate(zip(frames_per_subsegment, subsegment_offsets)):
             if frames == 0:
-                feature_tensors.append(torch.zeros(1, feature_dim, device=self.device))
+                feature_tensors.append(torch.zeros(1, feature_dim, device=self.torch_device))
                 continue
             num_floats = int(frames * feature_dim)
             t = big_tensor[offset:offset + num_floats].view(int(frames), int(feature_dim))
@@ -384,10 +408,63 @@ class Diarizer:
         # Concatenate all embeddings and move to CPU
         final_embeddings = torch.cat(embeddings, 0).cpu().numpy()
 
-        if self.device.type == "cuda":
+        if self.device == "cuda":
             torch.cuda.empty_cache()
-        if self.device.type == "mps":
-            torch.mps.empty_cache()
+
+        return final_embeddings
+
+    def _generate_embeddings_coreml(self, features_flat, frames_per_subsegment, subsegment_offsets, feature_dim):
+        FIXED_FRAMES = self.coreml_fixed_frames  # 150
+
+        # Prepare features
+        processed_features = []
+        for i, (frames, offset) in enumerate(zip(frames_per_subsegment, subsegment_offsets)):
+            if frames == 0:
+                # Zero features for empty segments
+                features = np.zeros((FIXED_FRAMES, feature_dim), dtype=np.float32)
+            else:
+                # Extract features for this subsegment
+                num_floats = int(frames * feature_dim)
+                features = features_flat[offset:offset + num_floats].reshape(int(frames), int(feature_dim))
+
+                # Prepare for fixed-size model
+                if frames <= FIXED_FRAMES:
+                    # Pad with zeros
+                    padded = np.zeros((FIXED_FRAMES, feature_dim), dtype=np.float32)
+                    padded[:frames, :] = features
+                    features = padded
+                else:
+                    # If longer than FIXED_FRAMES (should never happen, but in case): center crop
+                    start = (frames - FIXED_FRAMES) // 2
+                    features = features[start:start + FIXED_FRAMES, :]
+
+            processed_features.append(features)
+
+        # Convert to numpy array
+        all_features = np.array(processed_features)  # Shape: (num_segments, FIXED_FRAMES, 80)
+
+        embeddings = []
+
+        # Process in batches
+        batch_size = self.coreml_batch_size
+        num_segments = len(processed_features)
+        for i in range(0, num_segments, batch_size):
+            end_idx = min(i + batch_size, num_segments)
+            actual_batch_size = end_idx - i
+
+            # Create batch tensor (padded if necessary)
+            batch_features = np.zeros((batch_size, FIXED_FRAMES, feature_dim), dtype=np.float32)
+            batch_features[:actual_batch_size] = all_features[i:end_idx]
+
+            # Run batched CoreML inference
+            output = self.embeddings_model.predict({'input_features': batch_features})
+            batch_embeddings = output['embeddings']
+
+            # Only keep the embeddings we actually need (in case of padding)
+            embeddings.extend(batch_embeddings[:actual_batch_size])
+
+        # Stack all embeddings
+        final_embeddings = np.vstack(embeddings)
 
         return final_embeddings
 
@@ -395,7 +472,7 @@ class Diarizer:
     def _perform_clustering(self, embeddings, subsegments):
         wav_length = subsegments[-1][1]  # Using last segment's end time
 
-        with suppress_stdout():
+        with suppress_stdout_stderr():
             if wav_length < 1200.0:                          # Use spectral clustering for short audio (< 20 min)
                 labels = self.spectral_cluster(embeddings)
             else:                                            # Use UMAP+HDBSCAN for longer audio

@@ -3,15 +3,15 @@
 ### `Diarizer`
 ```python
 import senko
-diarizer = senko.Diarizer(torch_device='auto', vad='auto', clustering='auto', warmup=True, quiet=True)
+diarizer = senko.Diarizer(device='auto', vad='auto', clustering='auto', warmup=True, quiet=True)
 ```
-- `torch_device`: Device to use for PyTorch operations (`auto`, `cuda`, `mps`, `cpu`)
-    - `auto` automatically selects `cuda` if available, if not, then `mps` (Apple Silicon), if not, then `cpu`
+- `device`: Device to use for PyTorch operations (`auto`, `cuda`, `coreml`, `cpu`)
+    - `auto` automatically selects `coreml` if on macOS, if not, then `cuda`, if not, then `cpu`
 - `vad`: Voice Activity Detection model to use (`auto`, `pyannote`, `silero`)
     - `auto` automatically selects `pyannote` for `cuda`, `silero` for everything else
     - `pyannote` uses Pyannote VAD (requires `cuda` for optimal performance)
     - `silero` uses Silero VAD (works on all devices, runs on CPU)
-- `clustering`: Clustering location when `torch_device` == `cuda` (`auto`, `gpu`, `cpu`)
+- `clustering`: Clustering location when `device` == `cuda` (`auto`, `gpu`, `cpu`)
     - Only applies to CUDA devices; non-CUDA devices always use CPU clustering
     - `auto` uses GPU clustering for CUDA devices with compute capability >= 7.0, CPU clustering otherwise
     - `gpu` uses GPU clustering on CUDA devices with compute capability >= 7.0, falls back to CPU clustering with warning otherwise

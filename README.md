@@ -15,7 +15,7 @@ Senko powers the [Zanshin](https://github.com/narcotic-sh/zanshin) media player.
 ```python
 import senko, json
 
-diarizer = senko.Diarizer(torch_device='auto', warmup=True, quiet=False)
+diarizer = senko.Diarizer(device='auto', warmup=True, quiet=False)
 
 wav_path = 'audio.wav' # 16kHz mono 16-bit wav
 result = diarizer.diarize(wav_path, generate_colors=False)
@@ -45,7 +45,7 @@ uv pip install "git+https://github.com/narcotic-sh/senko.git[nvidia]"
 # For NVIDIA GPUs with CUDA compute capability < 7.5 (~GTX 10 series and older)
 uv pip install "git+https://github.com/narcotic-sh/senko.git[nvidia-old]"
 
-# For Macs (mps) and cpu execution on all other platforms
+# For Mac (macOS 14+) and CPU execution on all other platforms
 uv pip install "git+https://github.com/narcotic-sh/senko.git"
 ```
 For NVIDIA, make sure the installed driver is CUDA 12 capable (should see `CUDA Version: 12.x` in `nvidia-smi`).
@@ -111,7 +111,7 @@ During the embeddings generation phase, for example, while the actual model infe
 <br><br>
 Therefore, for optimal performance, pair a fast GPU with a fast CPU. The CPU bottleneck becomes more noticeable with very fast GPUs (ex. RTX 4090) where the GPU can execute the batch preparation and inference faster than the CPU can orchestrate/dispatch these operations.
 <br><br>
-As for <code>mps</code>, by default, the only part of the pipeline that runs on the GPU is the embeddings gen phase. All other parts run on the CPU. You <i>can</i> get VAD running on the GPU by setting <code>vad="pyannote"</code> in the <code>Diarizer</code> object instantiation. However, Pyannote VAD only runs fast on <code>cuda</code>, not <code>mps</code>. Therefore it is best to leave <code>vad="silero"</code> when on <code>mps</code>, which is the default.
+As for Mac, by default, the only part of the pipeline that doesn't run on the CPU is the embeddings gen phase, which runs on the ANE (Apple Neural Engine) through CoreML. All other parts run on the CPU. You <i>can</i> get VAD running on the GPU by setting <code>vad="pyannote"</code> in the <code>Diarizer</code> object instantiation. However, Pyannote VAD only runs fast on <code>cuda</code>, not on Mac GPUs. Therefore it is best to leave <code>vad="silero"</code> when on Mac, which is the default.
 </details>
 <details>
 <summary>Known limitations?</summary>

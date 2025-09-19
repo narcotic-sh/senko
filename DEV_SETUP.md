@@ -25,7 +25,7 @@ uv pip install -e "/path/to/cloned/senko[nvidia]"
 # For NVIDIA GPUs with CUDA compute capability < 7.5 (~GTX 10 series and older)
 uv pip install -e "/path/to/cloned/senko[nvidia-old]"
 
-# For Macs (mps) and cpu execution on all other platforms
+# For Mac (macOS 14+) and CPU execution on all other platforms
 uv pip install -e "/path/to/cloned/senko"
 ```
 For NVIDIA, make sure the installed driver is CUDA 12 capable (should see `CUDA Version: 12.x` in the top right of `nvidia-smi`)
@@ -37,7 +37,7 @@ Then use Senko like normal in scripts:
 from senko import Diarizer
 import json
 
-diarizer = Diarizer(torch_device='auto', warmup=True, quiet=False)
+diarizer = Diarizer(device='auto', warmup=True, quiet=False)
 result = diarizer.diarize('audio.wav', generate_colors=False) # 16kHz mono 16-bit wav
 
 with open('./audio_diarized.json', 'w') as f:

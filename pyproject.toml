@@ -60,7 +60,8 @@ dependencies = [
     "silero-vad",
     "termcolor",
     "psutil",
-    "colour-science"
+    "colour-science",
+    "coremltools; sys_platform == 'darwin'"
 ]
 
 [project.optional-dependencies]

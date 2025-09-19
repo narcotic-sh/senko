@@ -317,7 +317,7 @@ def evaluate_file(audio_file: Path, rttm_file: Path, diarizer,
 
 def main():
     parser = argparse.ArgumentParser(description='Evaluate Senko speaker diarization')
-    parser.add_argument('--device', choices=['cuda', 'mps', 'cpu', 'auto'], default='auto',
+    parser.add_argument('--device', choices=['auto', 'cuda', 'coreml', 'cpu'], default='auto',
                        help='Device for Senko processing')
     parser.add_argument('--vad', choices=['auto', 'pyannote', 'silero'], default='auto',
                        help='VAD system to use (auto=pyannote for CUDA, silero otherwise)')
@@ -345,7 +345,7 @@ def main():
 
     # Initialize Senko diarizer
     print(f"Initializing Senko diarizer (device: {args.device}, vad: {args.vad}, clustering: {args.clustering})...")
-    diarizer = senko.Diarizer(torch_device=args.device, vad=args.vad, clustering=args.clustering, warmup=True, quiet=False)
+    diarizer = senko.Diarizer(device=args.device, vad=args.vad, clustering=args.clustering, warmup=True, quiet=False)
     print("Diarizer ready!")
 
     # Setup dataset
