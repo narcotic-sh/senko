@@ -5,7 +5,7 @@ A very fast and accurate speaker diarization pipeline.
 
 1 hour of audio processed in 5 seconds (RTX 4090, Ryzen 9 7950X). ~17x faster than [Pyannote 3.1](https://huggingface.co/pyannote/speaker-diarization-3.1).
 
-On Apple M3, 1 hour in 23.5 seconds (~14x faster).
+On Apple M3, 1 hour in 15 seconds (~22x faster).
 
 The pipeline achieves a best score of 10.5% DER on VoxConverse, 9.3% on AISHELL-4, and 24.9% on AMI (IHM/SDM).
 
