@@ -132,7 +132,7 @@ Join the [Discord](https://discord.gg/Nf7m5Ftk3c) server to ask questions, sugge
 - Overlapping speaker segments support
 - Improve speaker colors generation algorithm
 - Support for Intel and AMD GPUs
-- Experiment with `torch.compile()` (faster than current JIT tracing TorchScript approach?)
+- Experiment with `torch.compile()`
 - Experiment with Modular [MAX](https://www.modular.com/blog/bring-your-own-pytorch-model) engine (faster CPU inference speed?)
 - Experiment with [Resonate](https://alexandrefrancois.org/Resonate/) for superior audio feature extraction
 - Background noise removal ([DeepFilterNet](https://github.com/Rikorose/DeepFilterNet))
