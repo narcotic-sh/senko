@@ -26,6 +26,10 @@ The following components are licensed under the Apache 2.0 License:
     - See individual source files for specific copyright holders
   Source: https://github.com/kaldi-asr/kaldi
 
+- FluidAudio
+  Copyright 2025 Fluid Inference
+  Source: https://github.com/FluidInference/FluidAudio
+
 License text:
 
                                  Apache License

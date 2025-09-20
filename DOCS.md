@@ -8,9 +8,9 @@ diarizer = senko.Diarizer(device='auto', vad='auto', clustering='auto', warmup=T
 - `device`: Device to use for PyTorch operations (`auto`, `cuda`, `coreml`, `cpu`)
     - `auto` automatically selects `coreml` if on macOS, if not, then `cuda`, if not, then `cpu`
 - `vad`: Voice Activity Detection model to use (`auto`, `pyannote`, `silero`)
-    - `auto` automatically selects `pyannote` for `cuda`, `silero` for everything else
+    - `auto` automatically selects `pyannote` for `cuda` & `coreml`, `silero` for `cpu`
     - `pyannote` uses Pyannote VAD (requires `cuda` for optimal performance)
-    - `silero` uses Silero VAD (works on all devices, runs on CPU)
+    - `silero` uses Silero VAD (runs on CPU; not available on macOS)
 - `clustering`: Clustering location when `device` == `cuda` (`auto`, `gpu`, `cpu`)
     - Only applies to CUDA devices; non-CUDA devices always use CPU clustering
     - `auto` uses GPU clustering for CUDA devices with compute capability >= 7.0, CPU clustering otherwise

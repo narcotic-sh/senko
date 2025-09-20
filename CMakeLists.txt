@@ -8,11 +8,15 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Find Python
 find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
 
-# Add the fbank_extractor subdirectory. This is where the C++ library is defined, built, and its installation is configured
+# libfbank_extractor
 add_subdirectory(senko/fbank_extractor)
+
+# libvad_coreml
+if(APPLE)
+    add_subdirectory(senko/vad_coreml)
+endif()
 
 # Only install in wheel builds (skip editable and sdist)
 if(SKBUILD_STATE STREQUAL "wheel")
-    install(TARGETS fbank_extractor DESTINATION senko)
     install(DIRECTORY models DESTINATION senko)
 endif()

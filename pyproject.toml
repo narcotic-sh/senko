@@ -56,11 +56,11 @@ dependencies = [
     "llvmlite",
     "pyyaml",
     "soundfile",
-    "torch",
-    "silero-vad",
     "termcolor",
     "psutil",
     "colour-science",
+    "silero-vad; sys_platform != 'darwin'",
+    "torch; sys_platform != 'darwin'",
     "coremltools; sys_platform == 'darwin'"
 ]
 
@@ -98,7 +98,10 @@ wheel.packages = ["senko"]                  # where python source code is locate
 cmake.source-dir = "."                      # dir where CMakeLists.txt is located (project root)
 cmake.build-type = "Release"
 build-dir = "build"                         # dir where CMake will place build artifacts during compilation
-wheel.exclude = ["senko/fbank_extractor"]   # exclude C++ source files from the wheel since they get compiled into binary
+wheel.exclude = [
+    "senko/fbank_extractor",
+    "senko/vad_coreml"
+]
 
 [tool.scikit-build.editable]
 mode = "redirect"                           # creates a .pth file pointing to senko/ for editable installs

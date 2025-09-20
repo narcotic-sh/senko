@@ -5,7 +5,7 @@ A very fast and accurate speaker diarization pipeline.
 
 1 hour of audio processed in 5 seconds (RTX 4090, Ryzen 9 7950X). ~17x faster than [Pyannote 3.1](https://huggingface.co/pyannote/speaker-diarization-3.1).
 
-On Apple M3, 1 hour in 15 seconds (~22x faster).
+On Apple M3, 1 hour in 7.7 seconds (~42x faster).
 
 The pipeline achieves a best score of 10.5% DER on VoxConverse, 9.3% on AISHELL-4, and 24.9% on AMI (IHM/SDM).
 
@@ -111,7 +111,7 @@ During the embeddings generation phase, for example, while the actual model infe
 <br><br>
 Therefore, for optimal performance, pair a fast GPU with a fast CPU. The CPU bottleneck becomes more noticeable with very fast GPUs (ex. RTX 4090) where the GPU can execute the batch preparation and inference faster than the CPU can orchestrate/dispatch these operations.
 <br><br>
-As for Mac, by default, the only part of the pipeline that doesn't run on the CPU is the embeddings gen phase, which runs on the ANE (Apple Neural Engine) through CoreML. All other parts run on the CPU. You <i>can</i> get VAD running on the GPU by setting <code>vad="pyannote"</code> in the <code>Diarizer</code> object instantiation. However, Pyannote VAD only runs fast on <code>cuda</code>, not on Mac GPUs. Therefore it is best to leave <code>vad="silero"</code> when on Mac, which is the default.
+As for Mac, both the VAD and embeddings gen phases run on the ANE (Apple Neural Engine) & CPU through CoreML. The fbank stage and clustering run purely on the CPU.
 </details>
 <details>
 <summary>Known limitations?</summary>

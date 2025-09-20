@@ -320,7 +320,7 @@ def main():
     parser.add_argument('--device', choices=['auto', 'cuda', 'coreml', 'cpu'], default='auto',
                        help='Device for Senko processing')
     parser.add_argument('--vad', choices=['auto', 'pyannote', 'silero'], default='auto',
-                       help='VAD system to use (auto=pyannote for CUDA, silero otherwise)')
+                       help='VAD to use')
     parser.add_argument('--clustering', choices=['auto', 'gpu', 'cpu'], default='auto',
                        help='Clustering location (auto=gpu for CUDA compute >=7.0, cpu otherwise)')
     parser.add_argument('--results_dir', type=Path, default='./senko_evaluation_results',

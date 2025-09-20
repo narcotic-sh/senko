@@ -11,7 +11,7 @@ A dataset of conversational speech from YouTube videos. Primarily English, with 
 | Device | VAD | Clustering Location | Global DER | Global RTF | System |
 |:--------:|:-----:|:-------------------:|:------------:|:------------:|:------------:|
 | `cuda` | pyannote | CPU | 10.5% | 0.0021401 | RTX 5090 + Ryzen 9 9950X |
-| `coreml` | silero | CPU | 11.0% | 0.0041023 | Apple M3 |
+| `coreml` | pyannote | CPU | 10.8% | 0.0020203 | Apple M3 |
 | `cuda` | pyannote | GPU | 14.5% | 0.0015595 | RTX 5090 + Ryzen 9 9950X |
 
 </center>
@@ -25,7 +25,7 @@ A dataset of meeting recordings in Mandarin Chinese.
 |:--------:|:-----:|:-------------------:|:------------:|:------------:|:------------:|
 | `cuda` | pyannote | GPU | 9.3% | 0.0015444 | RTX 5090 + Ryzen 9 9950X |
 | `cuda` | pyannote | CPU | 9.4% | 0.0034435 | RTX 5090 + Ryzen 9 9950X |
-| `coreml` | silero | CPU | 10.7% | 0.0043948 | Apple M3 |
+| `coreml` | pyannote | CPU | 9.5% | 0.0036052 | Apple M3 |
 
 </center>
 
@@ -40,7 +40,7 @@ A dataset of meeting recordings in English, with participants recorded using hea
 |:--------:|:-----:|:-------------------:|:------------:|:------------:|:------------:|
 | `cuda` | pyannote | GPU | 24.9% | 0.0014214 | RTX 5090 + Ryzen 9 9950X |
 | `cuda` | pyannote | CPU | 24.9% | 0.0028280 | RTX 5090 + Ryzen 9 9950X |
-| `coreml` | silero | CPU | 26.2% | 0.0042680 | Apple M3 |
+| `coreml` | pyannote | CPU | 25.2% | 0.0030760 | Apple M3 |
 
 </center>
 
@@ -52,6 +52,6 @@ A dataset of meeting recordings in English, with participants recorded using hea
 |:--------:|:-----:|:-------------------:|:------------:|:------------:|:------------:|
 | `cuda` | pyannote | GPU | 24.9% | 0.0014103 | RTX 5090 + Ryzen 9 9950X |
 | `cuda` | pyannote | CPU | 24.9% | 0.0028629 | RTX 5090 + Ryzen 9 9950X |
-| `coreml` | silero | CPU | 33.3% | 0.0040706 | Apple M3 |
+| `coreml` | pyannote | CPU | 30.7% | 0.0029834 | Apple M3 |
 
 </center>
