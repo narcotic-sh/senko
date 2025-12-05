@@ -159,39 +159,6 @@ class Diarizer:
         self.lib.free_fbank_features.restype = None
         self.fbank_extractor = self.lib.create_fbank_extractor()
 
-    def _init_kaldifeat_fbank(self):
-        """
-        Initialize a GPU Fbank extractor that mirrors the CPU/Kaldi settings used
-        in the C++ backend.
-        """
-        opts = self.kaldifeat.FbankOptions()
-        # Frame options
-        opts.frame_opts.samp_freq = 16000
-        opts.frame_opts.frame_shift_ms = 10.0
-        opts.frame_opts.frame_length_ms = 25.0
-        opts.frame_opts.dither = 0.0
-        opts.frame_opts.preemph_coeff = 0.97
-        opts.frame_opts.remove_dc_offset = True
-        opts.frame_opts.window_type = "povey"
-        opts.frame_opts.round_to_power_of_two = True
-        opts.frame_opts.blackman_coeff = 0.42
-        opts.frame_opts.snip_edges = True
-        # Mel options
-        opts.mel_opts.num_bins = 80
-        opts.mel_opts.low_freq = 20
-        opts.mel_opts.high_freq = 0
-        opts.mel_opts.vtln_low = 100
-        opts.mel_opts.vtln_high = -500
-        # Energy / log settings
-        opts.use_energy = False
-        opts.energy_floor = 1.0
-        opts.raw_energy = True
-        opts.use_log_fbank = True
-        opts.use_power = True
-        opts.device = self.torch_device
-
-        return self.kaldifeat.Fbank(opts)
-
         ################
         ## Embeddings ##
         ################
@@ -280,6 +247,39 @@ class Diarizer:
     def __del__(self):
         if hasattr(self, 'fbank_extractor') and self.fbank_extractor:
             self.lib.destroy_fbank_extractor(self.fbank_extractor)
+
+    def _init_kaldifeat_fbank(self):
+        """
+        Initialize a GPU Fbank extractor that mirrors the CPU/Kaldi settings used
+        in the C++ backend.
+        """
+        opts = self.kaldifeat.FbankOptions()
+        # Frame options
+        opts.frame_opts.samp_freq = 16000
+        opts.frame_opts.frame_shift_ms = 10.0
+        opts.frame_opts.frame_length_ms = 25.0
+        opts.frame_opts.dither = 0.0
+        opts.frame_opts.preemph_coeff = 0.97
+        opts.frame_opts.remove_dc_offset = True
+        opts.frame_opts.window_type = "povey"
+        opts.frame_opts.round_to_power_of_two = True
+        opts.frame_opts.blackman_coeff = 0.42
+        opts.frame_opts.snip_edges = True
+        # Mel options
+        opts.mel_opts.num_bins = 80
+        opts.mel_opts.low_freq = 20
+        opts.mel_opts.high_freq = 0
+        opts.mel_opts.vtln_low = 100
+        opts.mel_opts.vtln_high = -500
+        # Energy / log settings
+        opts.use_energy = False
+        opts.energy_floor = 1.0
+        opts.raw_energy = True
+        opts.use_log_fbank = True
+        opts.use_power = True
+        opts.device = self.torch_device
+
+        return self.kaldifeat.Fbank(opts)
 
     def diarize(self, wav_path, accurate=None, generate_colors=False):
         self._timing_stats = {}
