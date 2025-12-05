@@ -130,6 +130,13 @@ name = "nvidia-rapids"
 url = "https://pypi.nvidia.com"
 explicit = true
 
+# Kaldifeat prebuilt wheels (flat HTML index)
+[[tool.uv.index]]
+name = "kaldifeat-cuda"
+url = "https://csukuangfj.github.io/kaldifeat/cuda.html"
+format = "flat"
+explicit = true
+
 [tool.uv.sources]
 # Override torch/torchaudio for:
 #   nvidia -> use CUDA 12.9 torch
@@ -142,6 +149,7 @@ torchaudio = [
     { marker = "extra == 'nvidia'", index = "pytorch-cu129" },
     { marker = "extra != 'nvidia' and extra == 'nvidia-old'", index = "pytorch-cu126" },
 ]
+kaldifeat = { index = "kaldifeat-cuda" }
 
 # RAPIDS packages
 cudf-cu12 = { index = "nvidia-rapids" }
