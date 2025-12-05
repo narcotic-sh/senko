@@ -63,7 +63,7 @@ It consists of four stages: VAD (voice activity detection), Fbank feature extrac
 
 The following modifications have been made:
 - VAD model has been swapped from FSMN-VAD to either Pyannote [segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0) or [Silero VAD](https://github.com/snakers4/silero-vad)
-- Fbank feature extraction is done fully upfront, in C++, using all available CPU cores
+- Fbank feature extraction is done fully upfront. On CUDA it uses [kaldifeat](https://github.com/csukuangfj/kaldifeat) on the GPU (falls back to the C++ CPU extractor if the package is unavailable); on CPU/CoreML it uses the existing C++ implementation and all available CPU cores
 - Batched inference of CAM++ embedding model
 - Clustering when on NVIDIA (with a GPU of CUDA compute capability 7.0+) can be done on the GPU through [RAPIDS](https://docs.rapids.ai/api/cuml/stable/zero-code-change/)
 
@@ -103,7 +103,7 @@ On a Ryzen 9 9950X it takes 42 seconds to process 1 hour of audio.
 <details>
 <summary>Does the entire pipeline run fully on the GPU, if available?</summary>
 <br>
-With <code>cuda</code>, all parts of the pipeline except Fbank feature extraction (which always runs on the CPU) do, by default, run on the GPU (though you can override this behaviour using the <code>vad</code> and <code>clustering</code> arguments of the <code>Diarizer</code> object). However, CPU performance still significantly impacts overall speed even for the GPU-accelerated stages.
+With <code>cuda</code>, all parts of the pipeline now run on the GPU by default, including Fbank feature extraction (via <code>kaldifeat</code>) as long as that dependency is installed. If <code>kaldifeat</code> is missing, the Fbank step falls back to the CPU C++ extractor. You can override behaviour using the <code>vad</code> and <code>clustering</code> arguments of the <code>Diarizer</code> object. However, CPU performance still significantly impacts overall speed even for the GPU-accelerated stages.
 <br><br>
 During the embeddings generation phase, for example, while the actual model inference happens on the GPU with minimal CPU-GPU memory transfers (just input/output), the CPU handles all the orchestration work: Python loops for batching, tensor preparation, padding operations dispatch, and managing the inference pipeline. All this orchestration runs single-threaded on the CPU. This means a faster CPU will improve performance even when using a powerful GPU, as the CPU coordinates all the GPU operations.
 <br><br>

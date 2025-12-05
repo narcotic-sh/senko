@@ -68,13 +68,15 @@ dependencies = [
 # CUDA 12 capable driver + CUDA compute capability < 7.5
 nvidia-old = [
     "torchaudio",
-    "pyannote.audio"
+    "pyannote.audio",
+    "kaldifeat"
 ]
 
 # CUDA 12 capable driver + CUDA compute capability >= 7.5
 nvidia = [
     "torchaudio",
     "pyannote.audio",
+    "kaldifeat",
     "cudf-cu12==25.8.*",
     "dask-cudf-cu12==25.8.*",
     "cuml-cu12==25.8.*",

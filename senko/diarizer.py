@@ -50,6 +50,9 @@ class Diarizer:
         ## Device ##
         ############
 
+        # Default fbank backend flag
+        self.use_gpu_fbank = False
+
         if config.DARWIN:
             self.device = 'coreml'
             self.torch_device = None
@@ -57,6 +60,15 @@ class Diarizer:
             self.torch_device = (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")) if device == 'auto' else torch.device(device)
             self.device = self.torch_device.type
             self.logical_cores = psutil.cpu_count(logical=True)
+            if self.device == 'cuda':
+                try:
+                    import kaldifeat
+                    self.kaldifeat = kaldifeat
+                    self.kaldifeat_fbank = self._init_kaldifeat_fbank()
+                    self.use_gpu_fbank = True
+                    self._print("Using GPU fbank via kaldifeat")
+                except ImportError:
+                    self._print("kaldifeat not found; falling back to CPU fbank")
 
         self._print(f"Using device: {self.device}")
 
@@ -146,6 +158,39 @@ class Diarizer:
         self.lib.free_fbank_features.argtypes = [ctypes.POINTER(FbankFeatures)]
         self.lib.free_fbank_features.restype = None
         self.fbank_extractor = self.lib.create_fbank_extractor()
+
+    def _init_kaldifeat_fbank(self):
+        """
+        Initialize a GPU Fbank extractor that mirrors the CPU/Kaldi settings used
+        in the C++ backend.
+        """
+        opts = self.kaldifeat.FbankOptions()
+        # Frame options
+        opts.frame_opts.samp_freq = 16000
+        opts.frame_opts.frame_shift_ms = 10.0
+        opts.frame_opts.frame_length_ms = 25.0
+        opts.frame_opts.dither = 0.0
+        opts.frame_opts.preemph_coeff = 0.97
+        opts.frame_opts.remove_dc_offset = True
+        opts.frame_opts.window_type = "povey"
+        opts.frame_opts.round_to_power_of_two = True
+        opts.frame_opts.blackman_coeff = 0.42
+        opts.frame_opts.snip_edges = True
+        # Mel options
+        opts.mel_opts.num_bins = 80
+        opts.mel_opts.low_freq = 20
+        opts.mel_opts.high_freq = 0
+        opts.mel_opts.vtln_low = 100
+        opts.mel_opts.vtln_high = -500
+        # Energy / log settings
+        opts.use_energy = False
+        opts.energy_floor = 1.0
+        opts.raw_energy = True
+        opts.use_log_fbank = True
+        opts.use_power = True
+        opts.device = self.torch_device
+
+        return self.kaldifeat.Fbank(opts)
 
         ################
         ## Embeddings ##
@@ -365,6 +410,10 @@ class Diarizer:
 
     @time_method('fbank_time', 'Fbank feature extraction')
     def _extract_fbank_features(self, wav_path, subsegments):
+        # GPU path: use kaldifeat when available on CUDA
+        if getattr(self, "use_gpu_fbank", False):
+            return self._extract_fbank_features_gpu(wav_path, subsegments)
+
         # Convert subsegments to flat array
         subseg_array = np.array(subsegments, dtype=np.float32).flatten()
         subseg_ptr = subseg_array.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
@@ -390,6 +439,64 @@ class Diarizer:
 
         return features_copy, frames_per_seg_copy, subsegment_offsets_copy, features.feature_dim
 
+    def _extract_fbank_features_gpu(self, wav_path, subsegments):
+        import torchaudio
+        import torch.nn.functional as F
+
+        sample_rate = 16000
+        min_len = 400  # match C++ padding
+
+        wav, sr = torchaudio.load(wav_path)  # wav: (1, num_samples)
+        if sr != sample_rate:
+            raise AudioFormatError(f"Expected sample rate {sample_rate}, got {sr}")
+        wav = wav.squeeze(0).to(self.torch_device)
+
+        segment_tensors = []
+        for start_sec, end_sec in subsegments:
+            start = int(start_sec * sample_rate)
+            length = int((end_sec - start_sec) * sample_rate)
+            if length <= 0:
+                length = 1
+            # Clamp to available samples
+            if start + length > wav.numel():
+                length = wav.numel() - start
+            seg = wav[start:start + length]
+            if seg.numel() < min_len:
+                pad = min_len - seg.numel()
+                seg = F.pad(seg, (0, pad))
+            segment_tensors.append(seg)
+
+        # Compute features; passing list avoids padding-induced extra frames
+        with torch.no_grad():
+            feats_list = self.kaldifeat_fbank(segment_tensors)
+
+        mel_bins = feats_list[0].shape[1] if feats_list else 80
+
+        features_list = []
+        frames_per_subsegment = []
+        subsegment_offsets = []
+
+        offset = 0
+        for curr in feats_list:
+            frames = curr.size(0)
+            if frames > 0:
+                curr = curr - curr.mean(dim=0, keepdim=True)
+            curr_flat = curr.contiguous().view(-1)
+            features_list.append(curr_flat)
+            frames_per_subsegment.append(frames)
+            subsegment_offsets.append(offset)
+            offset += curr_flat.numel()
+
+        if features_list:
+            features_tensor = torch.cat(features_list, dim=0)
+        else:
+            features_tensor = torch.empty(0, device=self.torch_device, dtype=torch.float32)
+
+        frames_np = np.array(frames_per_subsegment, dtype=np.int64)
+        offsets_np = np.array(subsegment_offsets, dtype=np.int64)
+
+        return features_tensor, frames_np, offsets_np, mel_bins
+
     @time_method('embeddings_time', 'Embeddings generation')
     def _generate_embeddings(self, features_flat, frames_per_subsegment, subsegment_offsets, feature_dim):
         if self.device == 'coreml':
@@ -398,8 +505,11 @@ class Diarizer:
         if self.vad_model_type == 'pyannote' and self.device == 'cuda':
             set_fp32_precision('tf32')
 
-        # Move features to torch device
-        big_tensor = torch.from_numpy(features_flat).to(self.torch_device)
+        # Move features to torch device (avoid extra copy if already a tensor)
+        if isinstance(features_flat, torch.Tensor):
+            big_tensor = features_flat
+        else:
+            big_tensor = torch.from_numpy(features_flat).to(self.torch_device)
 
         feature_tensors = []
         for i, (frames, offset) in enumerate(zip(frames_per_subsegment, subsegment_offsets)):
