@@ -446,48 +446,56 @@ class Diarizer:
         sample_rate = 16000
         min_len = 400  # match C++ padding
 
-        wav, sr = torchaudio.load(wav_path)  # wav: (1, num_samples)
+        wav, sr = torchaudio.load(wav_path)  # wav: (1, num_samples) on CPU
         if sr != sample_rate:
             raise AudioFormatError(f"Expected sample rate {sample_rate}, got {sr}")
-        wav = wav.squeeze(0).to(self.torch_device)
+        wav = wav.squeeze(0)  # keep on CPU to avoid holding full audio on GPU
 
-        segment_tensors = []
-        for start_sec, end_sec in subsegments:
-            start = int(start_sec * sample_rate)
-            length = int((end_sec - start_sec) * sample_rate)
-            if length <= 0:
-                length = 1
-            # Clamp to available samples
-            if start + length > wav.numel():
-                length = wav.numel() - start
-            seg = wav[start:start + length]
-            if seg.numel() < min_len:
-                pad = min_len - seg.numel()
-                seg = F.pad(seg, (0, pad))
-            segment_tensors.append(seg)
-
-        # Compute features; passing list avoids padding-induced extra frames
-        with torch.no_grad():
-            feats_list = self.kaldifeat_fbank(segment_tensors)
-
-        mel_bins = feats_list[0].shape[1] if feats_list else 80
+        BATCH_SEGMENTS = 256
 
         features_list = []
         frames_per_subsegment = []
         subsegment_offsets = []
-
         offset = 0
-        for curr in feats_list:
-            frames = curr.size(0)
-            if frames > 0:
-                curr = curr - curr.mean(dim=0, keepdim=True)
-            # Move each segment back to CPU immediately to avoid large GPU buffers on long audio
-            curr_cpu = curr.cpu()
-            curr_flat = curr_cpu.contiguous().view(-1)
-            features_list.append(curr_flat)
-            frames_per_subsegment.append(frames)
-            subsegment_offsets.append(offset)
-            offset += curr_flat.numel()
+        mel_bins = 80
+
+        for b in range(0, len(subsegments), BATCH_SEGMENTS):
+            batch_segments = subsegments[b:b + BATCH_SEGMENTS]
+            segment_tensors = []
+            for start_sec, end_sec in batch_segments:
+                start = int(start_sec * sample_rate)
+                length = int((end_sec - start_sec) * sample_rate)
+                if length <= 0:
+                    length = 1
+                if start + length > wav.numel():
+                    length = wav.numel() - start
+                seg = wav[start:start + length]
+                if seg.numel() < min_len:
+                    pad = min_len - seg.numel()
+                    seg = F.pad(seg, (0, pad))
+                # move just this segment to GPU for fbank computation
+                segment_tensors.append(seg.to(self.torch_device))
+
+            # Compute features for this batch
+            with torch.no_grad():
+                feats_batch = self.kaldifeat_fbank(segment_tensors)
+
+            if feats_batch:
+                mel_bins = feats_batch[0].shape[1]
+
+            for curr in feats_batch:
+                frames = curr.size(0)
+                if frames > 0:
+                    curr = curr - curr.mean(dim=0, keepdim=True)
+                curr_cpu = curr.cpu()
+                curr_flat = curr_cpu.contiguous().view(-1)
+                features_list.append(curr_flat)
+                frames_per_subsegment.append(frames)
+                subsegment_offsets.append(offset)
+                offset += curr_flat.numel()
+
+            # free GPU memory between batches
+            torch.cuda.empty_cache()
 
         if features_list:
             features_tensor = torch.cat(features_list, dim=0)  # CPU tensor
