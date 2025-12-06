@@ -115,7 +115,7 @@ class Diarizer:
             self.read_audio_silero = read_audio
             self.get_speech_timestamps_silero = get_speech_timestamps
 
-        self._print(f'Using {self.vad_model_type} VAD' + ' (CoreML)' if self.device == 'coreml' else '')
+        self._print(f'Using {self.vad_model_type} VAD' + (' (CoreML)' if self.device == 'coreml' else ''))
 
         # silero sets torch threads to 1; set it back to make full use of all cores
         if self.vad_model_type == 'silero':
