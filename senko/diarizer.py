@@ -161,7 +161,7 @@ class Diarizer:
                 self.use_gpu_fbank = False
         
         # Extract features on CPU using C++ lib
-        if not self.use_gpu_fbank:
+        if not getattr(self, 'use_gpu_fbank', False):
             self.lib = ctypes.CDLL(config.FBANK_LIB_PATH)
 
             class FbankFeatures(ctypes.Structure):
