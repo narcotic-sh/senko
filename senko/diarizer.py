@@ -406,7 +406,7 @@ class Diarizer:
     @time_method('fbank_time', 'Fbank feature extraction')
     def _extract_fbank_features(self, wav_path, subsegments):
         # GPU path: use kaldifeat when available on CUDA
-        if self.use_gpu_fbank:
+        if getattr(self, 'use_gpu_fbank', False):
             return self._extract_fbank_features_gpu(wav_path, subsegments)
 
         # Convert subsegments to flat array
