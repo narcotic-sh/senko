@@ -481,16 +481,18 @@ class Diarizer:
             frames = curr.size(0)
             if frames > 0:
                 curr = curr - curr.mean(dim=0, keepdim=True)
-            curr_flat = curr.contiguous().view(-1)
+            # Move each segment back to CPU immediately to avoid large GPU buffers on long audio
+            curr_cpu = curr.cpu()
+            curr_flat = curr_cpu.contiguous().view(-1)
             features_list.append(curr_flat)
             frames_per_subsegment.append(frames)
             subsegment_offsets.append(offset)
             offset += curr_flat.numel()
 
         if features_list:
-            features_tensor = torch.cat(features_list, dim=0)
+            features_tensor = torch.cat(features_list, dim=0)  # CPU tensor
         else:
-            features_tensor = torch.empty(0, device=self.torch_device, dtype=torch.float32)
+            features_tensor = torch.empty(0, device='cpu', dtype=torch.float32)
 
         frames_np = np.array(frames_per_subsegment, dtype=np.int64)
         offsets_np = np.array(subsegment_offsets, dtype=np.int64)
@@ -507,7 +509,7 @@ class Diarizer:
 
         # Move features to torch device (avoid extra copy if already a tensor)
         if isinstance(features_flat, torch.Tensor):
-            big_tensor = features_flat
+            big_tensor = features_flat.to(self.torch_device)
         else:
             big_tensor = torch.from_numpy(features_flat).to(self.torch_device)
 
