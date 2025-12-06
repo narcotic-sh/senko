@@ -50,9 +50,6 @@ class Diarizer:
         ## Device ##
         ############
 
-        # Default fbank backend flag
-        self.use_gpu_fbank = False
-
         if config.DARWIN:
             self.device = 'coreml'
             self.torch_device = None
@@ -61,14 +58,8 @@ class Diarizer:
             self.device = self.torch_device.type
             self.logical_cores = psutil.cpu_count(logical=True)
             if self.device == 'cuda':
-                try:
-                    import kaldifeat
-                    self.kaldifeat = kaldifeat
-                    self.kaldifeat_fbank = self._init_kaldifeat_fbank()
-                    self.use_gpu_fbank = True
-                    self._print("Using GPU fbank via kaldifeat")
-                except ImportError:
-                    self._print("kaldifeat not found; falling back to CPU fbank")
+                import torchaudio
+                import torch.nn.functional as F
 
         self._print(f"Using device: {self.device}")
 
@@ -130,34 +121,69 @@ class Diarizer:
         if self.vad_model_type == 'silero':
             self._set_torch_num_threads()
 
-        ######################################
-        ## Fbank feature extraction C++ lib ##
-        ######################################
+        ##############################
+        ## Fbank feature extraction ##
+        ##############################
 
-        self.lib = ctypes.CDLL(config.FBANK_LIB_PATH)
+        # Extract features on GPU through kaldifeat
+        if self.device == 'cuda':
+            try:
+                import kaldifeat
+                self.kaldifeat = kaldifeat
+                # Configure kaldifeat options to match C++ extractor
+                opts = self.kaldifeat.FbankOptions()
+                opts.frame_opts.samp_freq = 16000
+                opts.frame_opts.frame_shift_ms = 10.0
+                opts.frame_opts.frame_length_ms = 25.0
+                opts.frame_opts.dither = 0.0
+                opts.frame_opts.preemph_coeff = 0.97
+                opts.frame_opts.remove_dc_offset = True
+                opts.frame_opts.window_type = "povey"
+                opts.frame_opts.round_to_power_of_two = True
+                opts.frame_opts.blackman_coeff = 0.42
+                opts.frame_opts.snip_edges = True
+                opts.mel_opts.num_bins = 80
+                opts.mel_opts.low_freq = 20
+                opts.mel_opts.high_freq = 0
+                opts.mel_opts.vtln_low = 100
+                opts.mel_opts.vtln_high = -500
+                opts.use_energy = False
+                opts.energy_floor = 1.0
+                opts.raw_energy = True
+                opts.use_log_fbank = True
+                opts.use_power = True
+                opts.device = self.torch_device
+                self.kaldifeat_fbank = self.kaldifeat.Fbank(opts)
+                self.use_gpu_fbank = True
+            except ImportError:
+                self.use_gpu_fbank = False
+        
+        # Extract features on CPU using C++ lib
+        if not self.use_gpu_fbank:
+            self.lib = ctypes.CDLL(config.FBANK_LIB_PATH)
 
-        class FbankFeatures(ctypes.Structure):
-            _fields_ = [
-                ("data", ctypes.POINTER(ctypes.c_float)),
-                ("frames_per_subsegment", ctypes.POINTER(ctypes.c_size_t)),
-                ("subsegment_offsets", ctypes.POINTER(ctypes.c_size_t)),
-                ("num_subsegments", ctypes.c_size_t),
-                ("total_frames", ctypes.c_size_t),
-                ("feature_dim", ctypes.c_size_t)
+            class FbankFeatures(ctypes.Structure):
+                _fields_ = [
+                    ("data", ctypes.POINTER(ctypes.c_float)),
+                    ("frames_per_subsegment", ctypes.POINTER(ctypes.c_size_t)),
+                    ("subsegment_offsets", ctypes.POINTER(ctypes.c_size_t)),
+                    ("num_subsegments", ctypes.c_size_t),
+                    ("total_frames", ctypes.c_size_t),
+                    ("feature_dim", ctypes.c_size_t)
+                ]
+
+            self.FbankFeatures = FbankFeatures
+            self.lib.create_fbank_extractor.restype = ctypes.c_void_p
+            self.lib.destroy_fbank_extractor.argtypes = [ctypes.c_void_p]
+            self.lib.destroy_fbank_extractor.restype = None
+            self.lib.extract_fbank_features.argtypes = [
+                ctypes.c_void_p, ctypes.c_char_p,
+                ctypes.POINTER(ctypes.c_float), ctypes.c_size_t
             ]
-
-        self.FbankFeatures = FbankFeatures
-        self.lib.create_fbank_extractor.restype = ctypes.c_void_p
-        self.lib.destroy_fbank_extractor.argtypes = [ctypes.c_void_p]
-        self.lib.destroy_fbank_extractor.restype = None
-        self.lib.extract_fbank_features.argtypes = [
-            ctypes.c_void_p, ctypes.c_char_p,
-            ctypes.POINTER(ctypes.c_float), ctypes.c_size_t
-        ]
-        self.lib.extract_fbank_features.restype = FbankFeatures
-        self.lib.free_fbank_features.argtypes = [ctypes.POINTER(FbankFeatures)]
-        self.lib.free_fbank_features.restype = None
-        self.fbank_extractor = self.lib.create_fbank_extractor()
+            self.lib.extract_fbank_features.restype = FbankFeatures
+            self.lib.free_fbank_features.argtypes = [ctypes.POINTER(FbankFeatures)]
+            self.lib.free_fbank_features.restype = None
+            self.fbank_extractor = self.lib.create_fbank_extractor()
 
         ################
         ## Embeddings ##
@@ -247,39 +273,6 @@ class Diarizer:
     def __del__(self):
         if hasattr(self, 'fbank_extractor') and self.fbank_extractor:
             self.lib.destroy_fbank_extractor(self.fbank_extractor)
-
-    def _init_kaldifeat_fbank(self):
-        """
-        Initialize a GPU Fbank extractor that mirrors the CPU/Kaldi settings used
-        in the C++ backend.
-        """
-        opts = self.kaldifeat.FbankOptions()
-        # Frame options
-        opts.frame_opts.samp_freq = 16000
-        opts.frame_opts.frame_shift_ms = 10.0
-        opts.frame_opts.frame_length_ms = 25.0
-        opts.frame_opts.dither = 0.0
-        opts.frame_opts.preemph_coeff = 0.97
-        opts.frame_opts.remove_dc_offset = True
-        opts.frame_opts.window_type = "povey"
-        opts.frame_opts.round_to_power_of_two = True
-        opts.frame_opts.blackman_coeff = 0.42
-        opts.frame_opts.snip_edges = True
-        # Mel options
-        opts.mel_opts.num_bins = 80
-        opts.mel_opts.low_freq = 20
-        opts.mel_opts.high_freq = 0
-        opts.mel_opts.vtln_low = 100
-        opts.mel_opts.vtln_high = -500
-        # Energy / log settings
-        opts.use_energy = False
-        opts.energy_floor = 1.0
-        opts.raw_energy = True
-        opts.use_log_fbank = True
-        opts.use_power = True
-        opts.device = self.torch_device
-
-        return self.kaldifeat.Fbank(opts)
 
     def diarize(self, wav_path, accurate=None, generate_colors=False):
         self._timing_stats = {}
@@ -411,7 +404,7 @@ class Diarizer:
     @time_method('fbank_time', 'Fbank feature extraction')
     def _extract_fbank_features(self, wav_path, subsegments):
         # GPU path: use kaldifeat when available on CUDA
-        if getattr(self, "use_gpu_fbank", False):
+        if self.use_gpu_fbank:
             return self._extract_fbank_features_gpu(wav_path, subsegments)
 
         # Convert subsegments to flat array
@@ -440,16 +433,10 @@ class Diarizer:
         return features_copy, frames_per_seg_copy, subsegment_offsets_copy, features.feature_dim
 
     def _extract_fbank_features_gpu(self, wav_path, subsegments):
-        import torchaudio
-        import torch.nn.functional as F
-
         sample_rate = 16000
         min_len = 400  # match C++ padding
-
-        wav, sr = torchaudio.load(wav_path)  # wav: (1, num_samples) on CPU
-        if sr != sample_rate:
-            raise AudioFormatError(f"Expected sample rate {sample_rate}, got {sr}")
-        wav = wav.squeeze(0)  # keep on CPU to avoid holding full audio on GPU
+        wav, sr = torchaudio.load(wav_path)  # shape: (1, num_samples) on CPU
+        wav = wav.squeeze(0)  # drop channel dim to 1-D samples
 
         BATCH_SEGMENTS = 256
 
