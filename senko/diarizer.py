@@ -57,9 +57,6 @@ class Diarizer:
             self.torch_device = (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")) if device == 'auto' else torch.device(device)
             self.device = self.torch_device.type
             self.logical_cores = psutil.cpu_count(logical=True)
-            if self.device == 'cuda':
-                import torchaudio
-                import torch.nn.functional as F
 
         self._print(f"Using device: {self.device}")
 
@@ -433,6 +430,9 @@ class Diarizer:
         return features_copy, frames_per_seg_copy, subsegment_offsets_copy, features.feature_dim
 
     def _extract_fbank_features_gpu(self, wav_path, subsegments):
+        import torchaudio
+        import torch.nn.functional as F
+        
         sample_rate = 16000
         min_len = 400  # match C++ padding
         wav, sr = torchaudio.load(wav_path)  # shape: (1, num_samples) on CPU
