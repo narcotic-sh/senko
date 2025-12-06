@@ -28,6 +28,11 @@ if not config.DARWIN:
     torch_version = tuple(map(int, torch_version_str.split('.')[:2]))
     use_legacy_tf32 = torch_version < (2, 9)
     
+    # For kaldifeat fbank extraction on GPU
+    if torch.cuda.is_available():
+        import torchaudio
+        import torch.nn.functional as F
+    
     def set_fp32_precision(mode='ieee'):
         if use_legacy_tf32:
             allow_tf32 = (mode == 'tf32')
@@ -430,9 +435,6 @@ class Diarizer:
         return features_copy, frames_per_seg_copy, subsegment_offsets_copy, features.feature_dim
 
     def _extract_fbank_features_gpu(self, wav_path, subsegments):
-        import torchaudio
-        import torch.nn.functional as F
-        
         sample_rate = 16000
         min_len = 400  # match C++ padding
         wav, sr = torchaudio.load(wav_path)  # shape: (1, num_samples) on CPU
