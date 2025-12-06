@@ -67,14 +67,16 @@ dependencies = [
 [project.optional-dependencies]
 # CUDA 12 capable driver + CUDA compute capability < 7.5
 nvidia-old = [
-    "torchaudio",
+    "torchaudio==2.8.0",
+    "torchvision==0.23.0",
     "pyannote.audio",
     "kaldifeat"
 ]
 
 # CUDA 12 capable driver + CUDA compute capability >= 7.5
 nvidia = [
-    "torchaudio",
+    "torchaudio==2.8.0",
+    "torchvision==0.23.0",
     "pyannote.audio",
     "kaldifeat",
     "cudf-cu12==25.8.*",
@@ -146,6 +148,10 @@ torch = [
     { marker = "extra != 'nvidia' and extra == 'nvidia-old'", index = "pytorch-cu126" },
 ]
 torchaudio = [
+    { marker = "extra == 'nvidia'", index = "pytorch-cu129" },
+    { marker = "extra != 'nvidia' and extra == 'nvidia-old'", index = "pytorch-cu126" },
+]
+torchvision = [
     { marker = "extra == 'nvidia'", index = "pytorch-cu129" },
     { marker = "extra != 'nvidia' and extra == 'nvidia-old'", index = "pytorch-cu126" },
 ]
