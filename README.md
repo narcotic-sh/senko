@@ -30,7 +30,7 @@ Senko can also be used in a notebook, like Google Colab; see [here](https://cola
 ## Installation
 Senko has been tested to work on Linux, macOS, and WSL.
 
-Pre-requisites:
+Prerequisites:
 - `gcc/clang` - on Linux/WSL, a separate install; on macOS, have the Xcode Command Line Tools installed
 - [`uv`](https://docs.astral.sh/uv/#installation)
 
@@ -63,8 +63,8 @@ It consists of four stages: VAD (voice activity detection), Fbank feature extrac
 
 The following modifications have been made:
 - VAD model has been swapped from FSMN-VAD to either Pyannote [segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0) or [Silero VAD](https://github.com/snakers4/silero-vad)
-- Fbank feature extraction is done fully upfront, in C++, using all available CPU cores
-- Batched inference of CAM++ embedding model
+- Fbank feature extraction is done fully upfront, on the GPU using [kaldifeat](https://github.com/csukuangfj/kaldifeat) if on NVIDIA, and on the CPU using all cores otherwise. 
+- Batched inference of the CAM++ embedding model
 - Clustering when on NVIDIA (with a GPU of CUDA compute capability 7.0+) can be done on the GPU through [RAPIDS](https://docs.rapids.ai/api/cuml/stable/zero-code-change/)
 
 On Linux/WSL, both Pyannote segmentation-3.0 and CAM++ run using PyTorch, but on Mac, both models run through CoreML. The CAM++ CoreML conversion was done from scratch in this project (see [`tracing/coreml`](tracing/coreml)), but the segmentation-3.0 converted model and interfacing code is taken from the excellent [FluidAudio](https://github.com/FluidInference/FluidAudio) project by Fluid Inference.
@@ -88,7 +88,7 @@ You can also load in the diarization data that Senko generates manually into Zan
 <details>
 <summary>What languages does Senko support?</summary>
 <br>
-Generally the pipeline should work for any language, as it relies on acoustic patterns as opposed to words or speech patterns. That being said, the embeddings model used in this pipeline was trained on a mix of English and Mandarin Chinese. So the pipeline will likely work best on English and Mandarin Chinese.
+Generally, the pipeline should work for any language, as it relies on acoustic patterns as opposed to words or speech patterns. That being said, the embeddings model used in this pipeline was trained on a mix of English and Mandarin Chinese. So the pipeline will likely work best on English and Mandarin Chinese.
 </details>
 <details>
 <summary>Are overlapping speaker segments detected correctly?</summary>
@@ -98,18 +98,16 @@ The current output will not have any overlapping speaker segments; i.e. only one
 <details>
 <summary>How fast is the pipeline on CPU (<code>cpu</code>)?</summary>
 <br>
-On a Ryzen 9 9950X it takes 42 seconds to process 1 hour of audio.
+On a Ryzen 9 9950X, it takes 42 seconds to process 1 hour of audio.
 </details>
 <details>
 <summary>Does the entire pipeline run fully on the GPU, if available?</summary>
 <br>
-With <code>cuda</code>, all parts of the pipeline except Fbank feature extraction (which always runs on the CPU) do, by default, run on the GPU (though you can override this behaviour using the <code>vad</code> and <code>clustering</code> arguments of the <code>Diarizer</code> object). However, CPU performance still significantly impacts overall speed even for the GPU-accelerated stages.
+With <code>cuda</code>, all parts of the pipeline run on the GPU by default. Clustering runs on the GPU only when your NVIDIA card has CUDA compute capability &ge; 7.0 (~GTX 16 series and newer); otherwise clustering falls back to the CPU. However, CPU performance still impacts overall diarization speed.
 <br><br>
-During the embeddings generation phase, for example, while the actual model inference happens on the GPU with minimal CPU-GPU memory transfers (just input/output), the CPU handles all the orchestration work: Python loops for batching, tensor preparation, padding operations dispatch, and managing the inference pipeline. All this orchestration runs single-threaded on the CPU. This means a faster CPU will improve performance even when using a powerful GPU, as the CPU coordinates all the GPU operations.
+During the embeddings generation phase, for example, model inference runs on the GPU with minimal CPU–GPU transfers, while the Python loop that batches and dispatches work is single‑threaded on the CPU. Thus, a faster CPU shortens that orchestration overhead, keeping the GPU fed. For best throughput, pair a fast GPU with a CPU that has strong single‑threaded performance; the CPU bottleneck becomes more noticeable with very fast GPUs (e.g., RTX 5090).
 <br><br>
-Therefore, for optimal performance, pair a fast GPU with a fast CPU. The CPU bottleneck becomes more noticeable with very fast GPUs (ex. RTX 4090) where the GPU can execute the batch preparation and inference faster than the CPU can orchestrate/dispatch these operations.
-<br><br>
-As for Mac, both the VAD and embeddings gen phases run on the ANE (Apple Neural Engine) & CPU through CoreML. The fbank stage and clustering run purely on the CPU.
+On Mac, VAD and embeddings run on the ANE and CPU through CoreML, and fbank and clustering run on the CPU.
 </details>
 <details>
 <summary>Known limitations?</summary>

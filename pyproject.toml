@@ -60,21 +60,25 @@ dependencies = [
     "psutil",
     "colour-science",
     "silero-vad; sys_platform != 'darwin'",
-    "torch; sys_platform != 'darwin'",
+    "torch==2.8.0; sys_platform != 'darwin'",
     "coremltools; sys_platform == 'darwin'"
 ]
 
 [project.optional-dependencies]
 # CUDA 12 capable driver + CUDA compute capability < 7.5
 nvidia-old = [
-    "torchaudio",
-    "pyannote.audio"
+    "torchaudio==2.8.0",
+    "torchvision==0.23.0",
+    "pyannote.audio",
+    "kaldifeat"
 ]
 
 # CUDA 12 capable driver + CUDA compute capability >= 7.5
 nvidia = [
-    "torchaudio",
+    "torchaudio==2.8.0",
+    "torchvision==0.23.0",
     "pyannote.audio",
+    "kaldifeat",
     "cudf-cu12==25.8.*",
     "dask-cudf-cu12==25.8.*",
     "cuml-cu12==25.8.*",
@@ -128,6 +132,13 @@ name = "nvidia-rapids"
 url = "https://pypi.nvidia.com"
 explicit = true
 
+# Kaldifeat prebuilt wheels (flat HTML index)
+[[tool.uv.index]]
+name = "kaldifeat-cuda"
+url = "https://csukuangfj.github.io/kaldifeat/cuda.html"
+format = "flat"
+explicit = true
+
 [tool.uv.sources]
 # Override torch/torchaudio for:
 #   nvidia -> use CUDA 12.9 torch
@@ -140,6 +151,11 @@ torchaudio = [
     { marker = "extra == 'nvidia'", index = "pytorch-cu129" },
     { marker = "extra != 'nvidia' and extra == 'nvidia-old'", index = "pytorch-cu126" },
 ]
+torchvision = [
+    { marker = "extra == 'nvidia'", index = "pytorch-cu129" },
+    { marker = "extra != 'nvidia' and extra == 'nvidia-old'", index = "pytorch-cu126" },
+]
+kaldifeat = { index = "kaldifeat-cuda" }
 
 # RAPIDS packages
 cudf-cu12 = { index = "nvidia-rapids" }
