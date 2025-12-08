@@ -9,7 +9,7 @@ uv run client.py path/to/audio.wav
 # Stop Modal app
 uv run modal app stop senko-diarization
 ```
-Using (CPU) memory snapshotting, we're able to shave off ~20 seconds from the cold-boot time.
+Using (CPU) memory snapshotting, we're able to shave off ~20 seconds from the cold-boot time. The bottommost run in the log screenshot below was the very first launched container, which built the snapshot, and the two runs above it load that snapshot, having lower startup times as a result.
 
 <img width="1128" height="202" alt="Screenshot 2025-12-07 at 8 12 28 PM" src="https://github.com/user-attachments/assets/7df0a866-21e8-49a0-acd5-100c832cc695" />
 
