@@ -243,11 +243,16 @@ class Diarizer:
             self.embeddings_model.to(self.torch_device)
             self.embeddings_model.eval()
 
-        with timed_operation("Init GPU clustering (cuML) .....", self.quiet):
-            self.clustering_location = 'gpu'
+        with timed_operation("Import GPU clustering (cuML) ...", self.quiet):
             from .cluster.cluster_gpu import CommonClustering as ClusteringClass
-            self.spectral_cluster = ClusteringClass(**self.spectral_config['cluster']['args'])
-            self.umap_hdbscan_cluster = ClusteringClass(**self.umap_hdbscan_config['cluster']['args'])
+            self._ClusteringClass = ClusteringClass
+
+        with timed_operation("Build spectral clusterer .......", self.quiet):
+            self.clustering_location = 'gpu'
+            self.spectral_cluster = self._ClusteringClass(**self.spectral_config['cluster']['args'])
+
+        with timed_operation("Build UMAP+HDBSCAN clusterer ...", self.quiet):
+            self.umap_hdbscan_cluster = self._ClusteringClass(**self.umap_hdbscan_config['cluster']['args'])
 
         if self._do_warmup:
             with timed_operation("Warming up embedding model .....", self.quiet):
