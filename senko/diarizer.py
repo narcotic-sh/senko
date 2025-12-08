@@ -233,21 +233,21 @@ class Diarizer:
         self.device = 'cuda'
         self._print("Activating CUDA...")
 
-        # Move VAD to GPU
-        self.vad_pipeline_pyannote_cuda.to(self.torch_device)
+        with timed_operation("Move VAD to CUDA ...............", self.quiet):
+            self.vad_pipeline_pyannote_cuda.to(self.torch_device)
 
-        # Initialize GPU fbank
-        self._init_kaldifeat()
+        with timed_operation("Init GPU fbank (kaldifeat) .....", self.quiet):
+            self._init_kaldifeat()
 
-        # Move embeddings to CUDA
-        self.embeddings_model.to(self.torch_device)
-        self.embeddings_model.eval()
+        with timed_operation("Move embeddings to CUDA ........", self.quiet):
+            self.embeddings_model.to(self.torch_device)
+            self.embeddings_model.eval()
 
-        # Clustering on GPU
-        self.clustering_location = 'gpu'
-        from .cluster.cluster_gpu import CommonClustering as ClusteringClass
-        self.spectral_cluster = ClusteringClass(**self.spectral_config['cluster']['args'])
-        self.umap_hdbscan_cluster = ClusteringClass(**self.umap_hdbscan_config['cluster']['args'])
+        with timed_operation("Init GPU clustering (cuML) .....", self.quiet):
+            self.clustering_location = 'gpu'
+            from .cluster.cluster_gpu import CommonClustering as ClusteringClass
+            self.spectral_cluster = ClusteringClass(**self.spectral_config['cluster']['args'])
+            self.umap_hdbscan_cluster = ClusteringClass(**self.umap_hdbscan_config['cluster']['args'])
 
         if self._do_warmup:
             with timed_operation("Warming up embedding model .....", self.quiet):
