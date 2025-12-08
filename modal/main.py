@@ -7,6 +7,7 @@ app = modal.App("senko-diarization")
 image = (
     modal.Image.debian_slim(python_version="3.13")
     .apt_install("git", "ffmpeg")
+    #.uv_pip_install("senko[nvidia] @ git+https://github.com/narcotic-sh/senko.git@modal", force_build=True)
     .uv_pip_install("senko[nvidia] @ git+https://github.com/narcotic-sh/senko.git@modal")
 )
 
