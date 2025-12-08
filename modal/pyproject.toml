@@ -1,0 +1,10 @@
+[project]
+name = "senko-modal"
+version = "0.1.0"
+description = "Modal deployment for Senko speaker diarization"
+readme = "README.md"
+requires-python = "==3.13.*"
+dependencies = [
+    "fastapi>=0.124.0",
+    "modal>=1.2.4",
+]

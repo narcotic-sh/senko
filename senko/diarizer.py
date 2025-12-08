@@ -42,75 +42,67 @@ class AudioFormatError(Exception):
     pass
 
 class Diarizer:
-    def __init__(self, device='auto', vad='auto', clustering='auto', warmup=True, quiet=True):
+    def __init__(self, device='auto', vad='auto', clustering='auto', warmup=True, quiet=True, defer_cuda_init=False):
 
         self.quiet = quiet
+        self._do_warmup = warmup
+        self.deferred_cuda = False
+        self.target_device = device
+        self._kaldifeat_opts = None
 
         ############
         ## Device ##
         ############
 
         if config.DARWIN:
-            self.device = 'coreml'
-            self.torch_device = None
+            raise RuntimeError("Modal build is CUDA-only; CoreML not supported in this branch.")
         else:
-            self.torch_device = (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")) if device == 'auto' else torch.device(device)
-            self.device = self.torch_device.type
+            resolved_device = (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")) if device == 'auto' else torch.device(device)
+            if defer_cuda_init and resolved_device.type == 'cuda':
+                self.deferred_cuda = True
+                self.target_device = 'cuda'
+                self.torch_device = torch.device("cpu")
+                self.device = 'cpu'
+            else:
+                self.torch_device = resolved_device
+                self.device = self.torch_device.type
             self.logical_cores = psutil.cpu_count(logical=True)
 
-        self._print(f"Using device: {self.device}")
+        self._print(f"Using device: {self.device}" + (" (deferred CUDA)" if self.deferred_cuda else ""))
 
         #########
         ## VAD ##
         #########
 
-        if vad not in ['auto', 'pyannote', 'silero']:
-            raise ValueError(f"Invalid VAD type: {vad}. Must be ['auto', 'pyannote'" + (", 'silero']" if not self.device == 'coreml' else "]"))
+        if vad not in ['auto', 'pyannote']:
+            raise ValueError("Modal branch supports only pyannote VAD on CUDA.")
 
-        if self.device == 'coreml' and vad == 'silero':
-            raise ValueError("Only pyannote VAD (CoreML) available on macOS")
-
-        # Determine VAD model type based on parameter or auto-selection
-        self.vad_model_type = ('pyannote' if self.device in ['cuda', 'coreml'] else 'silero') if vad == 'auto' else vad.lower()
+        # Determine VAD model type (pyannote only here)
+        self.vad_model_type = 'pyannote'
 
         # Pyannote VAD
-        if self.vad_model_type == 'pyannote':
-            # CUDA
-            if self.device == 'cuda':
-                try:
-                    from pyannote.audio.utils.reproducibility import ReproducibilityWarning
-                    warnings.filterwarnings("ignore", category=ReproducibilityWarning)
-                except ImportError:
-                    warnings.filterwarnings("ignore", message=".*TensorFloat-32.*", category=UserWarning)
+        # Pyannote VAD (CPU during deferred stage; GPU after activation)
+        try:
+            from pyannote.audio.utils.reproducibility import ReproducibilityWarning
+            warnings.filterwarnings("ignore", category=ReproducibilityWarning)
+        except ImportError:
+            warnings.filterwarnings("ignore", message=".*TensorFloat-32.*", category=UserWarning)
 
-                from pyannote.audio.pipelines import VoiceActivityDetection
-                from pyannote.audio import Model
+        from pyannote.audio.pipelines import VoiceActivityDetection
+        from pyannote.audio import Model
 
-                # Allow-list needed classes for safe weights-only loading on PyTorch 2.6+
-                from pyannote.audio.core.task import Specifications, Problem, Resolution
-                from pyannote.audio.models.segmentation import PyanNet
-                with torch.serialization.safe_globals([torch.torch_version.TorchVersion, Specifications, Problem, Resolution, PyanNet]):
-                    model = Model.from_pretrained(config.PYANNOTE_SEGMENTATION_PT_MODEL_PATH, map_location=self.torch_device)
-                self.vad_pipeline_pyannote_cuda = VoiceActivityDetection(segmentation=model)
-                self.vad_pipeline_pyannote_cuda.instantiate({
-                    "min_duration_on": 0.25,  # Remove speech regions shorter than 250ms
-                    "min_duration_off": 0.1   # Fill non-speech regions shorter than 100ms
-                })
-                self.vad_pipeline_pyannote_cuda.to(self.torch_device)
-            # CoreML
-            else:
-                from .vad_coreml import VADProcessorCoreML
-                self.vad_processor_pyannote_coreml = VADProcessorCoreML(
-                    lib_path=config.VAD_COREML_LIB_PATH,
-                    model_path=config.PYANNOTE_SEGMENTATION_COREML_MODEL_PATH
-                )
-
-        # Silero VAD
-        else:
-            from silero_vad import load_silero_vad, read_audio, get_speech_timestamps
-            self.vad_model_silero = load_silero_vad()
-            self.read_audio_silero = read_audio
-            self.get_speech_timestamps_silero = get_speech_timestamps
+        # Allow-list needed classes for safe weights-only loading on PyTorch 2.6+
+        from pyannote.audio.core.task import Specifications, Problem, Resolution
+        from pyannote.audio.models.segmentation import PyanNet
+        with torch.serialization.safe_globals([torch.torch_version.TorchVersion, Specifications, Problem, Resolution, PyanNet]):
+            model = Model.from_pretrained(config.PYANNOTE_SEGMENTATION_PT_MODEL_PATH, map_location=self.torch_device)
+        self.vad_pipeline_pyannote_cuda = VoiceActivityDetection(segmentation=model)
+        self.vad_pipeline_pyannote_cuda.instantiate({
+            "min_duration_on": 0.25,  # Remove speech regions shorter than 250ms
+            "min_duration_off": 0.1   # Fill non-speech regions shorter than 100ms
+        })
+        if not self.deferred_cuda:
+            self.vad_pipeline_pyannote_cuda.to(self.torch_device)
 
         self._print(f'Using {self.vad_model_type} VAD' + (' (CoreML)' if self.device == 'coreml' else ''))
 
@@ -122,65 +114,12 @@ class Diarizer:
         ## Fbank feature extraction ##
         ##############################
 
-        # Extract features on GPU through kaldifeat
-        if self.device == 'cuda':
-            try:
-                import kaldifeat
-                self.kaldifeat = kaldifeat
-                # Configure kaldifeat options to match C++ extractor
-                opts = self.kaldifeat.FbankOptions()
-                opts.frame_opts.samp_freq = 16000
-                opts.frame_opts.frame_shift_ms = 10.0
-                opts.frame_opts.frame_length_ms = 25.0
-                opts.frame_opts.dither = 0.0
-                opts.frame_opts.preemph_coeff = 0.97
-                opts.frame_opts.remove_dc_offset = True
-                opts.frame_opts.window_type = "povey"
-                opts.frame_opts.round_to_power_of_two = True
-                opts.frame_opts.blackman_coeff = 0.42
-                opts.frame_opts.snip_edges = True
-                opts.mel_opts.num_bins = 80
-                opts.mel_opts.low_freq = 20
-                opts.mel_opts.high_freq = 0
-                opts.mel_opts.vtln_low = 100
-                opts.mel_opts.vtln_high = -500
-                opts.use_energy = False
-                opts.energy_floor = 1.0
-                opts.raw_energy = True
-                opts.use_log_fbank = True
-                opts.use_power = True
-                opts.device = self.torch_device
-                self.kaldifeat_fbank = self.kaldifeat.Fbank(opts)
-                self.use_gpu_fbank = True
-            except ImportError:
-                self.use_gpu_fbank = False
-        
-        # Extract features on CPU using C++ lib
+        # Extract features: initialize GPU fbank only after CUDA activation
+        self.use_gpu_fbank = False
+        if not self.deferred_cuda:
+            self._init_kaldifeat()
         if not getattr(self, 'use_gpu_fbank', False):
-            self.lib = ctypes.CDLL(config.FBANK_LIB_PATH)
-
-            class FbankFeatures(ctypes.Structure):
-                _fields_ = [
-                    ("data", ctypes.POINTER(ctypes.c_float)),
-                    ("frames_per_subsegment", ctypes.POINTER(ctypes.c_size_t)),
-                    ("subsegment_offsets", ctypes.POINTER(ctypes.c_size_t)),
-                    ("num_subsegments", ctypes.c_size_t),
-                    ("total_frames", ctypes.c_size_t),
-                    ("feature_dim", ctypes.c_size_t)
-                ]
-
-            self.FbankFeatures = FbankFeatures
-            self.lib.create_fbank_extractor.restype = ctypes.c_void_p
-            self.lib.destroy_fbank_extractor.argtypes = [ctypes.c_void_p]
-            self.lib.destroy_fbank_extractor.restype = None
-            self.lib.extract_fbank_features.argtypes = [
-                ctypes.c_void_p, ctypes.c_char_p,
-                ctypes.POINTER(ctypes.c_float), ctypes.c_size_t
-            ]
-            self.lib.extract_fbank_features.restype = FbankFeatures
-            self.lib.free_fbank_features.argtypes = [ctypes.POINTER(FbankFeatures)]
-            self.lib.free_fbank_features.restype = None
-            self.fbank_extractor = self.lib.create_fbank_extractor()
+            self._init_cpu_fbank()
 
         ################
         ## Embeddings ##
@@ -188,37 +127,20 @@ class Diarizer:
 
         # Load embedding model
         with timed_operation("Loading embedding model ........", self.quiet):
-            # CoreML
-            if self.device == 'coreml':
-                with suppress_stdout_stderr():
-                    import coremltools as ct
-                    self.embeddings_model = ct.models.MLModel(config.EMBEDDINGS_COREML_PATH)
-                    self.coreml_fixed_frames = 150
-                    self.coreml_batch_size = 16
-            # CUDA
-            elif self.device == 'cuda':
-                self.embeddings_model = torch.jit.load(config.EMBEDDINGS_JIT_CUDA_MODEL_PATH, map_location=self.torch_device)
-                self.embeddings_model.eval()
-            # CPU
-            else:
-                from .camplusplus import CAMPPlus
-                self.embeddings_model = CAMPPlus(feat_dim=80, embedding_size=192)
-                self.embeddings_model.load_state_dict(torch.load(config.EMBEDDINGS_PT_MODEL_PATH, map_location=self.torch_device, weights_only=True))
-                self.embeddings_model.eval()
-                self.embeddings_model.to(self.torch_device)
+            from .camplusplus import CAMPPlus
+            map_loc = torch.device("cpu") if self.deferred_cuda else self.torch_device
+            self.embeddings_model = CAMPPlus(feat_dim=80, embedding_size=192)
+            self.embeddings_model.load_state_dict(torch.load(config.EMBEDDINGS_PT_MODEL_PATH, map_location=map_loc, weights_only=True))
+            self.embeddings_model.eval()
+            self.embeddings_model.to(map_loc)
 
         # Warm up embedding model
-        if warmup:
+        if warmup and not self.deferred_cuda:
             with timed_operation("Warming up embedding model .....", self.quiet):
-                if self.device == 'coreml':
-                    for i in range(64):
-                        dummy_input = np.random.randn(self.coreml_batch_size, self.coreml_fixed_frames, 80).astype(np.float32)
-                        _ = self.embeddings_model.predict({'input_features': dummy_input})
-                else:
-                    with torch.no_grad():
-                        for i in range(4):
-                            dummy = torch.randn(80, 148, 80, device=self.torch_device)
-                            _ = self.embeddings_model(dummy)
+                with torch.no_grad():
+                    for i in range(4):
+                        dummy = torch.randn(80, 148, 80, device=self.torch_device)
+                        _ = self.embeddings_model(dummy)
 
         ################
         ## Clustering ##
@@ -229,49 +151,125 @@ class Diarizer:
             self.umap_hdbscan_config = yaml.safe_load(umap_hdbscan_yaml)
 
             # Determine clustering location based on parameter or auto-selection
-            if self.device != 'cuda':
-                # Non-CUDA devices always use CPU clustering
-                use_gpu_clustering = False
+            if self.deferred_cuda:
+                self.clustering_location = 'deferred'
+                self.spectral_cluster = None
+                self.umap_hdbscan_cluster = None
             else:
-                # CUDA devices can choose between GPU and CPU clustering
-                cuda_compute_capable = torch.cuda.get_device_capability()[0] >= 7
-                if clustering == 'auto':
-                    use_gpu_clustering = cuda_compute_capable
-                elif clustering.lower() == 'gpu':
-                    if cuda_compute_capable:
-                        use_gpu_clustering = True
-                    else:
-                        self._print(f"Warning: GPU clustering requested but CUDA compute capability < 7.0. Falling back to CPU clustering.")
-                        use_gpu_clustering = False
-                elif clustering.lower() == 'cpu':
-                    use_gpu_clustering = False
-                else:
-                    raise ValueError(f"Invalid clustering type: {clustering}. Must be 'auto', 'gpu', or 'cpu'")
-
-            if use_gpu_clustering:
                 from .cluster.cluster_gpu import CommonClustering as ClusteringClass
                 self.clustering_location = 'gpu'
-            else:
-                from .cluster.cluster_cpu import CommonClustering as ClusteringClass
-                self.clustering_location = 'cpu'
-
-            self.spectral_cluster = ClusteringClass(**self.spectral_config['cluster']['args'])
-            self.umap_hdbscan_cluster = ClusteringClass(**self.umap_hdbscan_config['cluster']['args'])
+                self.spectral_cluster = ClusteringClass(**self.spectral_config['cluster']['args'])
+                self.umap_hdbscan_cluster = ClusteringClass(**self.umap_hdbscan_config['cluster']['args'])
 
         self._print(f'Using {self.clustering_location.upper()} clustering')
 
         # Warmup clustering objects
-        if warmup:
+        if warmup and not self.deferred_cuda:
             with timed_operation("Warming up clustering objects ...", self.quiet):
                 dummy_embeddings = np.random.randn(4250, 192).astype(np.float32)
                 with suppress_stdout_stderr():
                     _ = self.umap_hdbscan_cluster(dummy_embeddings)
 
+    def _init_kaldifeat(self):
+        import kaldifeat
+        self.kaldifeat = kaldifeat
+        opts = self.kaldifeat.FbankOptions()
+        opts.frame_opts.samp_freq = 16000
+        opts.frame_opts.frame_shift_ms = 10.0
+        opts.frame_opts.frame_length_ms = 25.0
+        opts.frame_opts.dither = 0.0
+        opts.frame_opts.preemph_coeff = 0.97
+        opts.frame_opts.remove_dc_offset = True
+        opts.frame_opts.window_type = "povey"
+        opts.frame_opts.round_to_power_of_two = True
+        opts.frame_opts.blackman_coeff = 0.42
+        opts.frame_opts.snip_edges = True
+        opts.mel_opts.num_bins = 80
+        opts.mel_opts.low_freq = 20
+        opts.mel_opts.high_freq = 0
+        opts.mel_opts.vtln_low = 100
+        opts.mel_opts.vtln_high = -500
+        opts.use_energy = False
+        opts.energy_floor = 1.0
+        opts.raw_energy = True
+        opts.use_log_fbank = True
+        opts.use_power = True
+        opts.device = self.torch_device
+        self.kaldifeat_fbank = self.kaldifeat.Fbank(opts)
+        self.use_gpu_fbank = True
+
+    def _init_cpu_fbank(self):
+        self.lib = ctypes.CDLL(config.FBANK_LIB_PATH)
+
+        class FbankFeatures(ctypes.Structure):
+            _fields_ = [
+                ("data", ctypes.POINTER(ctypes.c_float)),
+                ("frames_per_subsegment", ctypes.POINTER(ctypes.c_size_t)),
+                ("subsegment_offsets", ctypes.POINTER(ctypes.c_size_t)),
+                ("num_subsegments", ctypes.c_size_t),
+                ("total_frames", ctypes.c_size_t),
+                ("feature_dim", ctypes.c_size_t)
+            ]
+
+        self.FbankFeatures = FbankFeatures
+        self.lib.create_fbank_extractor.restype = ctypes.c_void_p
+        self.lib.destroy_fbank_extractor.argtypes = [ctypes.c_void_p]
+        self.lib.destroy_fbank_extractor.restype = None
+        self.lib.extract_fbank_features.argtypes = [
+            ctypes.c_void_p, ctypes.c_char_p,
+            ctypes.POINTER(ctypes.c_float), ctypes.c_size_t
+        ]
+        self.lib.extract_fbank_features.restype = FbankFeatures
+        self.lib.free_fbank_features.argtypes = [ctypes.POINTER(FbankFeatures)]
+        self.lib.free_fbank_features.restype = None
+        self.fbank_extractor = self.lib.create_fbank_extractor()
+
+    def activate_cuda(self):
+        """Called after snapshot restore to move models to CUDA and warm up."""
+        if not self.deferred_cuda:
+            return
+
+        self.torch_device = torch.device("cuda")
+        self.device = 'cuda'
+        self._print("Activating CUDA...")
+
+        # Move VAD to GPU
+        self.vad_pipeline_pyannote_cuda.to(self.torch_device)
+
+        # Initialize GPU fbank
+        self._init_kaldifeat()
+
+        # Move embeddings to CUDA
+        self.embeddings_model.to(self.torch_device)
+        self.embeddings_model.eval()
+
+        # Clustering on GPU
+        self.clustering_location = 'gpu'
+        from .cluster.cluster_gpu import CommonClustering as ClusteringClass
+        self.spectral_cluster = ClusteringClass(**self.spectral_config['cluster']['args'])
+        self.umap_hdbscan_cluster = ClusteringClass(**self.umap_hdbscan_config['cluster']['args'])
+
+        if self._do_warmup:
+            with timed_operation("Warming up embedding model .....", self.quiet):
+                with torch.no_grad():
+                    for i in range(4):
+                        dummy = torch.randn(80, 148, 80, device=self.torch_device)
+                        _ = self.embeddings_model(dummy)
+            with timed_operation("Warming up clustering objects ...", self.quiet):
+                dummy_embeddings = np.random.randn(4250, 192).astype(np.float32)
+                with suppress_stdout_stderr():
+                    _ = self.umap_hdbscan_cluster(dummy_embeddings)
+
+        self.deferred_cuda = False
+        self._print("CUDA activation complete.")
+
     def __del__(self):
-        if hasattr(self, 'fbank_extractor') and self.fbank_extractor:
+        if hasattr(self, 'lib') and hasattr(self, 'fbank_extractor') and self.fbank_extractor:
             self.lib.destroy_fbank_extractor(self.fbank_extractor)
 
     def diarize(self, wav_path, accurate=None, generate_colors=False):
+        if self.deferred_cuda:
+            raise RuntimeError("CUDA not activated. Call activate_cuda() after restore before diarization.")
         self._timing_stats = {}
         total_start = time.time()
 
@@ -346,32 +344,12 @@ class Diarizer:
 
     @time_method('vad_time', 'Voice activity detection')
     def _perform_vad(self, wav_path):
-        if self.vad_model_type == 'pyannote':
-            # CUDA
-            if self.device == 'cuda':
-                set_fp32_precision('ieee')
-                vad_result = self.vad_pipeline_pyannote_cuda(wav_path)
-                segments = [(segment.start, segment.end) for segment in vad_result.get_timeline()]
-            # CoreML
-            else:
-                segments = self.vad_processor_pyannote_coreml.process_audio(wav_path)
-        # Silero
-        else:
-            self._set_torch_num_threads(1)  # silero vad is single threaded
+        if self.device != 'cuda':
+            raise RuntimeError("activate_cuda() must be called before diarization.")
 
-            wav = self.read_audio_silero(wav_path)
-            speech_timestamps = self.get_speech_timestamps_silero(wav, self.vad_model_silero, threshold=0.55, min_speech_duration_ms=250, min_silence_duration_ms=100, return_seconds=False)
-
-            # Convert from samples to seconds manually for full precision
-            sample_rate = 16000
-            segments = []
-            for ts in speech_timestamps:
-                start_sec = float(ts['start']) / sample_rate
-                end_sec = float(ts['end']) / sample_rate
-                segments.append((start_sec, end_sec))
-
-            # Restore num threads to make full use of all CPU cores
-            self._set_torch_num_threads()
+        set_fp32_precision('ieee')
+        vad_result = self.vad_pipeline_pyannote_cuda(wav_path)
+        segments = [(segment.start, segment.end) for segment in vad_result.get_timeline()]
 
         return segments
 
