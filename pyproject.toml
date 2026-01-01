@@ -79,7 +79,6 @@ nvidia = [
     "torchvision==0.23.0",
     "pyannote.audio",
     "kaldifeat",
-    "scikit-learn",
     "cudf-cu12==25.12.*",
     "dask-cudf-cu12==25.12.*",
     "cuml-cu12==25.12.*",
@@ -91,6 +90,21 @@ nvidia = [
     "raft-dask-cu12==25.12.*",
     "cuvs-cu12==25.12.*"
 ]
+
+# Same as nvidia, without RAPIDS and kaldifeat
+nvidia-windows = [
+    "torchaudio==2.8.0",
+    "torchvision==0.23.0",
+    "pyannote.audio",
+]
+
+# Same as nvidia-old, without kaldifeat
+nvidia-old-windows = [
+    "torchaudio==2.8.0",
+    "torchvision==0.23.0",
+    "pyannote.audio"
+]
+
 
 [project.urls]
 Homepage = "https://github.com/narcotic-sh/senko"
@@ -140,21 +154,38 @@ url = "https://csukuangfj.github.io/kaldifeat/cuda.html"
 format = "flat"
 explicit = true
 
+[tool.uv]
+# Prevent selecting multiple NVIDIA extras at once.
+conflicts = [
+    [
+        { extra = "nvidia" },
+        { extra = "nvidia-old" },
+        { extra = "nvidia-windows" },
+        { extra = "nvidia-old-windows" },
+    ],
+]
+
 [tool.uv.sources]
 # Override torch/torchaudio for:
-#   nvidia -> use CUDA 12.9 torch
-#   nvidia-old -> use CUDA 12.6 torch
+#   nvidia + nvidia-windows -> use CUDA 12.9 torch
+#   nvidia-old + nvidia-old-windows -> use CUDA 12.6 torch
 torch = [
-    { marker = "extra == 'nvidia'", index = "pytorch-cu129" },
-    { marker = "extra != 'nvidia' and extra == 'nvidia-old'", index = "pytorch-cu126" },
+    { index = "pytorch-cu129", extra = "nvidia" },
+    { index = "pytorch-cu129", extra = "nvidia-windows" },
+    { index = "pytorch-cu126", extra = "nvidia-old" },
+    { index = "pytorch-cu126", extra = "nvidia-old-windows" },
 ]
 torchaudio = [
-    { marker = "extra == 'nvidia'", index = "pytorch-cu129" },
-    { marker = "extra != 'nvidia' and extra == 'nvidia-old'", index = "pytorch-cu126" },
+    { index = "pytorch-cu129", extra = "nvidia" },
+    { index = "pytorch-cu129", extra = "nvidia-windows" },
+    { index = "pytorch-cu126", extra = "nvidia-old" },
+    { index = "pytorch-cu126", extra = "nvidia-old-windows" },
 ]
 torchvision = [
-    { marker = "extra == 'nvidia'", index = "pytorch-cu129" },
-    { marker = "extra != 'nvidia' and extra == 'nvidia-old'", index = "pytorch-cu126" },
+    { index = "pytorch-cu129", extra = "nvidia" },
+    { index = "pytorch-cu129", extra = "nvidia-windows" },
+    { index = "pytorch-cu126", extra = "nvidia-old" },
+    { index = "pytorch-cu126", extra = "nvidia-old-windows" },
 ]
 kaldifeat = { index = "kaldifeat-cuda" }
 
