@@ -1,13 +1,5 @@
-import warnings
-warnings.filterwarnings("ignore", message=".*Matplotlib.*")
-warnings.filterwarnings("ignore", message=".*force_all_finite.*", category=FutureWarning)
-warnings.filterwarnings("ignore", message=".*invalid escape sequence.*")
-warnings.filterwarnings("ignore", message=".*n_jobs value.*overridden.*")
-warnings.filterwarnings("ignore", message=".*torchaudio._backend.list_audio_backends.*")
-warnings.filterwarnings("ignore", message=".*torchaudio.load_with_torchcodec.*")
-warnings.filterwarnings("ignore", message=".*torchaudio.sox_effects.sox_effects.apply_effects_file.*")
-warnings.filterwarnings("ignore", message=".*torio.io._streaming_media_decoder.StreamingMediaDecoder.*")
-warnings.filterwarnings("ignore", message=".*Please use the new API settings to control TF32.*")
+from .warning_filters import apply_warning_filters
+apply_warning_filters()
 
 import os
 import yaml
@@ -15,13 +7,13 @@ import time
 import wave
 import ctypes
 import psutil
+import warnings
 import numpy as np
 from termcolor import colored
 
 from . import config
 from .colors import generate_speaker_colors
 from .utils import time_method, suppress_stdout_stderr, timed_operation
-
 if not config.DARWIN:
     import torch
     torch_version_str = torch.__version__.split('+')[0]  # Remove any suffix like '+cu126'
@@ -239,24 +231,35 @@ class Diarizer:
                 # Non-CUDA devices always use CPU clustering
                 use_gpu_clustering = False
             else:
-                # CUDA devices can choose between GPU and CPU clustering
-                cuda_compute_capable = torch.cuda.get_device_capability()[0] >= 7
-                if clustering == 'auto':
-                    use_gpu_clustering = cuda_compute_capable
-                elif clustering.lower() == 'gpu':
-                    if cuda_compute_capable:
-                        use_gpu_clustering = True
-                    else:
-                        self._print(f"Warning: GPU clustering requested but CUDA compute capability < 7.0. Falling back to CPU clustering.")
-                        use_gpu_clustering = False
-                elif clustering.lower() == 'cpu':
+                # Windows builds don't ship RAPIDS; always fall back to CPU clustering.
+                if config.WINDOWS:
+                    if clustering.lower() == 'gpu':
+                        self._print("Warning: GPU clustering requested on Windows, but RAPIDS is not installed. Falling back to CPU clustering.")
                     use_gpu_clustering = False
                 else:
-                    raise ValueError(f"Invalid clustering type: {clustering}. Must be 'auto', 'gpu', or 'cpu'")
+                    # CUDA devices can choose between GPU and CPU clustering
+                    cuda_compute_capable = torch.cuda.get_device_capability()[0] >= 7
+                    if clustering == 'auto':
+                        use_gpu_clustering = cuda_compute_capable
+                    elif clustering.lower() == 'gpu':
+                        if cuda_compute_capable:
+                            use_gpu_clustering = True
+                        else:
+                            self._print("Warning: GPU clustering requested but CUDA compute capability < 7.0. Falling back to CPU clustering.")
+                            use_gpu_clustering = False
+                    elif clustering.lower() == 'cpu':
+                        use_gpu_clustering = False
+                    else:
+                        raise ValueError(f"Invalid clustering type: {clustering}. Must be 'auto', 'gpu', or 'cpu'")
 
             if use_gpu_clustering:
-                from .cluster.cluster_gpu import CommonClustering as ClusteringClass
-                self.clustering_location = 'gpu'
+                try:
+                    from .cluster.cluster_gpu import CommonClustering as ClusteringClass
+                    self.clustering_location = 'gpu'
+                except ImportError:
+                    self._print("Warning: RAPIDS is unavailable. Falling back to CPU clustering.")
+                    from .cluster.cluster_cpu import CommonClustering as ClusteringClass
+                    self.clustering_location = 'cpu'
             else:
                 from .cluster.cluster_cpu import CommonClustering as ClusteringClass
                 self.clustering_location = 'cpu'
