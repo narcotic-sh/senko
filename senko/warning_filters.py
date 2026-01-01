@@ -1,8 +1,5 @@
 import warnings
 
-from . import config
-
-
 def apply_warning_filters():
     warnings.filterwarnings("ignore", message=".*Matplotlib.*")
     warnings.filterwarnings("ignore", message=".*force_all_finite.*", category=FutureWarning)
@@ -13,10 +10,3 @@ def apply_warning_filters():
     warnings.filterwarnings("ignore", message=".*torchaudio.sox_effects.sox_effects.apply_effects_file.*")
     warnings.filterwarnings("ignore", message=".*torio.io._streaming_media_decoder.StreamingMediaDecoder.*")
     warnings.filterwarnings("ignore", message=".*Please use the new API settings to control TF32.*")
-
-    if config.WINDOWS:
-        warnings.filterwarnings(
-            "ignore",
-            message=".*torchcodec is not installed correctly so built-in audio decoding will fail.*",
-            category=UserWarning,
-        )
