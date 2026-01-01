@@ -67,6 +67,7 @@ dependencies = [
 [project.optional-dependencies]
 # CUDA 12 capable driver + CUDA compute capability < 7.5
 nvidia-old = [
+    "torch==2.8.0",
     "torchaudio==2.8.0",
     "torchvision==0.23.0",
     "pyannote.audio",
@@ -75,6 +76,7 @@ nvidia-old = [
 
 # CUDA 12 capable driver + CUDA compute capability >= 7.5
 nvidia = [
+    "torch==2.8.0",
     "torchaudio==2.8.0",
     "torchvision==0.23.0",
     "pyannote.audio",
@@ -93,6 +95,7 @@ nvidia = [
 
 # Same as nvidia, without RAPIDS and kaldifeat
 nvidia-windows = [
+    "torch==2.8.0",
     "torchaudio==2.8.0",
     "torchvision==0.23.0",
     "pyannote.audio",
@@ -100,6 +103,7 @@ nvidia-windows = [
 
 # Same as nvidia-old, without kaldifeat
 nvidia-old-windows = [
+    "torch==2.8.0",
     "torchaudio==2.8.0",
     "torchvision==0.23.0",
     "pyannote.audio"
