@@ -65,6 +65,13 @@ class Diarizer:
         # Determine VAD model type based on parameter or auto-selection
         self.vad_model_type = ('pyannote' if self.device in ['cuda', 'coreml'] else 'silero') if vad == 'auto' else vad.lower()
 
+        # If pyannote, check if it's actually available
+        if self.vad_model_type == 'pyannote' and self.device != 'coreml':
+            try:
+                import pyannote.audio
+            except ModuleNotFoundError:
+                self.vad_model_type = 'silero'
+
         # Pyannote VAD
         if self.vad_model_type == 'pyannote':
             # CUDA
