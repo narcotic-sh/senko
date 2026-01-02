@@ -34,3 +34,11 @@ uv pip install "git+https://github.com/narcotic-sh/senko.git"
 For NVIDIA, make sure the installed driver is CUDA 12 capable (should see `CUDA Version: 12+` in `nvidia-smi`).
 
 For setting up Senko for development, see [`DEV_SETUP.md`](DEV_SETUP.md).
+
+## Native Windows vs. WSL
+There are a couple downsides to running Senko natively on Windows vs. on WSL:
+
+- Clustering cannot run on the GPU ([RAPIDS](https://rapids.ai/) doesn't support native Windows)
+- Fbank feature extraction cannot run on the GPU ([`kaldifeat`](https://github.com/csukuangfj/kaldifeat) only has prebuilt wheels for Linux)
+
+For CPU-only diarization though, native Windows yields a significant speed boost vs. WSL.
