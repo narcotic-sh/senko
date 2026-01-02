@@ -23,12 +23,12 @@ result = diarizer.diarize(wav_path, generate_colors=False)
 senko.save_json(result["merged_segments"], 'audio_diarized.json')
 senko.save_rttm(result["merged_segments"], wav_path, 'audio_diarized.rttm')
 ```
-See `examples/diarize.py` for an interactive script, and also read `DOCS.md`
+See `examples/diarize.py` for an interactive script, and also read [`DOCS.md`](DOCS.md)
 
 Senko can also be used in a notebook, like [Google Colab](https://colab.research.google.com/drive/12WBChh5cdw-RKRStr5hlFgQLPy7R950o?usp=sharing) and [Modal Notebooks](https://modal.com/notebooks/mhamzaqayyum/main/nb-ioITGZf4CRHhpO1ftYAGXr).
 
 ## Installation
-Senko has been tested to work on Linux, macOS, and WSL.
+The following instructions are for Linux, macOS, and WSL. For Windows, see [`WINDOWS.md`](WINDOWS.md).
 
 Prerequisites:
 - `gcc/clang` - on Linux/WSL, a separate install; on macOS, have the Xcode Command Line Tools installed
@@ -52,7 +52,7 @@ uv pip install "git+https://github.com/narcotic-sh/senko.git"
 ```
 For NVIDIA, make sure the installed driver is CUDA 12 capable (should see `CUDA Version: 12+` in `nvidia-smi`).
 
-For setting up Senko for development, see `DEV_SETUP.md`.
+For setting up Senko for development, see [`DEV_SETUP.md`](DEV_SETUP.md).
 
 ## Accuracy
 See the [evaluation](/evaluation) directory.

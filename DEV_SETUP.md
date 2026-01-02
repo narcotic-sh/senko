@@ -1,34 +1,40 @@
 # Senko Development Setup Guide
-## Pre-requisites
-- `gcc/clang` if on Linux or WSL
+
+Pre-requisites
+- `gcc/clang` if on Linux/macOS/WSL
+- `MSVC` if on Windows
+
+  ```cmd
+  winget install Microsoft.VisualStudio.2022.BuildTools --source winget --force --override "--wait --passive --add Microsoft.VisualStudio.Workload.VCTools --add Microsoft.VisualStudio.Component.VC.Tools.x86.x64 --add Microsoft.VisualStudio.Component.Windows11SDK.26100"
+  ```
+
 - `git`
-    - On macOS, comes with the Xcode Command Line Tools
 - [`uv`](https://docs.astral.sh/uv/#installation)
 
 ## Development Setup Steps
 First create and activate a Python virtual environment
-```
+```sh
 uv venv --python 3.13 .venv
+
+# bash/zsh etc.
 source .venv/bin/activate
+
+# PowerShell
+.venv\Scripts\Activate
+
+# Command Prompt
+.venv\Scripts\activate.bat
 ```
 Clone the Senko repository
-```
+```sh
 git clone https://github.com/narcotic-sh/senko.git
 ```
 Then install using editable mode (`-e`)
-```bash
-# For NVIDIA GPUs with CUDA compute capability >= 7.5 (~GTX 16 series and newer)
-uv pip install -e "/path/to/cloned/senko[nvidia]"
-
-# For NVIDIA GPUs with CUDA compute capability < 7.5 (~GTX 10 series and older)
-uv pip install -e "/path/to/cloned/senko[nvidia-old]"
-
-# For Mac (macOS 14+) and CPU execution on all other platforms
+```sh
+# Can add [nvidia], [nvidia-old], [nvidia-windows] etc. 
 uv pip install -e "/path/to/cloned/senko"
 ```
-For NVIDIA, make sure the installed driver is CUDA 12 capable (should see `CUDA Version: 12+` in `nvidia-smi`)
-
-Now you can modify the Senko code in the cloned repository folder. Changes will be reflected immediately if only the Python code was changed; if the C++ code was changed, you'll have to run the `uv pip install -e` command to rebuild the C++ code before changes are reflected.
+Now you can modify the Senko code in the cloned repository folder. Changes will be reflected immediately if only the Python code was changed; if the C++/Swift code was changed, you'll have to run the `uv pip install -e` command again to rebuild the C++/Swift code.
 
 Then use Senko like normal in scripts:
 ```python
