@@ -47,4 +47,4 @@ result = diarizer.diarize('audio.wav', generate_colors=False) # 16kHz mono 16-bi
 with open('./audio_diarized.json', 'w') as f:
     json.dump(result["merged_segments"], f, indent=2)
 ```
-Also see `examples/diarize.py`.
+Also see [`examples/diarize.py`](examples/diarize.py).

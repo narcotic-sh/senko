@@ -23,7 +23,7 @@ result = diarizer.diarize(wav_path, generate_colors=False)
 senko.save_json(result["merged_segments"], 'audio_diarized.json')
 senko.save_rttm(result["merged_segments"], wav_path, 'audio_diarized.rttm')
 ```
-See `examples/diarize.py` for an interactive script, and also read [`DOCS.md`](DOCS.md)
+See [`examples/diarize.py`](examples/diarize.py) for an interactive script, and also read [`DOCS.md`](DOCS.md)
 
 Senko can also be used in a notebook, like [Google Colab](https://colab.research.google.com/drive/12WBChh5cdw-RKRStr5hlFgQLPy7R950o?usp=sharing) and [Modal Notebooks](https://modal.com/notebooks/mhamzaqayyum/main/nb-ioITGZf4CRHhpO1ftYAGXr).
 
@@ -80,10 +80,10 @@ Create a PR or message on Discord if you'd like your application that uses Senko
 <details>
 <summary>Is there any way to visualize the output diarization data?</summary>
 <br>
-Absolutely. The <a href="https://github.com/narcotic-sh/zanshin">Zanshin</a> media player is entirely made for this purpose. Zanshin is powered by Senko, so the easiest way to visualize the diarization data is by simply using it. It's currently available for Mac (Apple Silicon) with packaging. It also works on Windows and Linux, but without packaging (coming soon); you'll need to clone the repo and launch it through the terminal. See <a href="https://github.com/narcotic-sh/zanshin/blob/main/DEV_SETUP.md">here</a> for instructions.
+Absolutely. The <a href="https://github.com/narcotic-sh/zanshin">Zanshin</a> media player is entirely made for this purpose. Zanshin is powered by Senko, so the easiest way to visualize the diarization data is by simply using it. It's currently available for Mac (Apple Silicon) with packaging. It also works on Windows and Linux, but without packaging (coming soon); you'll need to clone the repo and launch it through the terminal. See <a href="DEV_SETUP.md">here</a> for instructions.
 <br>
 <br>
-You can also load in the diarization data that Senko generates manually into Zanshin if you want. First, turn off diarization in Zanshin by going into Settings and turning off <code>Identify Speakers</code>. Then, after you add a media item, click on it and on the player page press the <code>H</code> key. In the textbox that appears, paste the contents of the output JSON file that <code>examples/diarize.py</code> generates.
+You can also load in the diarization data that Senko generates manually into Zanshin if you want. First, turn off diarization in Zanshin by going into Settings and turning off <code>Identify Speakers</code>. Then, after you add a media item, click on it and on the player page press the <code>H</code> key. In the textbox that appears, paste the contents of the output JSON file that <code><a href="examples/diarize.py">examples/diarize.py</a></code> generates.
 </details>
 <details>
 <summary>What languages does Senko support?</summary>
