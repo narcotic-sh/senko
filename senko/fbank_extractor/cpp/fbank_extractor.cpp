@@ -277,27 +277,28 @@ private:
 
 class MemoryAudioReader {
 public:
-    explicit MemoryAudioReader(const std::vector<float>& samples) : samples_(samples) {}
+    MemoryAudioReader(const float* samples, size_t num_samples) : samples_(samples), num_samples_(num_samples) {}
 
-    size_t num_samples() const { return samples_.size(); }
+    size_t num_samples() const { return num_samples_; }
 
     bool read_samples(size_t start_frame, size_t frame_count, std::vector<float>& out) const {
-        if (frame_count == 0 || start_frame >= samples_.size()) {
+        if (frame_count == 0 || start_frame >= num_samples_) {
             out.clear();
             return true;
         }
 
-        const size_t available = samples_.size() - start_frame;
+        const size_t available = num_samples_ - start_frame;
         const size_t to_read = std::min(frame_count, available);
         out.resize(to_read);
-        std::copy(samples_.begin() + static_cast<long long>(start_frame),
-                  samples_.begin() + static_cast<long long>(start_frame + to_read),
+        std::copy(samples_ + start_frame,
+                  samples_ + start_frame + to_read,
                   out.begin());
         return true;
     }
 
 private:
-    const std::vector<float>& samples_;
+    const float* samples_ = nullptr;
+    size_t num_samples_ = 0;
 };
 
 template <typename AudioReader>
@@ -403,7 +404,7 @@ FbankResult FbankExtractor::extract_features(const std::string& wav_path, const 
     return extract_features_impl(wav_reader, subsegments);
 }
 
-FbankResult FbankExtractor::extract_features_from_memory(const std::vector<float>& samples, const std::vector<std::pair<float, float>>& subsegments) {
-    MemoryAudioReader audio_reader(samples);
+FbankResult FbankExtractor::extract_features_from_memory(const float* samples, size_t num_samples, const std::vector<std::pair<float, float>>& subsegments) {
+    MemoryAudioReader audio_reader(samples, num_samples);
     return extract_features_impl(audio_reader, subsegments);
 }

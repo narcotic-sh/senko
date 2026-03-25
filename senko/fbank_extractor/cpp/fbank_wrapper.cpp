@@ -68,8 +68,7 @@ extern "C" {
                                                     size_t num_subsegments) {
         auto* extractor = reinterpret_cast<FbankExtractor*>(handle);
         auto subsegments = build_subsegments(subsegments_array, num_subsegments);
-        std::vector<float> audio(samples, samples + num_samples);
-        auto result = extractor->extract_features_from_memory(audio, subsegments);
+        auto result = extractor->extract_features_from_memory(samples, num_samples, subsegments);
         return build_feature_result(result, num_subsegments);
     }
 
