@@ -1,5 +1,7 @@
 import ctypes
-from ctypes import c_double, c_void_p, POINTER, c_int32, c_char_p
+from ctypes import c_double, c_void_p, POINTER, c_int32, c_char_p, c_float, c_size_t
+
+import numpy as np
 
 class VADProcessorCoreML:
     def __init__(self, lib_path, model_path, min_duration_on=0.25, min_duration_off=0.1):
@@ -12,6 +14,8 @@ class VADProcessorCoreML:
         self.lib.vad_set_min_duration_off.argtypes = [c_void_p, c_double]
         self.lib.vad_process_file.argtypes = [c_void_p, c_char_p, POINTER(c_int32)]
         self.lib.vad_process_file.restype = c_void_p
+        self.lib.vad_process_samples.argtypes = [c_void_p, POINTER(c_float), c_size_t, POINTER(c_int32)]
+        self.lib.vad_process_samples.restype = c_void_p
         self.lib.vad_free_segments.argtypes = [c_void_p]
         self.lib.vad_destroy.argtypes = [c_void_p]
 
@@ -26,14 +30,24 @@ class VADProcessorCoreML:
         if not self.lib.vad_load_model(self.processor, model_path.encode('utf-8')):
             raise RuntimeError(f"Failed to load model from {model_path}")
 
-    def process_audio(self, audio_path):
-        """Process audio file and return VAD segments"""
+    def process_audio(self, audio_source):
+        """Process a WAV path or in-memory float32 mono samples and return VAD segments."""
         count = c_int32()
-        segments_ptr = self.lib.vad_process_file(
-            self.processor,
-            str(audio_path).encode('utf-8'),
-            ctypes.byref(count)
-        )
+
+        if isinstance(audio_source, np.ndarray):
+            audio = np.ascontiguousarray(audio_source, dtype=np.float32)
+            segments_ptr = self.lib.vad_process_samples(
+                self.processor,
+                audio.ctypes.data_as(POINTER(c_float)),
+                audio.size,
+                ctypes.byref(count)
+            )
+        else:
+            segments_ptr = self.lib.vad_process_file(
+                self.processor,
+                str(audio_source).encode('utf-8'),
+                ctypes.byref(count)
+            )
 
         if not segments_ptr or count.value == 0:
             return []

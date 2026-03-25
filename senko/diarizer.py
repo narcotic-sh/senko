@@ -177,6 +177,12 @@ class Diarizer:
                 ctypes.POINTER(ctypes.c_float), ctypes.c_size_t
             ]
             self.lib.extract_fbank_features.restype = FbankFeatures
+            self.lib.extract_fbank_features_from_memory.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_float), ctypes.c_size_t,
+                ctypes.POINTER(ctypes.c_float), ctypes.c_size_t
+            ]
+            self.lib.extract_fbank_features_from_memory.restype = FbankFeatures
             self.lib.free_fbank_features.argtypes = [ctypes.POINTER(FbankFeatures)]
             self.lib.free_fbank_features.restype = None
             self.fbank_extractor = self.lib.create_fbank_extractor()
@@ -296,17 +302,7 @@ class Diarizer:
 
         # Verify correct format (16kHz mono 16-bit WAV)
         with wave.open(wav_path, 'rb') as wav_file:
-            channels = wav_file.getnchannels()
-            sample_rate = wav_file.getframerate()
-            bit_depth = wav_file.getsampwidth() * 8  # getsampwidth returns bytes, multiply by 8 for bits
-
-            if channels != 1 or sample_rate != 16000 or bit_depth != 16:
-                error_msg = f"\tError: Audio file must be 16kHz mono 16-bit WAV format.\n"
-                error_msg += f"\tCurrent format: {sample_rate}Hz, {channels} channel(s), {bit_depth}-bit\n\n"
-                error_msg += "\tTo convert your file to the correct format, run:\n"
-                error_msg += f"\tffmpeg -i {wav_path} -acodec pcm_s16le -ac 1 -ar 16000 {os.path.splitext(wav_path)[0]}_mono.wav\n"
-                self._print(colored(error_msg, 'red'))
-                raise AudioFormatError(f"Audio file must be 16kHz mono 16-bit WAV format. Current: {sample_rate}Hz, {channels} channel(s), {bit_depth}-bit")
+            self._validate_wav_file(wav_file, wav_path)
 
         # VAD (voice activity detection)
         vad_segments = self._perform_vad(wav_path)
@@ -368,22 +364,114 @@ class Diarizer:
 
         return result
 
+    def diarize_samples(self, samples, sample_rate=16000, accurate=None, generate_colors=False, source_name="<memory>"):
+        self._timing_stats = {}
+        total_start = time.time()
+
+        audio = self._normalize_audio_samples(samples, sample_rate)
+        self._print(f"\n    \033[38;2;120;167;214m{source_name}\033[0m")
+
+        vad_segments = self._perform_vad(audio)
+
+        if os.getenv("DUMP_VAD"):
+            print(f"\n    VAD segments ({len(vad_segments)}):")
+            if vad_segments:
+                for start, end in vad_segments:
+                    print(f"    - {start:.3f} -> {end:.3f}")
+            else:
+                print("    (none)")
+
+        if not vad_segments:
+            self._print(colored("\n    No speakers detected in the audio!\n", 'yellow'))
+            return None
+
+        subsegments = self._generate_subsegments(vad_segments, accurate)
+        features_flat, frames_per_subsegment, subsegment_offsets, feature_dim = self._extract_fbank_features(audio, subsegments)
+        subsegment_offsets = [int(offset) for offset in subsegment_offsets]
+        embeddings = self._generate_embeddings(features_flat, frames_per_subsegment, subsegment_offsets, feature_dim)
+        raw_segments, merged_segments, centroids = self._perform_clustering(embeddings, subsegments)
+
+        total_time = round(time.time() - total_start, 2)
+        self._timing_stats["total_time"] = total_time
+        self._print(colored(f"\n    Total diarization time: ", 'light_cyan'), end="")
+        self._print(f"{total_time:.2f}s\n")
+
+        raw_speakers_detected = len(set(segment['speaker'] for segment in raw_segments))
+        merged_speakers_detected = len(set(segment['speaker'] for segment in merged_segments))
+
+        result = {
+            "raw_segments": raw_segments,
+            "raw_speakers_detected": raw_speakers_detected,
+            "merged_speakers_detected": merged_speakers_detected,
+            "merged_segments": merged_segments,
+            "speaker_centroids": centroids,
+            "timing_stats": self._timing_stats,
+            "vad": vad_segments,
+        }
+
+        if generate_colors:
+            speaker_color_sets = {}
+            for i in range(10):
+                speaker_color_sets[str(i)] = generate_speaker_colors(merged_segments, i)
+            result["speaker_color_sets"] = speaker_color_sets
+
+        return result
+
+    def _validate_wav_file(self, wav_file, wav_path):
+        channels = wav_file.getnchannels()
+        sample_rate = wav_file.getframerate()
+        bit_depth = wav_file.getsampwidth() * 8
+
+        if channels != 1 or sample_rate != 16000 or bit_depth != 16:
+            error_msg = f"\tError: Audio file must be 16kHz mono 16-bit WAV format.\n"
+            error_msg += f"\tCurrent format: {sample_rate}Hz, {channels} channel(s), {bit_depth}-bit\n\n"
+            error_msg += "\tTo convert your file to the correct format, run:\n"
+            error_msg += f"\tffmpeg -i {wav_path} -acodec pcm_s16le -ac 1 -ar 16000 {os.path.splitext(wav_path)[0]}_mono.wav\n"
+            self._print(colored(error_msg, 'red'))
+            raise AudioFormatError(f"Audio file must be 16kHz mono 16-bit WAV format. Current: {sample_rate}Hz, {channels} channel(s), {bit_depth}-bit")
+
+    def _normalize_audio_samples(self, samples, sample_rate):
+        if sample_rate != 16000:
+            raise AudioFormatError(f"Audio samples must be 16kHz mono PCM in memory. Current sample rate: {sample_rate}Hz")
+
+        if not isinstance(samples, np.ndarray):
+            samples = np.asarray(samples)
+
+        if samples.ndim != 1:
+            raise AudioFormatError(f"Audio samples must be mono in memory. Current shape: {samples.shape}")
+
+        if np.issubdtype(samples.dtype, np.integer):
+            max_abs = max(abs(np.iinfo(samples.dtype).min), np.iinfo(samples.dtype).max)
+            samples = samples.astype(np.float32) / float(max_abs)
+        else:
+            samples = samples.astype(np.float32, copy=False)
+
+        return np.ascontiguousarray(samples)
+
     @time_method('vad_time', 'Voice activity detection')
-    def _perform_vad(self, wav_path):
+    def _perform_vad(self, audio_source):
         if self.vad_model_type == 'pyannote':
             # CUDA
             if self.device == 'cuda':
                 set_fp32_precision('ieee')
-                vad_result = self.vad_pipeline_pyannote_cuda(wav_path)
+                if isinstance(audio_source, np.ndarray):
+                    waveform = torch.from_numpy(audio_source).unsqueeze(0)
+                    vad_input = {"waveform": waveform, "sample_rate": 16000}
+                else:
+                    vad_input = audio_source
+                vad_result = self.vad_pipeline_pyannote_cuda(vad_input)
                 segments = [(segment.start, segment.end) for segment in vad_result.get_timeline()]
             # CoreML
             else:
-                segments = self.vad_processor_pyannote_coreml.process_audio(wav_path)
+                segments = self.vad_processor_pyannote_coreml.process_audio(audio_source)
         # Silero
         else:
             self._set_torch_num_threads(1)  # silero vad is single threaded
 
-            wav = self.read_audio_silero(wav_path)
+            if isinstance(audio_source, np.ndarray):
+                wav = torch.from_numpy(audio_source)
+            else:
+                wav = self.read_audio_silero(audio_source)
             speech_timestamps = self.get_speech_timestamps_silero(wav, self.vad_model_silero, threshold=0.55, min_speech_duration_ms=250, min_silence_duration_ms=100, return_seconds=False)
 
             # Convert from samples to seconds manually for full precision
@@ -423,18 +511,25 @@ class Diarizer:
         return subsegments
 
     @time_method('fbank_time', 'Fbank feature extraction')
-    def _extract_fbank_features(self, wav_path, subsegments):
+    def _extract_fbank_features(self, audio_source, subsegments):
         # GPU path: use kaldifeat when available on CUDA
         if getattr(self, 'use_gpu_fbank', False):
-            return self._extract_fbank_features_gpu(wav_path, subsegments)
+            return self._extract_fbank_features_gpu(audio_source, subsegments)
 
         # Convert subsegments to flat array
         subseg_array = np.array(subsegments, dtype=np.float32).flatten()
         subseg_ptr = subseg_array.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
 
-        # Call C++ lib function
-        wav_path_bytes = wav_path.encode('utf-8')
-        features = self.lib.extract_fbank_features(self.fbank_extractor, wav_path_bytes, subseg_ptr, len(subsegments))
+        if isinstance(audio_source, np.ndarray):
+            sample_ptr = audio_source.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+            features = self.lib.extract_fbank_features_from_memory(
+                self.fbank_extractor,
+                sample_ptr, len(audio_source),
+                subseg_ptr, len(subsegments)
+            )
+        else:
+            wav_path_bytes = audio_source.encode('utf-8')
+            features = self.lib.extract_fbank_features(self.fbank_extractor, wav_path_bytes, subseg_ptr, len(subsegments))
 
         # Convert results to numpy arrays
         total_floats = features.total_frames * features.feature_dim
@@ -453,14 +548,17 @@ class Diarizer:
 
         return features_copy, frames_per_seg_copy, subsegment_offsets_copy, features.feature_dim
 
-    def _extract_fbank_features_gpu(self, wav_path, subsegments):
+    def _extract_fbank_features_gpu(self, audio_source, subsegments):
         import torchaudio
         import torch.nn.functional as F
         
         sample_rate = 16000
         min_len = 400  # match C++ padding
-        wav, sr = torchaudio.load(wav_path)  # shape: (1, num_samples) on CPU
-        wav = wav.squeeze(0)  # drop channel dim to 1-D samples
+        if isinstance(audio_source, np.ndarray):
+            wav = torch.from_numpy(audio_source)
+        else:
+            wav, sr = torchaudio.load(audio_source)  # shape: (1, num_samples) on CPU
+            wav = wav.squeeze(0)  # drop channel dim to 1-D samples
 
         BATCH_SEGMENTS = 256
 

@@ -32,6 +32,12 @@ extern "C" {
                                          const char* wav_path,
                                          float* subsegments_array,
                                          size_t num_subsegments);
+
+    FBANK_EXPORT FbankFeatures extract_fbank_features_from_memory(FbankExtractorHandle handle,
+                                         const float* samples,
+                                         size_t num_samples,
+                                         float* subsegments_array,
+                                         size_t num_subsegments);
     
     // Free features
     FBANK_EXPORT void free_fbank_features(FbankFeatures* features);

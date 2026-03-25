@@ -61,6 +61,23 @@ Dictionary (`result_data`) containing keys:
 #### Raises
 - `senko.AudioFormatError` if audio file is not in the required 16kHz mono 16-bit WAV format
 
+### `diarize_samples()`
+```python
+result_data = diarizer.diarize_samples(samples, sample_rate=16000, accurate=None, generate_colors=False, source_name="<memory>")
+```
+#### Parameters
+- `samples`: In-memory mono PCM samples at 16kHz (`numpy.ndarray`, list, or similar)
+- `sample_rate`: Must be `16000`
+- `accurate`: Same behavior as `diarize()`
+- `generate_colors`: Same behavior as `diarize()`
+- `source_name`: Label used in progress output
+
+#### Returns
+- Same dictionary shape as `diarize()`
+
+#### Raises
+- `senko.AudioFormatError` if the input is not 16kHz mono audio
+
 ### `speaker_similarity()`
 ```python
 if senko.speaker_similarity(centroid1, centroid2) >= 0.875:

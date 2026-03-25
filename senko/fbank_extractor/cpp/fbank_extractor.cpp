@@ -3,14 +3,13 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
-#include <cmath>
-#include <iomanip>
-#include <iostream>
 #include <span>
 #include <thread>
 #include <vector>
 #ifdef _WIN32
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <io.h>
 #include <fcntl.h>
 #include <windows.h>
@@ -23,7 +22,6 @@
 #ifndef _O_BINARY
 #define _O_BINARY 0x8000
 #endif
-// pread implementation for Windows
 static long long pread_win(int fd, void* buf, size_t count, long long offset) {
     HANDLE h = (HANDLE)_get_osfhandle(fd);
     if (h == INVALID_HANDLE_VALUE) return -1;
@@ -138,11 +136,7 @@ static bool parse_wav_header(int fd, WavInfo& info) {
             fmt_found = true;
         } else if (chunk_id == "data") {
             info.data_offset = chunk_data_offset;
-            if (chunk_size == 0) {
-                info.data_size = file_size - info.data_offset;
-            } else {
-                info.data_size = static_cast<int64_t>(chunk_size);
-            }
+            info.data_size = chunk_size == 0 ? file_size - info.data_offset : static_cast<int64_t>(chunk_size);
             data_found = true;
         }
 
@@ -199,19 +193,12 @@ public:
 
     bool valid() const { return fd_ >= 0; }
     size_t num_samples() const { return total_frames_; }
-    int channels() const { return info_.channels; }
-    int bits_per_sample() const { return info_.bits_per_sample; }
-    int audio_format() const { return info_.audio_format; }
 
     bool read_samples(size_t start_frame, size_t frame_count, std::vector<float>& out) const {
         if (!valid()) {
             return false;
         }
-        if (frame_count == 0) {
-            out.clear();
-            return true;
-        }
-        if (start_frame >= total_frames_) {
+        if (frame_count == 0 || start_frame >= total_frames_) {
             out.clear();
             return true;
         }
@@ -228,7 +215,6 @@ public:
             static_cast<off_t>(start_frame * bytes_per_frame_);
 #endif
         const size_t byte_count = to_read * bytes_per_frame_;
-
         const float scale = 1.0f / 32768.0f;
 
         switch (info_.bits_per_sample) {
@@ -253,7 +239,7 @@ public:
                 break;
             }
             case 32: {
-                if (info_.audio_format == 1) { // PCM int32
+                if (info_.audio_format == 1) {
                     std::vector<int32_t> interleaved(to_read * info_.channels);
                     if (!read_fully(fd_, interleaved.data(), byte_count, byte_offset)) {
                         return false;
@@ -261,7 +247,7 @@ public:
                     for (size_t i = 0; i < to_read; ++i) {
                         out[i] = static_cast<float>(interleaved[i * info_.channels]) * scale;
                     }
-                } else if (info_.audio_format == 3) { // IEEE float
+                } else if (info_.audio_format == 3) {
                     std::vector<float> interleaved(to_read * info_.channels);
                     if (!read_fully(fd_, interleaved.data(), byte_count, byte_offset)) {
                         return false;
@@ -289,52 +275,50 @@ private:
     size_t total_frames_ = 0;
 };
 
-}  // namespace
+class MemoryAudioReader {
+public:
+    explicit MemoryAudioReader(const std::vector<float>& samples) : samples_(samples) {}
 
-FbankExtractor::FbankExtractor() {}
+    size_t num_samples() const { return samples_.size(); }
 
-FbankResult FbankExtractor::extract_features(const std::string& wav_path, const std::vector<std::pair<float, float>>& subsegments) {
+    bool read_samples(size_t start_frame, size_t frame_count, std::vector<float>& out) const {
+        if (frame_count == 0 || start_frame >= samples_.size()) {
+            out.clear();
+            return true;
+        }
 
-    /*═════════════╗
-    ║  Load audio  ║
-    ╚═════════════*/
-
-    WavStreamReader wav_reader(wav_path);
-    if (!wav_reader.valid()) {
-        return {{}, {}, {}};
+        const size_t available = samples_.size() - start_frame;
+        const size_t to_read = std::min(frame_count, available);
+        out.resize(to_read);
+        std::copy(samples_.begin() + static_cast<long long>(start_frame),
+                  samples_.begin() + static_cast<long long>(start_frame + to_read),
+                  out.begin());
+        return true;
     }
-    const size_t total_samples = wav_reader.num_samples();
 
-    /*════════════════════════════════════════════╗
-    ║  Fbank feature extraction (multi-threaded)  ║
-    ╚════════════════════════════════════════════*/
+private:
+    const std::vector<float>& samples_;
+};
+
+template <typename AudioReader>
+static FbankResult extract_features_impl(const AudioReader& audio_reader,
+                                         const std::vector<std::pair<float, float>>& subsegments) {
+    const size_t total_samples = audio_reader.num_samples();
 
     FeatureComputer fc;
-
-    // Each feature is 80 mel bins ("height") by up to ~150 frames ("width")
     constexpr size_t mel_bins = 80;
     constexpr size_t max_frames_per_subseg = 150;
     constexpr size_t sample_rate = 16000;
 
-    // Allocate a single large buffer for all subsegments
     std::vector<float> big_features(subsegments.size() * max_frames_per_subseg * mel_bins, 0.f);
-
-    // For each subsegment, track (offset_in_big_features, frames_produced)
-    std::vector<std::pair<size_t, size_t>> feature_indices(subsegments.size());
-
-    // Track frame counts for each subsegment (this is what we'll return)
     std::vector<size_t> frames_per_subsegment(subsegments.size());
     std::vector<size_t> subsegment_offsets(subsegments.size());
 
-    // Multi-threading setup
     const unsigned int feat_threads = std::max(1u, std::thread::hardware_concurrency());
     std::vector<std::thread> feat_workers;
     feat_workers.reserve(feat_threads);
 
-    // Use an atomic offset so each thread knows where to write in big_features
     std::atomic_size_t global_offset{0};
-
-    // Thread-local buffers for streaming reads and padding short segments
     thread_local static std::vector<float> segment_buffer;
     thread_local static std::vector<float> padded_buffer;
 
@@ -351,21 +335,20 @@ FbankResult FbankExtractor::extract_features(const std::string& wav_path, const 
                 sample_len = total_samples - sample_start;
             }
 
-            const size_t min_len = 400;  // Ensure a minimum of 400 samples
+            const size_t min_len = 400;
             std::span<float> wav_span;
 
             if (sample_len < min_len) {
                 if (padded_buffer.size() < min_len) padded_buffer.resize(min_len, 0.f);
                 std::fill(padded_buffer.begin(), padded_buffer.begin() + min_len, 0.f);
-                if (sample_len > 0 && wav_reader.read_samples(sample_start, sample_len, segment_buffer)) {
+                if (sample_len > 0 && audio_reader.read_samples(sample_start, sample_len, segment_buffer)) {
                     std::copy(segment_buffer.begin(),
-                             segment_buffer.begin() + sample_len,
-                             padded_buffer.begin());
+                              segment_buffer.begin() + static_cast<long long>(sample_len),
+                              padded_buffer.begin());
                 }
-                // Remaining samples in padded_buffer stay zero
                 wav_span = std::span<float>(padded_buffer.data(), min_len);
             } else {
-                if (wav_reader.read_samples(sample_start, sample_len, segment_buffer)) {
+                if (audio_reader.read_samples(sample_start, sample_len, segment_buffer)) {
                     wav_span = std::span<float>(segment_buffer.data(), sample_len);
                 } else {
                     if (padded_buffer.size() < min_len) padded_buffer.resize(min_len, 0.f);
@@ -374,30 +357,21 @@ FbankResult FbankExtractor::extract_features(const std::string& wav_path, const 
                 }
             }
 
-            // Compute FBank features => 2D: (frames x mel_bins)
             auto feat2d = fc.compute_feature(wav_span);
-            const size_t frames = feat2d.size(); // #frames generated
-
-            // Store frame count for this subsegment
+            const size_t frames = feat2d.size();
             frames_per_subsegment[i] = frames;
 
-            // Claim a chunk in big_features for these features
             const size_t my_off = global_offset.fetch_add(frames * mel_bins);
-            feature_indices[i] = {my_off, frames};
             subsegment_offsets[i] = my_off;
 
-            // Flatten-copy (frame by frame) into big_features
             size_t write_ptr = my_off;
             for (const auto& frame : feat2d) {
-                // Each frame => mel_bins floats
-                std::copy(frame.begin(), frame.end(),
-                         big_features.begin() + static_cast<long>(write_ptr));
+                std::copy(frame.begin(), frame.end(), big_features.begin() + static_cast<long>(write_ptr));
                 write_ptr += mel_bins;
             }
         }
     };
 
-    // Distribute subsegments across threads
     const size_t sub_per_thread = (subsegments.size() + feat_threads - 1) / feat_threads;
     size_t idx0 = 0;
     for (unsigned int t = 0; t < feat_threads; ++t) {
@@ -406,12 +380,30 @@ FbankResult FbankExtractor::extract_features(const std::string& wav_path, const 
         idx0 = idx1;
     }
 
-    for (auto& th : feat_workers) th.join();
+    for (auto& th : feat_workers) {
+        th.join();
+    }
 
-    // Shrink big_features to actual usage
     const size_t used_size = global_offset.load();
     big_features.resize(used_size);
     big_features.shrink_to_fit();
 
     return {big_features, frames_per_subsegment, subsegment_offsets};
+}
+
+}  // namespace
+
+FbankExtractor::FbankExtractor() {}
+
+FbankResult FbankExtractor::extract_features(const std::string& wav_path, const std::vector<std::pair<float, float>>& subsegments) {
+    WavStreamReader wav_reader(wav_path);
+    if (!wav_reader.valid()) {
+        return {{}, {}, {}};
+    }
+    return extract_features_impl(wav_reader, subsegments);
+}
+
+FbankResult FbankExtractor::extract_features_from_memory(const std::vector<float>& samples, const std::vector<std::pair<float, float>>& subsegments) {
+    MemoryAudioReader audio_reader(samples);
+    return extract_features_impl(audio_reader, subsegments);
 }

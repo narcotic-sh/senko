@@ -433,6 +433,49 @@ private func parseWavHeader(fd: Int32) throws -> WavInfo {
         }
     }
 
+    @objc public func processAudioSamples(_ samples: [Float]) -> [VADSegment] {
+        guard let model = segmentationModel else {
+            print("Model not loaded")
+            return []
+        }
+
+        guard !samples.isEmpty else {
+            return []
+        }
+
+        var allSegments: [VADSegment] = []
+        let batchSize = 64
+        var batch: [(ArraySlice<Float>, Double)] = []
+        batch.reserveCapacity(batchSize)
+
+        var offsetSamples = 0
+        while offsetSamples < samples.count {
+            let samplesToRead = min(chunkSize, samples.count - offsetSamples)
+            if samplesToRead <= 0 {
+                break
+            }
+
+            let endOffset = offsetSamples + samplesToRead
+            let chunkOffsetTime = Double(offsetSamples) / Double(sampleRate)
+            batch.append((samples[offsetSamples..<endOffset], chunkOffsetTime))
+
+            if batch.count >= batchSize {
+                let batchSegments = processBatch(batch, model: model)
+                allSegments.append(contentsOf: batchSegments)
+                batch.removeAll(keepingCapacity: true)
+            }
+
+            offsetSamples = endOffset
+        }
+
+        if !batch.isEmpty {
+            let batchSegments = processBatch(batch, model: model)
+            allSegments.append(contentsOf: batchSegments)
+        }
+
+        return mergeSegments(allSegments)
+    }
+
     private func processStreamedWav(at path: String, model: MLModel) throws -> [VADSegment] {
         let fd = open(path, O_RDONLY)
         if fd < 0 {
@@ -887,6 +930,32 @@ public func vad_process_file(
     }
 
     // Allocate memory for doubles (start, end pairs)
+    let buffer = UnsafeMutablePointer<Double>.allocate(capacity: segments.count * 2)
+    for (i, seg) in segments.enumerated() {
+        buffer[i * 2] = seg.start
+        buffer[i * 2 + 1] = seg.end
+    }
+
+    return UnsafeMutableRawPointer(buffer)
+}
+
+@_cdecl("vad_process_samples")
+public func vad_process_samples(
+    _ processorPtr: UnsafeMutableRawPointer,
+    _ samplesPtr: UnsafePointer<Float>,
+    _ sampleCount: Int,
+    _ count: UnsafeMutablePointer<Int32>
+) -> UnsafeMutableRawPointer {
+    let processor = Unmanaged<VADProcessor>.fromOpaque(processorPtr).takeUnretainedValue()
+    let samples = Array(UnsafeBufferPointer(start: samplesPtr, count: sampleCount))
+
+    let segments = processor.processAudioSamples(samples)
+    count.pointee = Int32(segments.count)
+
+    guard segments.count > 0 else {
+        return UnsafeMutableRawPointer(bitPattern: 1)!
+    }
+
     let buffer = UnsafeMutablePointer<Double>.allocate(capacity: segments.count * 2)
     for (i, seg) in segments.enumerated() {
         buffer[i * 2] = seg.start
