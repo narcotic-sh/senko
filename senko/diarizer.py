@@ -430,21 +430,52 @@ class Diarizer:
             self._print(colored(error_msg, 'red'))
             raise AudioFormatError(f"Audio file must be 16kHz mono 16-bit WAV format. Current: {sample_rate}Hz, {channels} channel(s), {bit_depth}-bit")
 
+    def _coerce_audio_samples_array(self, samples):
+        if isinstance(samples, np.ndarray):
+            return samples
+
+        try:
+            import torch as torch_module
+        except ModuleNotFoundError:
+            torch_module = None
+
+        if torch_module is not None and isinstance(samples, torch_module.Tensor):
+            return samples.detach().cpu().contiguous().numpy()
+
+        raise AudioFormatError(
+            "Audio samples must be provided as a 1-D numpy.ndarray or torch.Tensor. "
+            "Plain Python sequences are unsupported because integer PCM dtype would be ambiguous."
+        )
+
     def _normalize_audio_samples(self, samples, sample_rate):
         if sample_rate != 16000:
             raise AudioFormatError(f"Audio samples must be 16kHz mono PCM in memory. Current sample rate: {sample_rate}Hz")
 
-        if not isinstance(samples, np.ndarray):
-            samples = np.asarray(samples)
+        samples = self._coerce_audio_samples_array(samples)
 
         if samples.ndim != 1:
             raise AudioFormatError(f"Audio samples must be mono in memory. Current shape: {samples.shape}")
 
-        if np.issubdtype(samples.dtype, np.integer):
-            max_abs = max(abs(np.iinfo(samples.dtype).min), np.iinfo(samples.dtype).max)
-            samples = samples.astype(np.float32) / float(max_abs)
-        else:
+        if np.issubdtype(samples.dtype, np.floating):
+            if not np.all(np.isfinite(samples)):
+                raise AudioFormatError("Floating-point audio samples must be finite")
+
+            max_abs = float(np.max(np.abs(samples))) if samples.size else 0.0
+            if max_abs > 1.0:
+                raise AudioFormatError(
+                    f"Floating-point audio samples must be normalized to [-1, 1]. Current max absolute value: {max_abs}"
+                )
             samples = samples.astype(np.float32, copy=False)
+        elif np.issubdtype(samples.dtype, np.unsignedinteger) and samples.dtype.itemsize == 1:
+            samples = (samples.astype(np.float32) - 128.0) / 128.0
+        elif np.issubdtype(samples.dtype, np.signedinteger) and samples.dtype.itemsize in (2, 4):
+            max_abs = float(1 << (samples.dtype.itemsize * 8 - 1))
+            samples = samples.astype(np.float32) / max_abs
+        else:
+            raise AudioFormatError(
+                "Unsupported in-memory audio dtype. Supported dtypes are floating-point audio normalized "
+                "to [-1, 1], uint8 PCM, int16 PCM, and int32 PCM."
+            )
 
         return np.ascontiguousarray(samples)
 

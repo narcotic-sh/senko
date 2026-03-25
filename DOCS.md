@@ -66,7 +66,9 @@ Dictionary (`result_data`) containing keys:
 result_data = diarizer.diarize_samples(samples, sample_rate=16000, accurate=None, generate_colors=False, source_name="<memory>")
 ```
 #### Parameters
-- `samples`: In-memory mono PCM samples at 16kHz (`numpy.ndarray`, list, or similar)
+- `samples`: In-memory mono 16kHz audio as a `numpy.ndarray` or `torch.Tensor`
+  - Floating-point inputs must already be normalized to `[-1, 1]`
+  - Integer PCM inputs must use `uint8`, `int16`, or `int32`
 - `sample_rate`: Must be `16000`
 - `accurate`: Same behavior as `diarize()`
 - `generate_colors`: Same behavior as `diarize()`
@@ -76,7 +78,7 @@ result_data = diarizer.diarize_samples(samples, sample_rate=16000, accurate=None
 - Same dictionary shape as `diarize()`
 
 #### Raises
-- `senko.AudioFormatError` if the input is not 16kHz mono audio
+- `senko.AudioFormatError` if the input is not 16kHz mono audio or uses an unsupported/ambiguous in-memory representation
 
 ### `speaker_similarity()`
 ```python
