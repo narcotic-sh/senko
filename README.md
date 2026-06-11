@@ -52,6 +52,8 @@ uv pip install "git+https://github.com/narcotic-sh/senko.git"
 ```
 For NVIDIA, make sure the installed driver is CUDA 12 capable (should see `CUDA Version: 12+` in `nvidia-smi`).
 
+Senko is also available on [PyPI](https://pypi.org/project/senko/), thanks to [@gaspardpetit](https://github.com/gaspardpetit).
+
 For setting up Senko for development, see [`DEV_SETUP.md`](DEV_SETUP.md).
 
 ## Accuracy
