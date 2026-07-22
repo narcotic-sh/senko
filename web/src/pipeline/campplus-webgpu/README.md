@@ -154,6 +154,13 @@ and 0.99998526 cosine similarity. Production and the combined diagnostic
 baseline therefore now select FP16 and FP32, respectively, across FCM, dense
 bottlenecks, and pointwise transits.
 
+On the final clean production build, three independent isolated-Chrome runs of
+the one-hour fixture completed in 9.911170, 9.922655, and 9.934825 seconds. The
+9.922655-second median attributed 8.736230 seconds to CAM++ while overlapping
+FBank and VAD work. All three runs produced the same 9-speaker/137-segment
+payload, passed the offline-Senko gates, and retained exact production ownership
+of 39,855,360 CAM++ GPU-buffer bytes.
+
 Before the FP16 promotion, the target M3 geometry combination (`tile4-fold`,
 `direct-tile8-wg96` TDNN, `direct-tile4-wg128` dense bottlenecks, and
 `chunk512` transits) measured a 22.806528 ms nine-run pooled B16 whole-graph GPU
@@ -184,6 +191,13 @@ workgroups exposed too little parallelism. F(2x2,3x3) Winograd retained cosine
 second B16 CAM++ device improved isolated CAM throughput by about 11%, but its
 39,855,360 additional GPU bytes projected to at most about 7% end-to-end, so it
 failed the memory trade gate. No code from these rejected paths remains.
+
+Selective INT8/DP4A was also rejected after timing prepacked weights before any
+activation-quantization cost. A representative 992-to-128 projection took
+0.720896 ms with DP4A versus 0.268698 ms with FP16, and a 1024-to-512 projection
+took 2.778726 ms versus 1.199309 ms. Being 2.68x and 2.32x slower before input
+quantization closed this route on the target M3 WebGPU implementation; no
+quantized production code remains.
 
 The first cooled FP16 production acceptance completed the one-hour fixture in
 10.170115 seconds, 403.780 ms (3.82%) below the preceding 10.573895-second FP32
