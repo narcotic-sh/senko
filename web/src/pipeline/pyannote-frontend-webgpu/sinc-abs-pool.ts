@@ -11,6 +11,13 @@ const CONV_FRAMES = 15_975;
 const POOL_FRAMES = 5_325;
 const OUTPUT_GROUPS = OUTPUT_CHANNELS / 4;
 const UNIFORM_BYTES = 64;
+const SIGNAL_TILE_ELEMENTS = 2_161;
+const FILTER_TILE_BYTES = KERNEL * 4 * 2;
+
+export type PyannoteSincAccumulationSchedule = "serial" | "interleaved";
+
+export const PYANNOTE_SINC_WORKGROUP_STORAGE_BYTES =
+  SIGNAL_TILE_ELEMENTS * 4 + FILTER_TILE_BYTES;
 
 export interface PyannoteSincStageBuffers {
   readonly waveform: GPUBuffer;
@@ -44,10 +51,12 @@ export class PyannoteSincAbsPoolKernel {
   static async create(
     device: GPUDevice,
     gpuPackage: PyannoteFrontendGpuPackage,
+    accumulationSchedule: PyannoteSincAccumulationSchedule = "interleaved",
   ): Promise<PyannoteSincAbsPoolKernel> {
     if (
       device.limits.maxComputeInvocationsPerWorkgroup < STATS_WORKGROUP_SIZE ||
-      device.limits.maxComputeWorkgroupStorageSize < 10_652
+      device.limits.maxComputeWorkgroupStorageSize <
+        PYANNOTE_SINC_WORKGROUP_STORAGE_BYTES
     ) {
       throw new Error("Raw pyannote Sinc stage exceeds this WebGPU device's compute limits");
     }
@@ -57,8 +66,8 @@ export class PyannoteSincAbsPoolKernel {
       code: WAVEFORM_STATS_WGSL,
     });
     const sincModule = device.createShaderModule({
-      label: "senko-pyannote-sinc-abs-pool",
-      code: SINC_ABS_POOL_WGSL,
+      label: `senko-pyannote-sinc-abs-pool-${accumulationSchedule}`,
+      code: sincAbsPoolWgsl(accumulationSchedule),
     });
     const [statsInfo, sincInfo] = await Promise.all([
       statsModule.getCompilationInfo(),
@@ -79,7 +88,7 @@ export class PyannoteSincAbsPoolKernel {
         compute: { module: statsModule, entryPoint: "main" },
       }),
       device.createComputePipelineAsync({
-        label: "senko-pyannote-sinc-abs-pool",
+        label: `senko-pyannote-sinc-abs-pool-${accumulationSchedule}`,
         layout: "auto",
         compute: { module: sincModule, entryPoint: "main" },
       }),
@@ -338,7 +347,48 @@ fn main(
 }
 `;
 
-const SINC_ABS_POOL_WGSL = /* wgsl */ `
+function sincAbsPoolWgsl(
+  accumulationSchedule: PyannoteSincAccumulationSchedule,
+): string {
+  const accumulate =
+    accumulationSchedule === "interleaved"
+      ? `var accumulated0 = vec4<f32>(bias.values[output_group]);
+  var accumulated1 = accumulated0;
+  var accumulated2 = accumulated0;
+  let local_start = lane * 30u;
+  for (var kernel = 0u; kernel < 251u; kernel += 1u) {
+    let weight = vec4<f32>(filter_tile[kernel]);
+    accumulated0 = fma(
+      vec4<f32>(f32(signal_tile[local_start + kernel])),
+      weight,
+      accumulated0,
+    );
+    accumulated1 = fma(
+      vec4<f32>(f32(signal_tile[local_start + 10u + kernel])),
+      weight,
+      accumulated1,
+    );
+    accumulated2 = fma(
+      vec4<f32>(f32(signal_tile[local_start + 20u + kernel])),
+      weight,
+      accumulated2,
+    );
+  }
+  let maximum = max(abs(accumulated0), max(abs(accumulated1), abs(accumulated2)));`
+      : `var maximum = vec4<f32>(-1.0e30);
+  for (var pool_lane = 0u; pool_lane < 3u; pool_lane += 1u) {
+    var accumulated = vec4<f32>(bias.values[output_group]);
+    let local_start = lane * 30u + pool_lane * 10u;
+    for (var kernel = 0u; kernel < 251u; kernel += 1u) {
+      accumulated = fma(
+        vec4<f32>(f32(signal_tile[local_start + kernel])),
+        vec4<f32>(filter_tile[kernel]),
+        accumulated,
+      );
+    }
+    maximum = max(maximum, abs(accumulated));
+  }`;
+  return /* wgsl */ `
 enable f16;
 
 struct FloatBuffer { values: array<f32> };
@@ -364,7 +414,7 @@ struct Parameters {
 @group(0) @binding(4) var<storage, read_write> pooled: HalfBuffer;
 @group(0) @binding(5) var<uniform> parameters: Parameters;
 
-var<workgroup> signal_tile: array<f32, 2161>;
+var<workgroup> signal_tile: array<f32, ${SIGNAL_TILE_ELEMENTS}>;
 var<workgroup> filter_tile: array<vec4<f16>, 251>;
 
 @compute @workgroup_size(64)
@@ -384,11 +434,12 @@ fn main(
   loop {
     if (tile_index >= 2161u) { break; }
     let waveform_index = waveform_start + tile_index;
-    signal_tile[tile_index] = select(
+    let normalized = select(
       0.0,
       waveform.values[batch_index * parameters.samples + waveform_index] * scale + shift,
       waveform_index < parameters.samples,
     );
+    signal_tile[tile_index] = normalized;
     tile_index += 64u;
   }
   var kernel_index = lane;
@@ -402,19 +453,7 @@ fn main(
 
   let pooled_frame = pooled_start + lane;
   if (pooled_frame >= parameters.pool_frames) { return; }
-  var maximum = vec4<f32>(-1.0e30);
-  for (var pool_lane = 0u; pool_lane < 3u; pool_lane += 1u) {
-    var accumulated = vec4<f32>(bias.values[output_group]);
-    let local_start = lane * 30u + pool_lane * 10u;
-    for (var kernel = 0u; kernel < 251u; kernel += 1u) {
-      accumulated = fma(
-        vec4<f32>(signal_tile[local_start + kernel]),
-        vec4<f32>(filter_tile[kernel]),
-        accumulated,
-      );
-    }
-    maximum = max(maximum, abs(accumulated));
-  }
+  ${accumulate}
   for (var output_lane = 0u; output_lane < 4u; output_lane += 1u) {
     let channel = output_group * 4u + output_lane;
     let output_index =
@@ -424,3 +463,4 @@ fn main(
   }
 }
 `;
+}

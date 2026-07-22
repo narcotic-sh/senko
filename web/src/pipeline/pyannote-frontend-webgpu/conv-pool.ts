@@ -9,10 +9,15 @@ const KERNEL = 5;
 const POOL = 3;
 const INPUT_TILE_FRAMES = WORKGROUP_SIZE * POOL + KERNEL - 1;
 const INPUT_TILE_ELEMENTS = INPUT_TILE_FRAMES * INPUT_BLOCK_CHANNELS;
-const WORKGROUP_STORAGE_BYTES = INPUT_TILE_ELEMENTS * 4 + KERNEL * INPUT_BLOCK_CHANNELS * 8;
 const UNIFORM_BYTES = 64;
 
 export type ConvPoolOutputLayout = "f16-bct" | "f32-btf";
+export type PyannoteConvPoolActivationTilePrecision = "float32" | "float16";
+
+export const PYANNOTE_CONV_POOL_WORKGROUP_STORAGE_BYTES = {
+  float32: INPUT_TILE_ELEMENTS * 4 + KERNEL * INPUT_BLOCK_CHANNELS * 8,
+  float16: INPUT_TILE_ELEMENTS * 2 + KERNEL * INPUT_BLOCK_CHANNELS * 8,
+} as const satisfies Record<PyannoteConvPoolActivationTilePrecision, number>;
 
 export interface PyannoteConvPoolDescriptor {
   readonly label: string;
@@ -66,22 +71,25 @@ export class PyannoteConvPoolKernel {
   static async create(
     device: GPUDevice,
     gpuPackage: PyannoteFrontendGpuPackage,
+    activationTilePrecision: PyannoteConvPoolActivationTilePrecision = "float16",
   ): Promise<PyannoteConvPoolKernel> {
+    const workgroupStorageBytes =
+      PYANNOTE_CONV_POOL_WORKGROUP_STORAGE_BYTES[activationTilePrecision];
     if (
       device.limits.maxComputeInvocationsPerWorkgroup < WORKGROUP_SIZE ||
-      device.limits.maxComputeWorkgroupStorageSize < WORKGROUP_STORAGE_BYTES
+      device.limits.maxComputeWorkgroupStorageSize < workgroupStorageBytes
     ) {
       throw new Error(
-        `Raw pyannote Conv5 needs ${WORKGROUP_STORAGE_BYTES} workgroup bytes and ${WORKGROUP_SIZE} lanes`,
+        `Raw pyannote Conv5 needs ${workgroupStorageBytes} workgroup bytes and ${WORKGROUP_SIZE} lanes`,
       );
     }
     const f16Module = device.createShaderModule({
-      label: "senko-pyannote-conv5-pool-f16-bct",
-      code: convPoolWgsl("f16-bct"),
+      label: `senko-pyannote-conv5-pool-f16-bct-${activationTilePrecision}`,
+      code: convPoolWgsl("f16-bct", activationTilePrecision),
     });
     const f32Module = device.createShaderModule({
-      label: "senko-pyannote-conv5-pool-f32-btf",
-      code: convPoolWgsl("f32-btf"),
+      label: `senko-pyannote-conv5-pool-f32-btf-${activationTilePrecision}`,
+      code: convPoolWgsl("f32-btf", activationTilePrecision),
     });
     const [f16Info, f32Info] = await Promise.all([
       f16Module.getCompilationInfo(),
@@ -97,12 +105,12 @@ export class PyannoteConvPoolKernel {
     }
     const [f16BctPipeline, f32BtfPipeline] = await Promise.all([
       device.createComputePipelineAsync({
-        label: "senko-pyannote-conv5-pool-f16-bct",
+        label: `senko-pyannote-conv5-pool-f16-bct-${activationTilePrecision}`,
         layout: "auto",
         compute: { module: f16Module, entryPoint: "main" },
       }),
       device.createComputePipelineAsync({
-        label: "senko-pyannote-conv5-pool-f32-btf",
+        label: `senko-pyannote-conv5-pool-f32-btf-${activationTilePrecision}`,
         layout: "auto",
         compute: { module: f32Module, entryPoint: "main" },
       }),
@@ -211,7 +219,10 @@ function validateSections(descriptor: PyannoteConvPoolDescriptor): void {
   }
 }
 
-function convPoolWgsl(outputLayout: ConvPoolOutputLayout): string {
+function convPoolWgsl(
+  outputLayout: ConvPoolOutputLayout,
+  activationTilePrecision: PyannoteConvPoolActivationTilePrecision,
+): string {
   const outputDeclaration =
     outputLayout === "f16-bct"
       ? "@group(0) @binding(4) var<storage, read_write> output_values: HalfBuffer;"
@@ -226,6 +237,8 @@ function convPoolWgsl(outputLayout: ConvPoolOutputLayout): string {
       (batch_index * parameters.output_frames + output_frame) * parameters.output_channels
       + output_channel;
     output_values.values[output_index] = maximum[output_lane];`;
+  const inputTileType = activationTilePrecision === "float16" ? "f16" : "f32";
+  const inputTileWrite = activationTilePrecision === "float16" ? "f16(activated)" : "activated";
   return /* wgsl */ `
 enable f16;
 struct HalfBuffer { values: array<f16> };
@@ -249,7 +262,7 @@ struct Parameters {
 ${outputDeclaration}
 @group(0) @binding(5) var<uniform> parameters: Parameters;
 
-var<workgroup> input_tile: array<f32, ${INPUT_TILE_ELEMENTS}>;
+var<workgroup> input_tile: array<${inputTileType}, ${INPUT_TILE_ELEMENTS}>;
 var<workgroup> filter_tile: array<vec4<f16>, ${KERNEL * INPUT_BLOCK_CHANNELS}>;
 
 @compute @workgroup_size(${WORKGROUP_SIZE})
@@ -290,7 +303,7 @@ fn main(
           normalized >= 0.0,
         );
       }
-      input_tile[tile_index] = activated;
+      input_tile[tile_index] = ${inputTileWrite};
       tile_index += ${WORKGROUP_SIZE}u;
     }
     var weight_index = lane;
@@ -317,9 +330,9 @@ fn main(
             filter_tile[kernel * ${INPUT_BLOCK_CHANNELS}u + block_channel]
           );
           let tile_base = block_channel * ${INPUT_TILE_FRAMES}u + lane * ${POOL}u + kernel;
-          accumulated0 = fma(vec4<f32>(input_tile[tile_base]), weight, accumulated0);
-          accumulated1 = fma(vec4<f32>(input_tile[tile_base + 1u]), weight, accumulated1);
-          accumulated2 = fma(vec4<f32>(input_tile[tile_base + 2u]), weight, accumulated2);
+          accumulated0 = fma(vec4<f32>(f32(input_tile[tile_base])), weight, accumulated0);
+          accumulated1 = fma(vec4<f32>(f32(input_tile[tile_base + 1u])), weight, accumulated1);
+          accumulated2 = fma(vec4<f32>(f32(input_tile[tile_base + 2u])), weight, accumulated2);
         }
       }
     }

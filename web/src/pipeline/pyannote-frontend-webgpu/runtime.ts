@@ -2,6 +2,7 @@
 
 import {
   PyannoteSincAbsPoolKernel,
+  type PyannoteSincAccumulationSchedule,
   type PyannoteSincAbsPoolDispatch,
 } from "./sinc-abs-pool";
 import {
@@ -12,6 +13,7 @@ import {
 } from "./instance-norm";
 import {
   PyannoteConvPoolKernel,
+  type PyannoteConvPoolActivationTilePrecision,
   type PyannoteConvPoolDispatch,
 } from "./conv-pool";
 import {
@@ -26,6 +28,22 @@ export interface RawPyannoteFrontendGpuBytes {
   readonly uniforms: number;
   readonly total: number;
 }
+
+export interface RawPyannoteFrontendCreateOptions
+  extends PyannoteFrontendPackageLoadOptions {
+  readonly convActivationTilePrecision?: PyannoteConvPoolActivationTilePrecision;
+  readonly sincAccumulationSchedule?: PyannoteSincAccumulationSchedule;
+}
+
+export const RAW_PYANNOTE_FRONTEND_PRODUCTION_KERNELS = {
+  convActivationTilePrecision: "float16",
+  sincAccumulationSchedule: "interleaved",
+} as const satisfies Required<
+  Pick<
+    RawPyannoteFrontendCreateOptions,
+    "convActivationTilePrecision" | "sincAccumulationSchedule"
+  >
+>;
 
 /**
  * Complete direct-WebGPU frontend with a two-slot activation arena.
@@ -81,7 +99,7 @@ export class RawPyannoteFrontendFoundation {
   static async create(
     device: GPUDevice,
     metadataUrl: string,
-    options: PyannoteFrontendPackageLoadOptions = {},
+    options: RawPyannoteFrontendCreateOptions = {},
   ): Promise<RawPyannoteFrontendFoundation> {
     const gpuPackage = await PyannoteFrontendGpuPackage.load(
       device,
@@ -107,10 +125,24 @@ export class RawPyannoteFrontendFoundation {
         size: gpuPackage.metadata.memory.slotABytes,
         usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
       });
-      sincKernel = await PyannoteSincAbsPoolKernel.create(device, gpuPackage);
+      const convActivationTilePrecision =
+        options.convActivationTilePrecision ??
+        RAW_PYANNOTE_FRONTEND_PRODUCTION_KERNELS.convActivationTilePrecision;
+      const sincAccumulationSchedule =
+        options.sincAccumulationSchedule ??
+        RAW_PYANNOTE_FRONTEND_PRODUCTION_KERNELS.sincAccumulationSchedule;
+      sincKernel = await PyannoteSincAbsPoolKernel.create(
+        device,
+        gpuPackage,
+        sincAccumulationSchedule,
+      );
       const [normKernel, convKernel, finalNormKernel] = await Promise.all([
         PyannoteF16BctNormKernel.create(device, gpuPackage),
-        PyannoteConvPoolKernel.create(device, gpuPackage),
+        PyannoteConvPoolKernel.create(
+          device,
+          gpuPackage,
+          convActivationTilePrecision,
+        ),
         PyannoteF32BtfNormKernel.create(device, gpuPackage),
       ]);
       const batch = gpuPackage.metadata.contract.inputShape[0];

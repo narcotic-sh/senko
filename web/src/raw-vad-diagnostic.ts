@@ -14,6 +14,7 @@ import { RawPyannoteTail } from "./pipeline/pyannote-tail-webgpu";
 
 const parameters = new URLSearchParams(location.search);
 const BATCH = diagnosticBatch(parameters.get("batch"));
+const FRONTEND_MODE = diagnosticFrontendMode(parameters.get("frontend"));
 const SAMPLES = 160_000;
 const FRAMES = 589;
 const CLASSES = 7;
@@ -25,6 +26,18 @@ function diagnosticBatch(source: string | null): 8 | 16 | 32 {
     throw new Error(`Raw VAD diagnostic batch must be 8, 16, or 32; received ${source}`);
   }
   return batch;
+}
+
+function diagnosticFrontendMode(
+  source: string | null,
+): "baseline" | "production" {
+  const mode = source ?? "production";
+  if (mode !== "baseline" && mode !== "production") {
+    throw new Error(
+      `Raw VAD frontend mode must be baseline or production; received ${source}`,
+    );
+  }
+  return mode;
 }
 
 const element = document.querySelector<HTMLPreElement>("#output");
@@ -247,6 +260,12 @@ async function main(): Promise<void> {
   const frontend = await RawPyannoteFrontendFoundation.create(
     device,
     `${directDirectory}/pyannote-segmentation-3.0-frontend-webgpu-f16.json`,
+    {
+      sincAccumulationSchedule:
+        FRONTEND_MODE === "baseline" ? "serial" : "interleaved",
+      convActivationTilePrecision:
+        FRONTEND_MODE === "baseline" ? "float32" : "float16",
+    },
   );
   const lstm = await PersistentWebGpuLstm.create(
     device,
@@ -417,6 +436,7 @@ async function main(): Promise<void> {
   const result = {
     ok,
     batchSize: BATCH,
+    frontendMode: FRONTEND_MODE,
     timestampQuery,
     outputSha256,
     comparison,

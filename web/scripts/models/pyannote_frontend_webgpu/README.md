@@ -14,8 +14,10 @@ InstanceNorm(waveform)
 `pack.py` checks that exact contract, covers every initializer, retiles all
 convolution weights as `[kernel,input,output-group,output-lane]`, and emits a
 headered, 256-byte-aligned FP16-storage binary plus JSON metadata. Reductions,
-state, boundaries, and convolution accumulators remain FP32. No ONNX protobuf
-is needed by the raw runtime.
+state, boundaries, and convolution accumulators remain FP32. The two Conv5
+kernels round only their normalized workgroup-local input tiles to FP16; their
+global inputs and outputs retain the package contract. No ONNX protobuf is
+needed by the raw runtime.
 
 Generate the ignored deployment package from the B8 export:
 
@@ -71,24 +73,33 @@ The complete mixed-precision B8 runtime uses two aliased activation slots:
 The seven dispatches own 384 uniform bytes, so the exact frontend GPU allocation
 is 12,068,992 bytes.
 
+Workgroup scratch is transient and does not add to that persistent allocation.
+The production Sinc kernel uses 10,652 bytes: 2,161 FP32 signal values and 251
+FP16 `vec4` filters. Each Conv5 kernel uses 13,056 bytes: 6,208 FP16 normalized
+activations and 80 FP16 `vec4` filters. Keeping the Conv5 accumulators FP32 while
+halving its scratch from the 25,472-byte FP32-tile baseline materially improves
+M3 occupancy without allocating another GPU buffer.
+
 This is lifetime aliasing, not an estimate based on garbage collection. The
 runtime retains two GPU buffers for the full frontend and overwrites them only
 after their previous values' last use. CPU residency after upload is the JSON
 metadata and small JavaScript objects; the 127,488-byte response buffer is not
 retained by `PyannoteFrontendGpuPackage`.
 
-## Kernel order
+## Kernel lowering
 
-1. Validate the implemented Sinc/Abs/Pool kernel against an ONNX intermediate
-   on Chrome/M3, including silence and deterministic nonzero input.
-2. Generalize its output-channel vec4 accumulator to Conv1. Norm0 scale/shift
-   is applied while loading pool0, so no normalized activation is written.
-3. Reuse the same kernel for Conv2, write BTF directly, and run final
-   InstanceNorm plus LeakyReLU in place.
-4. Replace the eight-node tail with one workgroup per `(batch, frame)`: two
-   128-wide affine/Leaky stages in workgroup memory followed by the seven-way
-   classifier. The tail is 29,478,272 MACs per item (235,826,176 per B8) and
-   needs no globally materialized hidden tensors.
+The Sinc kernel interleaves the three independent convolution accumulators that
+feed each MaxPool result. Each accumulator still executes its 251 FP32 FMAs in
+the identical order, so this scheduling change is byte-exact relative to the
+serial kernel while removing its single dependency chain. Conv1 applies the
+norm0 scale/shift as it loads pool0, so no normalized activation is written.
+Conv2 reuses the same kernel, writes BTF directly, and the final InstanceNorm
+plus LeakyReLU runs in place.
+
+The raw VAD tail uses one workgroup per `(batch, frame)`: two 128-wide
+affine/Leaky stages in workgroup memory followed by the seven-way classifier.
+The tail is 29,478,272 MACs per item (235,826,176 per B8) and needs no globally
+materialized hidden tensors.
 
 FluidAudio and Mobius confirm the same 160,000-sample/589-frame contract, but
 their optimization target is Core ML/ANE. Their useful transferable decisions
@@ -98,17 +109,23 @@ that can replace this WGSL lowering.
 
 ## M3 Chrome measurement
 
-The complete frontend was measured in Chrome on the target M3 with B8 random
-input and the ORT reference session released before timing:
+The complete frontend was measured twice in isolated Chrome on the target M3
+with deterministic B8 input:
 
-- settled mean: 26.708 ms per B8;
-- settled median: 26.375 ms per B8;
-- ORT-frontend parity: max absolute `2.924e-3`, RMS `2.011e-4`, and zero
-  non-finite values.
+- FP32 scratch with serial Sinc: 20.61--20.63 ms mean per B8;
+- FP32 scratch with byte-exact interleaved Sinc: 15.23--15.27 ms;
+- production interleaved Sinc plus FP16 Conv5 scratch: 11.12--11.14 ms;
+- production frontend versus the FP32 baseline: max absolute `1.519e-3`, RMS
+  `8.564e-5`, cosine `0.999999831`, and zero non-finite values.
 
 The full raw frontend -> FP16-weight/FP32-state LSTM -> raw tail settled at
-58.728 ms per synthetic B8 call, with maximum logit error `5.015e-3`, RMS
-`1.137e-3`, and 4712/4712 matching argmax decisions versus the split ORT
-reference. It owns exactly 24,845,312 GPU bytes. On `test_audio.wav` (3696.043
-seconds, 370 chunks), 47 B8 calls complete in roughly 3.1--3.6 seconds in
-Chrome/M3; run-to-run GPU scheduling is the dominant spread.
+48.43 ms wall / 46.78 ms GPU per synthetic B8 call, down from 57.81 / 56.15
+ms. Maximum logit error versus the split ORT reference is `5.141e-3`, RMS is
+`1.183e-3`, and all 4712/4712 argmax decisions match. It still owns exactly
+24,845,312 GPU bytes. For 370 chunks, 47 steady calls project to 2.276 seconds.
+
+Rounding the Sinc signal tile to FP16 was rejected. It saved only about 0.9 ms
+per B8 beyond the production configuration (roughly 49 ms across 47 calls when
+combined with the Conv5 change) while raising the full raw maximum logit error
+to `9.380e-3`. It did not justify weakening numerical agreement for a sub-1%
+whole-pipeline projection.
