@@ -2,6 +2,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const fakes = vi.hoisted(() => ({
   events: [] as string[],
+  selections: [] as string[],
+  deviceDescriptors: [] as GPUDeviceDescriptor[],
   failEmbeddingCreate: false,
   manifest: {
     models: {
@@ -13,7 +15,13 @@ const fakes = vi.hoisted(() => ({
 
 vi.mock("./model-manifest", () => ({
   loadModelManifest: async () => fakes.manifest,
-  selectSegmentationSplit: () => ({
+  selectSegmentationSplit: (
+    _url: string,
+    _model: unknown,
+    _batch: number,
+    precision: "float16" | "float32",
+  ) => ({
+    precision,
     batchSize: 8,
     directWebGpu: {
       frontendMetadata: { url: "https://example.test/frontend.json" },
@@ -21,7 +29,13 @@ vi.mock("./model-manifest", () => ({
       explicitGpuBytes: 44_145_664,
     },
   }),
-  selectCampPlusDirect: () => ({
+  selectCampPlusDirect: (
+    _url: string,
+    _model: unknown,
+    _batch: number,
+    precision: "float16" | "float32",
+  ) => ({
+    precision,
     batchSize: 16,
     metadata: { url: "https://example.test/campplus.json" },
     weights: { url: "https://example.test/campplus.bin" },
@@ -99,7 +113,7 @@ function fakeDeviceRole(device: GPUDevice): string {
   return (device as unknown as FakeDevice).role;
 }
 
-function createGpu(): {
+function createGpu(shaderF16 = true): {
   readonly gpu: GPU;
   readonly devices: readonly [FakeDevice, FakeDevice];
 } {
@@ -123,7 +137,7 @@ function createGpu(): {
       if (device === undefined) throw new Error("unexpected third adapter request");
       fakes.events.push(`request-adapter:${device.role}`);
       return {
-        features: new Set(["shader-f16"]),
+        features: new Set(shaderF16 ? ["shader-f16"] : []),
         limits: {
           maxBufferSize: 1_000_000_000,
           maxStorageBufferBindingSize: 1_000_000_000,
@@ -132,8 +146,9 @@ function createGpu(): {
           maxComputeWorkgroupSizeX: 256,
           maxComputeWorkgroupsPerDimension: 65_535,
         },
-        async requestDevice() {
+        async requestDevice(descriptor: GPUDeviceDescriptor) {
           fakes.events.push(`request-device:${device.role}`);
+          fakes.deviceDescriptors.push(descriptor);
           return device;
         },
       };
@@ -145,6 +160,8 @@ function createGpu(): {
 describe("BrowserModelSet dual residency", () => {
   beforeEach(() => {
     fakes.events.length = 0;
+    fakes.selections.length = 0;
+    fakes.deviceDescriptors.length = 0;
     fakes.failEmbeddingCreate = false;
   });
 
@@ -158,6 +175,7 @@ describe("BrowserModelSet dual residency", () => {
 
     expect(models.vadDevice).toBe(devices[0]);
     expect(models.embeddingDevice).toBe(devices[1]);
+    expect(models.precision).toBe("float16");
     expect(fakes.events).toEqual([
       "request-adapter:vad",
       "request-adapter:embedding",
@@ -169,11 +187,52 @@ describe("BrowserModelSet dual residency", () => {
       "run-embedding",
     ]);
     expect(models.knownGpuBufferBytes).toBe(84_001_024);
+    expect(fakes.deviceDescriptors).toHaveLength(2);
+    expect(fakes.deviceDescriptors).toEqual([
+      expect.objectContaining({ requiredFeatures: ["shader-f16"] }),
+      expect.objectContaining({ requiredFeatures: ["shader-f16"] }),
+    ]);
 
     fakes.events.length = 0;
     await models.vad.run(new Float32Array(8 * 160_000));
     await models.embedding.run(new Float32Array(16 * 150 * 80));
     expect(fakes.events).toEqual(["run-vad", "run-embedding"]);
+  });
+
+  it("forces fully FP32 models without requesting shader-f16", async () => {
+    const { gpu } = createGpu(true);
+    const models = await BrowserModelSet.load(
+      "https://example.test/manifest.json",
+      gpu,
+      { preferFloat16: false, warmupRuns: 0 },
+    );
+
+    expect(models.precision).toBe("float32");
+    expect(models.vadVariant.precision).toBe("float32");
+    expect(models.embeddingVariant.precision).toBe("float32");
+    expect(fakes.deviceDescriptors).toHaveLength(2);
+    expect(
+      fakes.deviceDescriptors.every(
+        (descriptor) => descriptor.requiredFeatures === undefined,
+      ),
+    ).toBe(true);
+  });
+
+  it("automatically chooses FP32 when shader-f16 is unavailable", async () => {
+    const { gpu } = createGpu(false);
+    const models = await BrowserModelSet.load(
+      "https://example.test/manifest.json",
+      gpu,
+      { warmupRuns: 0 },
+    );
+
+    expect(models.precision).toBe("float32");
+    expect(fakes.deviceDescriptors).toHaveLength(2);
+    expect(
+      fakes.deviceDescriptors.every(
+        (descriptor) => descriptor.requiredFeatures === undefined,
+      ),
+    ).toBe(true);
   });
 
   it("reports both concurrent load and warmup paths", async () => {

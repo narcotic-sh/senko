@@ -6,9 +6,9 @@ import {
   type PyannoteSincAbsPoolDispatch,
 } from "./sinc-abs-pool";
 import {
-  PyannoteF16BctNormKernel,
+  PyannoteBctNormKernel,
   PyannoteF32BtfNormKernel,
-  type PyannoteF16BctNormDispatch,
+  type PyannoteBctNormDispatch,
   type PyannoteF32BtfNormDispatch,
 } from "./instance-norm";
 import {
@@ -50,8 +50,10 @@ export const RAW_PYANNOTE_FRONTEND_PRODUCTION_KERNELS = {
  *
  * Slot A holds the pooled Sinc activation and is later overwritten by the
  * final FP32 BTF features. Slot B first holds the FP32 waveform and is later
- * overwritten by the second FP16 pooled activation. No intermediate tensor
- * relies on JavaScript garbage collection for timely GPU reclamation.
+ * overwritten by the second pooled activation. Pooled storage follows package
+ * metadata (FP16 in production, FP32 in the shader-f16-free fallback). No
+ * intermediate tensor relies on JavaScript garbage collection for timely GPU
+ * reclamation.
  */
 export class RawPyannoteFrontendFoundation {
   readonly waveformBuffer: GPUBuffer;
@@ -65,9 +67,9 @@ export class RawPyannoteFrontendFoundation {
     private readonly device: GPUDevice,
     readonly gpuPackage: PyannoteFrontendGpuPackage,
     readonly sincKernel: PyannoteSincAbsPoolKernel,
-    private readonly norm0Dispatch: PyannoteF16BctNormDispatch,
+    private readonly norm0Dispatch: PyannoteBctNormDispatch,
     private readonly conv1Dispatch: PyannoteConvPoolDispatch,
-    private readonly norm1Dispatch: PyannoteF16BctNormDispatch,
+    private readonly norm1Dispatch: PyannoteBctNormDispatch,
     private readonly conv2Dispatch: PyannoteConvPoolDispatch,
     private readonly finalNormDispatch: PyannoteF32BtfNormDispatch,
     waveformBuffer: GPUBuffer,
@@ -109,9 +111,9 @@ export class RawPyannoteFrontendFoundation {
     let waveformBuffer: GPUBuffer | undefined;
     let pooledSincBuffer: GPUBuffer | undefined;
     let sincKernel: PyannoteSincAbsPoolKernel | undefined;
-    let norm0Dispatch: PyannoteF16BctNormDispatch | undefined;
+    let norm0Dispatch: PyannoteBctNormDispatch | undefined;
     let conv1Dispatch: PyannoteConvPoolDispatch | undefined;
-    let norm1Dispatch: PyannoteF16BctNormDispatch | undefined;
+    let norm1Dispatch: PyannoteBctNormDispatch | undefined;
     let conv2Dispatch: PyannoteConvPoolDispatch | undefined;
     let finalNormDispatch: PyannoteF32BtfNormDispatch | undefined;
     try {
@@ -131,13 +133,19 @@ export class RawPyannoteFrontendFoundation {
       const sincAccumulationSchedule =
         options.sincAccumulationSchedule ??
         RAW_PYANNOTE_FRONTEND_PRODUCTION_KERNELS.sincAccumulationSchedule;
+      const intermediatePrecision =
+        gpuPackage.metadata.contract.intermediateDtype;
+      const intermediateElementBytes =
+        intermediatePrecision === "float16" ? 2 : 4;
+      const bctOutputLayout =
+        intermediatePrecision === "float16" ? "f16-bct" : "f32-bct";
       sincKernel = await PyannoteSincAbsPoolKernel.create(
         device,
         gpuPackage,
         sincAccumulationSchedule,
       );
       const [normKernel, convKernel, finalNormKernel] = await Promise.all([
-        PyannoteF16BctNormKernel.create(device, gpuPackage),
+        PyannoteBctNormKernel.create(device, gpuPackage),
         PyannoteConvPoolKernel.create(
           device,
           gpuPackage,
@@ -151,7 +159,7 @@ export class RawPyannoteFrontendFoundation {
       norm0Dispatch = normKernel.createDispatch({
         label: "senko-pyannote-pool0-instance-norm",
         input: pooledSincBuffer,
-        inputBytes: batch * 80 * 5_325 * 2,
+        inputBytes: batch * 80 * 5_325 * intermediateElementBytes,
         statistics,
         statisticsBytes,
         affine: gpuPackage.section("instance_norm:1:affine"),
@@ -163,9 +171,9 @@ export class RawPyannoteFrontendFoundation {
       conv1Dispatch = convKernel.createDispatch({
         label: "senko-pyannote-conv1-pool",
         input: pooledSincBuffer,
-        inputBytes: batch * 80 * 5_325 * 2,
+        inputBytes: batch * 80 * 5_325 * intermediateElementBytes,
         output: waveformBuffer,
-        outputBytes: batch * 60 * 1_773 * 2,
+        outputBytes: batch * 60 * 1_773 * intermediateElementBytes,
         statistics,
         statisticsBytes,
         weight: gpuPackage.section("conv:1:weight"),
@@ -175,13 +183,13 @@ export class RawPyannoteFrontendFoundation {
         outputChannels: 60,
         inputFrames: 5_325,
         outputFrames: 1_773,
-        outputLayout: "f16-bct",
+        outputLayout: bctOutputLayout,
         leakyAlpha: 0.01,
       });
       norm1Dispatch = normKernel.createDispatch({
         label: "senko-pyannote-pool1-instance-norm",
         input: waveformBuffer,
-        inputBytes: batch * 60 * 1_773 * 2,
+        inputBytes: batch * 60 * 1_773 * intermediateElementBytes,
         statistics,
         statisticsBytes,
         affine: gpuPackage.section("instance_norm:2:affine"),
@@ -193,7 +201,7 @@ export class RawPyannoteFrontendFoundation {
       conv2Dispatch = convKernel.createDispatch({
         label: "senko-pyannote-conv2-pool",
         input: waveformBuffer,
-        inputBytes: batch * 60 * 1_773 * 2,
+        inputBytes: batch * 60 * 1_773 * intermediateElementBytes,
         output: pooledSincBuffer,
         outputBytes: batch * 60 * 589 * 4,
         statistics,

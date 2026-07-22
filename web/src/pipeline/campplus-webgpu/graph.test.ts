@@ -41,6 +41,21 @@ describe("raw CAM++ graph batch plans", () => {
     });
   });
 
+  it("doubles only internal activation storage for the FP32 fallback", () => {
+    expect(campPlusRawArenaPlan(16, "float32")).toEqual({
+      activationArenaBytes: 50_380_800,
+      minimumActivationArenaBytes: 49_152_000,
+      fcmPeakBytes: 49_152_000,
+      denseBackbonePeakBytes: 10_452_992,
+    });
+    expect(campPlusRawGraphVariableGpuBytes(16, "float32")).toMatchObject({
+      activationArena: 50_380_800,
+      input: 768_000,
+      output: 12_288,
+      readback: 24_576,
+    });
+  });
+
   it("accounts every batch-dependent B64 GPUBuffer byte", () => {
     const bytes = campPlusRawGraphVariableGpuBytes(64);
     expect(bytes).toEqual({

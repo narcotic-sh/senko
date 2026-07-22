@@ -5,6 +5,7 @@ export interface PyannoteTailSection {
   readonly byteLength: number;
   readonly logicalShape: readonly number[];
   readonly layout: "I_O4_O" | "O4";
+  readonly dtype: "float16" | "float32";
 }
 
 export interface PyannoteTailMetadata {
@@ -17,6 +18,7 @@ export interface PyannoteTailMetadata {
     readonly sectionCount: number;
   };
   readonly batch: number;
+  readonly weightPrecision: "float16" | "float32";
   readonly weightBytes: number;
   readonly outputBytes: number;
   readonly readbackBytes: number;
@@ -44,7 +46,7 @@ export function parsePyannoteTailMetadata(value: unknown): PyannoteTailMetadata 
     outputShape[1] !== 589 ||
     outputShape[2] !== 7 ||
     contract.boundary_dtype !== "float32" ||
-    contract.weight_dtype !== "float16" ||
+    (contract.weight_dtype !== "float16" && contract.weight_dtype !== "float32") ||
     contract.accumulator_dtype !== "float32"
   ) {
     throw new Error("Unsupported raw pyannote tail tensor contract");
@@ -55,6 +57,9 @@ export function parsePyannoteTailMetadata(value: unknown): PyannoteTailMetadata 
   const sections = new Map(sectionList.map((section) => [section.id, section]));
   if (sections.size !== 6 || sections.size !== sectionList.length) {
     throw new Error("Raw pyannote tail requires six unique sections");
+  }
+  if (sectionList.some((section) => section.dtype !== contract.weight_dtype)) {
+    throw new Error("Raw pyannote tail section precision does not match its contract");
   }
   const binaryBytes = positive(binary.byte_length, "metadata.binary.byte_length");
   if (
@@ -80,6 +85,7 @@ export function parsePyannoteTailMetadata(value: unknown): PyannoteTailMetadata 
       sectionCount: sectionList.length,
     },
     batch: inputShape[0]!,
+    weightPrecision: contract.weight_dtype,
     weightBytes: positive(memory.weight_buffer_bytes, "metadata.memory.weight_buffer_bytes"),
     outputBytes: positive(memory.output_buffer_bytes, "metadata.memory.output_buffer_bytes"),
     readbackBytes: positive(memory.readback_buffer_bytes, "metadata.memory.readback_buffer_bytes"),
@@ -95,7 +101,7 @@ function parseSection(value: unknown, index: number): PyannoteTailSection {
   if (
     (section.kind !== "matrix" && section.kind !== "bias") ||
     (section.layout !== "I_O4_O" && section.layout !== "O4") ||
-    section.dtype !== "float16"
+    (section.dtype !== "float16" && section.dtype !== "float32")
   ) {
     throw new Error(`${path} has an unsupported storage contract`);
   }
@@ -106,6 +112,7 @@ function parseSection(value: unknown, index: number): PyannoteTailSection {
     byteLength: positive(section.byte_length, `${path}.byte_length`),
     logicalShape: dimensions(section.logical_shape, `${path}.logical_shape`),
     layout: section.layout,
+    dtype: section.dtype,
   };
 }
 

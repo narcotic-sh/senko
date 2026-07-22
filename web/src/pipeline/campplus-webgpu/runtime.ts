@@ -34,6 +34,10 @@ import {
   CampPlusGpuPackage,
   type CampPlusPackageLoadOptions,
 } from "./package";
+import {
+  campPlusStorageBytes,
+  type CampPlusStorageDtype,
+} from "./storage";
 
 export interface CampPlusRawGpuBytes {
   readonly weights: number;
@@ -42,6 +46,8 @@ export interface CampPlusRawGpuBytes {
 }
 
 export interface RawCampPlusFoundationOptions extends CampPlusPackageLoadOptions {
+  /** Required package/arena storage precision; omission accepts package metadata. */
+  readonly storageDtype?: CampPlusStorageDtype;
   /** Explicit arena plan for a supported front-end microbatch. */
   readonly activationArenaBytes?: number;
   /** Diagnostic FCM kernel selection; omission uses the measured production default. */
@@ -127,6 +133,8 @@ export class RawCampPlusFoundation {
   readonly finalStatsDense: FinalStatsDenseKernel;
   readonly pointwiseTransit: PointwiseTransitKernels;
   readonly gpuBytes: CampPlusRawGpuBytes;
+  readonly storageDtype: CampPlusStorageDtype;
+  readonly storageBytesPerElement: 2 | 4;
   private destroyed = false;
 
   private constructor(
@@ -144,6 +152,8 @@ export class RawCampPlusFoundation {
     this.fcm = fcm;
     this.finalStatsDense = finalStatsDense;
     this.pointwiseTransit = pointwiseTransit;
+    this.storageDtype = gpuPackage.metadata.contract.internalDtype;
+    this.storageBytesPerElement = campPlusStorageBytes(this.storageDtype);
     this.gpuBytes = {
       weights: gpuPackage.metadata.binary.byteLength,
       activationArena: arena.byteLength,
@@ -159,10 +169,19 @@ export class RawCampPlusFoundation {
     const gpuPackage = await CampPlusGpuPackage.load(device, metadataUrl, options);
     let arena: CampPlusActivationArena | undefined;
     try {
+      if (
+        options.storageDtype !== undefined &&
+        gpuPackage.metadata.contract.internalDtype !== options.storageDtype
+      ) {
+        throw new Error(
+          `CAM++ requested ${options.storageDtype} storage but package is ${gpuPackage.metadata.contract.internalDtype}`,
+        );
+      }
       arena = new CampPlusActivationArena(
         device,
         options.activationArenaBytes ?? gpuPackage.metadata.memory.activationArenaBytes,
       );
+      const storageDtype = gpuPackage.metadata.contract.internalDtype;
       const [
         packedConvolution,
         denseCam,
@@ -182,7 +201,10 @@ export class RawCampPlusFoundation {
           gpuPackage,
           arena,
           options.fcmVariant ?? DEFAULT_FCM_VARIANT,
-          options.fcmAccumulation ?? DEFAULT_FCM_ACCUMULATION,
+          options.fcmAccumulation ??
+            (storageDtype === "float32"
+              ? "float32"
+              : DEFAULT_FCM_ACCUMULATION),
         ),
         FinalStatsDenseKernel.create(device, gpuPackage, arena),
         PointwiseTransitKernels.create(
@@ -191,7 +213,9 @@ export class RawCampPlusFoundation {
           arena,
           options.pointwiseTransitVariant,
           options.pointwiseTransitAccumulation ??
-            DEFAULT_POINTWISE_TRANSIT_ACCUMULATION,
+            (storageDtype === "float32"
+              ? "float32"
+              : DEFAULT_POINTWISE_TRANSIT_ACCUMULATION),
         ),
       ]);
       return new RawCampPlusFoundation(

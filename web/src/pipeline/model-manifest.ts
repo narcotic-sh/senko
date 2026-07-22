@@ -25,13 +25,25 @@ export interface BrowserModel {
   direct_webgpu?: DirectWebGpuCampPlusManifest;
 }
 
-export interface DirectWebGpuCampPlusManifest {
-  readonly format: "senko-campplus-direct-webgpu-f16-v1";
+export type WebGpuModelPrecision = "float16" | "float32";
+
+const WEBGPU_MODEL_PRECISIONS = ["float16", "float32"] as const;
+
+export interface DirectWebGpuCampPlusPrecisionVariant {
+  readonly format:
+    | "senko-campplus-direct-webgpu-f16-v1"
+    | "senko-campplus-direct-webgpu-f32-v1";
   readonly metadata: FileAssetRecord;
   readonly weights: FileAssetRecord;
   readonly production_batch: 16;
   readonly supported_batches: readonly [4, 8, 16, 32];
   readonly explicit_gpu_buffer_bytes_by_batch: Readonly<Record<string, number>>;
+}
+
+export interface DirectWebGpuCampPlusManifest {
+  readonly precision_variants: Readonly<
+    Record<WebGpuModelPrecision, DirectWebGpuCampPlusPrecisionVariant>
+  >;
 }
 
 export interface PrecisionVariant {
@@ -52,7 +64,9 @@ export interface FileAssetRecord {
 }
 
 export interface LstmSplitArtifact {
-  format: "senko-persistent-lstm-f16-gc4h";
+  format:
+    | "senko-persistent-lstm-f16-gc4h"
+    | "senko-persistent-lstm-f32-gc4h";
   boundary_layout: "batch,frame,feature";
   frames: 589;
   input_features: 60;
@@ -73,21 +87,29 @@ export interface VadBufferBytes {
 }
 
 export interface DirectWebGpuVadVariant {
-  readonly format: "senko-pyannote-direct-webgpu-f16-v1";
+  readonly format:
+    | "senko-pyannote-direct-webgpu-f16-v1"
+    | "senko-pyannote-direct-webgpu-f32-v1";
   readonly frontend_metadata: FileAssetRecord;
   readonly tail_metadata: FileAssetRecord;
   readonly explicit_gpu_bytes: number;
 }
 
-export interface DirectWebGpuVadManifest {
+export interface DirectWebGpuVadPrecisionVariant {
+  readonly lstm: LstmSplitArtifact;
   readonly batches: Record<string, DirectWebGpuVadVariant>;
+}
+
+export interface DirectWebGpuVadManifest {
+  readonly precision_variants: Readonly<
+    Record<WebGpuModelPrecision, DirectWebGpuVadPrecisionVariant>
+  >;
 }
 
 export interface SegmentationSplitManifest {
   version: 1;
   boundary_layout: "batch,frame,feature";
   frontend: BrowserModel;
-  lstm: LstmSplitArtifact;
   tail: BrowserModel;
   direct_webgpu: DirectWebGpuVadManifest;
   buffer_bytes_by_batch: Record<string, VadBufferBytes>;
@@ -115,6 +137,7 @@ export interface SelectedModelVariant {
 }
 
 export interface SelectedSegmentationSplit {
+  readonly precision: WebGpuModelPrecision;
   batchSize: number;
   frontend: SelectedModelVariant;
   tail: SelectedModelVariant;
@@ -130,6 +153,7 @@ export interface SelectedSegmentationSplit {
 }
 
 export interface SelectedCampPlusDirect {
+  readonly precision: WebGpuModelPrecision;
   readonly batchSize: 4 | 8 | 16 | 32;
   readonly metadata: OrtModelAsset;
   readonly weights: OrtModelAsset;
@@ -215,6 +239,7 @@ export function selectSegmentationSplit(
   manifestUrl: string,
   model: BrowserSegmentationModel,
   batchSize: number,
+  precision: WebGpuModelPrecision = "float16",
 ): SelectedSegmentationSplit {
   const split = model.split;
   const frontend = selectModelVariant(manifestUrl, split.frontend, batchSize);
@@ -223,23 +248,27 @@ export function selectSegmentationSplit(
   if (declaredBufferBytes === undefined) {
     throw new Error(`Split segmentation has no B${batchSize} buffer accounting`);
   }
-  const direct = split.direct_webgpu.batches[String(batchSize)];
+  const precisionVariant = split.direct_webgpu.precision_variants[precision];
+  const direct = precisionVariant.batches[String(batchSize)];
   if (direct === undefined) {
-    throw new Error(`Split segmentation has no direct WebGPU B${batchSize} package`);
+    throw new Error(
+      `Split segmentation has no direct WebGPU ${precision} B${batchSize} package`,
+    );
   }
   return {
+    precision,
     batchSize,
     frontend,
     tail,
-    weights: fileAsset(manifestUrl, split.lstm.weights),
-    metadata: fileAsset(manifestUrl, split.lstm.metadata),
+    weights: fileAsset(manifestUrl, precisionVariant.lstm.weights),
+    metadata: fileAsset(manifestUrl, precisionVariant.lstm.metadata),
     directWebGpu: {
       frontendMetadata: fileAsset(manifestUrl, direct.frontend_metadata),
       tailMetadata: fileAsset(manifestUrl, direct.tail_metadata),
       explicitGpuBytes: direct.explicit_gpu_bytes,
     },
     declaredBufferBytes,
-    artifact: split.lstm,
+    artifact: precisionVariant.lstm,
   };
 }
 
@@ -247,9 +276,13 @@ export function selectCampPlusDirect(
   manifestUrl: string,
   model: BrowserModel,
   preferredBatchSize?: number,
+  precision: WebGpuModelPrecision = "float16",
 ): SelectedCampPlusDirect {
-  const direct = model.direct_webgpu;
-  if (direct === undefined) throw new Error("CAM++ direct WebGPU package is missing");
+  const directManifest = model.direct_webgpu;
+  if (directManifest === undefined) {
+    throw new Error("CAM++ direct WebGPU package is missing");
+  }
+  const direct = directManifest.precision_variants[precision];
   const batchSize = preferredBatchSize ?? direct.production_batch;
   if (batchSize !== 4 && batchSize !== 8 && batchSize !== 16 && batchSize !== 32) {
     throw new Error(`CAM++ direct WebGPU does not support B${batchSize}`);
@@ -267,6 +300,7 @@ export function selectCampPlusDirect(
     throw new Error(`CAM++ direct WebGPU B${batchSize} memory declaration is missing`);
   }
   return {
+    precision,
     batchSize,
     metadata: fileAsset(manifestUrl, direct.metadata),
     weights: fileAsset(manifestUrl, direct.weights),
@@ -374,46 +408,57 @@ function assertSegmentationSplit(value: unknown): asserts value is SegmentationS
   const split = value as Partial<SegmentationSplitManifest>;
   if (
     split.version !== 1 ||
-    split.boundary_layout !== "batch,frame,feature" ||
-    split.lstm?.format !== "senko-persistent-lstm-f16-gc4h" ||
-    split.lstm.frames !== 589 ||
-    split.lstm.input_features !== 60 ||
-    split.lstm.output_features !== 256
+    split.boundary_layout !== "batch,frame,feature"
   ) {
     throw new Error("Segmentation split manifest has an unsupported contract");
   }
   assertModel(split.frontend, "segmentation.split.frontend");
   assertModel(split.tail, "segmentation.split.tail");
-  assertFileAsset(split.lstm.weights, "segmentation.split.lstm.weights");
-  assertFileAsset(split.lstm.metadata, "segmentation.split.lstm.metadata");
   if (
     typeof split.direct_webgpu !== "object" ||
     split.direct_webgpu === null ||
-    typeof split.direct_webgpu.batches !== "object" ||
-    split.direct_webgpu.batches === null
+    typeof split.direct_webgpu.precision_variants !== "object" ||
+    split.direct_webgpu.precision_variants === null
   ) {
     throw new Error("Segmentation direct WebGPU packages are missing");
   }
-  for (const [batch, value] of Object.entries(split.direct_webgpu.batches)) {
-    if (!/^\d+$/.test(batch) || typeof value !== "object" || value === null) {
-      throw new Error(`Segmentation direct WebGPU B${batch} is malformed`);
-    }
-    const variant = value as Partial<DirectWebGpuVadVariant>;
+  for (const precision of WEBGPU_MODEL_PRECISIONS) {
+    const precisionVariant = split.direct_webgpu.precision_variants[precision];
     if (
-      variant.format !== "senko-pyannote-direct-webgpu-f16-v1" ||
-      !Number.isSafeInteger(variant.explicit_gpu_bytes) ||
-      (variant.explicit_gpu_bytes ?? 0) <= 0
+      typeof precisionVariant !== "object" ||
+      precisionVariant === null ||
+      typeof precisionVariant.batches !== "object" ||
+      precisionVariant.batches === null
     ) {
-      throw new Error(`Segmentation direct WebGPU B${batch} is malformed`);
+      throw new Error(`Segmentation direct WebGPU ${precision} package is missing`);
     }
-    assertFileAsset(
-      variant.frontend_metadata,
-      `segmentation.split.direct_webgpu.${batch}.frontend_metadata`,
-    );
-    assertFileAsset(
-      variant.tail_metadata,
-      `segmentation.split.direct_webgpu.${batch}.tail_metadata`,
-    );
+    assertLstmSplitArtifact(precisionVariant.lstm, precision);
+    for (const [batch, value] of Object.entries(precisionVariant.batches)) {
+      if (!/^\d+$/.test(batch) || typeof value !== "object" || value === null) {
+        throw new Error(
+          `Segmentation direct WebGPU ${precision} B${batch} is malformed`,
+        );
+      }
+      const variant = value as Partial<DirectWebGpuVadVariant>;
+      const expectedFormat = `senko-pyannote-direct-webgpu-${precision === "float16" ? "f16" : "f32"}-v1`;
+      if (
+        variant.format !== expectedFormat ||
+        !Number.isSafeInteger(variant.explicit_gpu_bytes) ||
+        (variant.explicit_gpu_bytes ?? 0) <= 0
+      ) {
+        throw new Error(
+          `Segmentation direct WebGPU ${precision} B${batch} is malformed`,
+        );
+      }
+      assertFileAsset(
+        variant.frontend_metadata,
+        `segmentation.split.direct_webgpu.${precision}.${batch}.frontend_metadata`,
+      );
+      assertFileAsset(
+        variant.tail_metadata,
+        `segmentation.split.direct_webgpu.${precision}.${batch}.tail_metadata`,
+      );
+    }
   }
   if (
     typeof split.buffer_bytes_by_batch !== "object" ||
@@ -423,27 +468,72 @@ function assertSegmentationSplit(value: unknown): asserts value is SegmentationS
   }
 }
 
+function assertLstmSplitArtifact(
+  value: unknown,
+  precision: WebGpuModelPrecision,
+): asserts value is LstmSplitArtifact {
+  if (typeof value !== "object" || value === null) {
+    throw new Error(`Segmentation ${precision} LSTM artifact is missing`);
+  }
+  const artifact = value as Partial<LstmSplitArtifact>;
+  const expectedFormat =
+    precision === "float16"
+      ? "senko-persistent-lstm-f16-gc4h"
+      : "senko-persistent-lstm-f32-gc4h";
+  if (
+    artifact.format !== expectedFormat ||
+    artifact.boundary_layout !== "batch,frame,feature" ||
+    artifact.frames !== 589 ||
+    artifact.input_features !== 60 ||
+    artifact.output_features !== 256
+  ) {
+    throw new Error(`Segmentation ${precision} LSTM artifact is malformed`);
+  }
+  assertFileAsset(artifact.weights, `segmentation.${precision}.lstm.weights`);
+  assertFileAsset(artifact.metadata, `segmentation.${precision}.lstm.metadata`);
+}
+
 function assertCampPlusDirect(value: unknown): asserts value is DirectWebGpuCampPlusManifest {
   if (typeof value !== "object" || value === null) {
     throw new Error("CAM++ direct WebGPU package is missing");
   }
   const direct = value as Partial<DirectWebGpuCampPlusManifest>;
   if (
-    direct.format !== "senko-campplus-direct-webgpu-f16-v1" ||
-    direct.production_batch !== 16 ||
-    !Array.isArray(direct.supported_batches) ||
-    direct.supported_batches.join(",") !== "4,8,16,32" ||
-    typeof direct.explicit_gpu_buffer_bytes_by_batch !== "object" ||
-    direct.explicit_gpu_buffer_bytes_by_batch === null
+    typeof direct.precision_variants !== "object" ||
+    direct.precision_variants === null
   ) {
     throw new Error("CAM++ direct WebGPU package has an unsupported contract");
   }
-  assertFileAsset(direct.metadata, "campplus.direct_webgpu.metadata");
-  assertFileAsset(direct.weights, "campplus.direct_webgpu.weights");
-  for (const batch of direct.supported_batches) {
-    const bytes = direct.explicit_gpu_buffer_bytes_by_batch[String(batch)];
-    if (typeof bytes !== "number" || !Number.isSafeInteger(bytes) || bytes <= 0) {
-      throw new Error(`CAM++ direct WebGPU B${batch} memory declaration is malformed`);
+  for (const precision of WEBGPU_MODEL_PRECISIONS) {
+    const variant = direct.precision_variants[precision];
+    const expectedFormat = `senko-campplus-direct-webgpu-${precision === "float16" ? "f16" : "f32"}-v1`;
+    if (
+      typeof variant !== "object" ||
+      variant === null ||
+      variant.format !== expectedFormat ||
+      variant.production_batch !== 16 ||
+      !Array.isArray(variant.supported_batches) ||
+      variant.supported_batches.join(",") !== "4,8,16,32" ||
+      typeof variant.explicit_gpu_buffer_bytes_by_batch !== "object" ||
+      variant.explicit_gpu_buffer_bytes_by_batch === null
+    ) {
+      throw new Error(`CAM++ direct WebGPU ${precision} package is malformed`);
+    }
+    assertFileAsset(
+      variant.metadata,
+      `campplus.direct_webgpu.${precision}.metadata`,
+    );
+    assertFileAsset(
+      variant.weights,
+      `campplus.direct_webgpu.${precision}.weights`,
+    );
+    for (const batch of variant.supported_batches) {
+      const bytes = variant.explicit_gpu_buffer_bytes_by_batch[String(batch)];
+      if (typeof bytes !== "number" || !Number.isSafeInteger(bytes) || bytes <= 0) {
+        throw new Error(
+          `CAM++ direct WebGPU ${precision} B${batch} memory declaration is malformed`,
+        );
+      }
     }
   }
 }

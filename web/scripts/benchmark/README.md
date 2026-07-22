@@ -24,15 +24,39 @@ node web/scripts/benchmark/run-browser-pipeline.mjs \
 Port 4173 and the production preview are the defaults, so `--url` is shown
 only to make the acceptance protocol explicit. Timing mode inspects the served
 HTML and refuses Vite's development client or an unrecognized artifact. It also
-requires cross-origin isolation, WebGPU, a dedicated worker, WASM SIMD, WASM
-threads, and `shader-f16`. The record is therefore labeled
+requires cross-origin isolation, WebGPU, a dedicated worker, WASM SIMD, and
+WASM threads. An FP16 run additionally requires `shader-f16`; an automatically
+selected or explicitly forced FP32 run does not. The record is therefore labeled
 `timingAcceptanceEligible: true` only when the full accelerated environment is
-present and page-memory instrumentation is absent.
+present, page-memory instrumentation is absent, and the selected precision is
+the adapter's automatic production path.
 It also verifies the canonical `test_audio.wav` byte length and SHA-256, then
 requires a complete six-stage result with the expected 3696.0426875-second
 duration and internally consistent speakers and segments.
 The SHA-256 pass happens after pipeline completion so verification does not
 pre-warm the WAV in the filesystem cache before `wallMs` starts.
+
+To force the complete FP32 model/kernel path on an adapter that also exposes
+`shader-f16`, add `--precision float32`. The runner sets
+`?precision=float32`, verifies that the worker actually initialized FP32
+models, and records `runtime.modelPrecision` in its output:
+
+```bash
+node web/scripts/benchmark/run-browser-pipeline.mjs \
+  --mode timing \
+  --precision float32 \
+  --audio ./test_audio.wav \
+  --remove-profile
+```
+
+On an adapter that exposes `shader-f16`, this forced run is labeled
+`timing-fp32-compatibility-diagnostic` and is not a production timing
+acceptance. On an adapter without `shader-f16`, automatically selected FP32 is
+the production path and remains timing-acceptance eligible.
+
+Omitting the flag keeps production selection automatic: FP16 is preferred
+when both model-device adapter handles expose `shader-f16`; otherwise the
+fully custom FP32 WebGPU path is selected. WebGPU itself remains mandatory.
 
 Offline Senko is the correctness oracle. With `--offline-reference`, the
 runner scores the browser segments after timing has stopped and records the
@@ -223,6 +247,27 @@ noise and shows no material per-run accumulation. Page-memory and
 retained-memory modes are diagnostic only; their timings are not used in the
 three-run acceptance median.
 
+### FP32 compatibility validation
+
+The complete fallback was forced on the same M3 with `?precision=float32`.
+Both model devices were requested without `shader-f16`, so WebGPU validation
+proved that no FP16 shader syntax leaked into the fallback. This is a
+compatibility diagnostic on M3, not a replacement for the faster automatic
+FP16 production path.
+
+| Fixture | Worker wall | Explicit GPU buffers | Result | Offline agreement |
+| --- | ---: | ---: | --- | --- |
+| `test_audio_short.wav` | 2.465 s | 132,535,040 B | 4 speakers, 49 segments | 0.999960/1.000000 speech IoU; 1.000000/1.000000 mapped agreement |
+| `test_audio.wav` | 16.650–16.760 s | 132,535,040 B | 9 speakers, 136 segments | 0.998660/0.998744 speech IoU; 0.988457/0.988393 mapped agreement |
+
+The long page-scoped run measured 25,146,688 bytes for the isolated Senko page
+and dedicated worker at completion, alongside 12,058,624 fixed WASM bytes and
+9,815,976 bytes of known CPU working state. The input Blob remained externally
+backed. A two-run short-file retained-memory diagnostic grew by only 73,864
+bytes from post-run 1 to post-run 2, within the coarse measurement noise. The
+automatic FP16 regression run remained at 9.972 s with its original
+84,001,024-byte GPU total and passed the same offline correctness gate.
+
 Do not use `pnpm dev` for acceptance. HMR, source transforms, development module
 loading, and concurrent code edits make its timings non-reproducible. The dev
 server on port 5173 remains useful for implementation diagnostics:
@@ -242,7 +287,8 @@ node web/scripts/benchmark/run-browser-pipeline.mjs \
 
 The runner launches a new Chrome process with a unique `--user-data-dir`, no
 extensions/background mode/sync, and exactly one Senko tab. It connects through
-raw CDP using Node's built-in WebSocket, waits for `WebGPU models ready.`, sets
+raw CDP using Node's built-in WebSocket, waits for the FP16/FP32 model-ready
+marker, sets
 the absolute WAV path with `DOM.setFileInputFiles`, and captures the page's
 result JSON at the exact `Pipeline complete.` DOM mutation. Chrome and only its
 isolated process group are terminated in `finally`, including on errors. The

@@ -63,6 +63,7 @@ describe("PipelineWorkerClient", () => {
         crossOriginIsolated: true,
         sharedArrayBuffer: true,
         webgpu: true,
+        modelPrecision: "float16",
       },
     });
 

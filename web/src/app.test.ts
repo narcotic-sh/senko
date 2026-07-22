@@ -3,12 +3,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   formatPageMemorySummary,
   formatPipelineMemorySummary,
+  pipelineOptionsFromSearch,
   type PageExitEvent,
   type PageExitListener,
   type PageLifecycleTarget,
   SenkoBrowserApp,
 } from "./app";
-import type { PipelineMemorySummary } from "./runtime/types";
+import {
+  DEFAULT_PIPELINE_OPTIONS,
+  type PipelineMemorySummary,
+} from "./runtime/types";
 import type { RuntimeCapabilities } from "./capabilities";
 import type { PipelineWorkerClient } from "./runtime/worker-client";
 
@@ -49,6 +53,7 @@ class TestElement {
 
 class TestRoot {
   innerHTML = "";
+  readonly dataset: Record<string, string> = {};
   readonly elements = new Map<string, TestElement>(
     [
       "#audio-file",
@@ -110,8 +115,13 @@ describe("SenkoBrowserApp lifecycle", () => {
   it("coalesces concurrent and repeated start calls into one worker initialization", async () => {
     const root = new TestRoot();
     let finishInitialization!: () => void;
-    const initialization = new Promise<void>((resolve) => {
-      finishInitialization = resolve;
+    const initialization = new Promise<{
+      readonly runtime: {
+        readonly modelPrecision: "float16";
+      };
+    }>((resolve) => {
+      finishInitialization = () =>
+        resolve({ runtime: { modelPrecision: "float16" } });
     });
     const initialize = vi.fn(() => initialization);
     const dispose = vi.fn();
@@ -134,6 +144,10 @@ describe("SenkoBrowserApp lifecycle", () => {
 
     finishInitialization();
     await first;
+    expect(root.dataset.modelPrecision).toBe("float16");
+    expect(root.elements.get("#status")?.textContent).toBe(
+      "WebGPU FP16 models ready.",
+    );
     expect(app.start()).toBe(first);
     expect(dispose).not.toHaveBeenCalled();
     app.dispose();
@@ -167,6 +181,19 @@ describe("SenkoBrowserApp lifecycle", () => {
     });
     app.dispose();
     expect(dispose).toHaveBeenCalledOnce();
+  });
+});
+
+describe("pipeline precision query", () => {
+  it("uses automatic FP16 preference by default", () => {
+    expect(pipelineOptionsFromSearch("?memory=1").preferFloat16).toBe(true);
+  });
+
+  it("forces FP32 without changing unrelated pipeline options", () => {
+    expect(pipelineOptionsFromSearch("?memory=1&precision=float32")).toEqual({
+      ...DEFAULT_PIPELINE_OPTIONS,
+      preferFloat16: false,
+    });
   });
 });
 

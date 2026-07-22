@@ -7,24 +7,41 @@ from pathlib import Path
 
 import numpy as np
 
-from pack import (
-    BinaryBuilder,
-    FORMAT_MAGIC,
-    HEADER_BYTES,
-    SECTION_ALIGNMENT,
-    align_up,
-    apply_compiled_batch_norm,
-    build_package,
-    compile_batch_norm_affine,
-    pack_conv_oihw4,
-    parse_header,
-    sha256_bytes,
-    unpack_conv_oihw4,
-)
+try:
+    from .pack import (
+        BinaryBuilder,
+        FORMAT_MAGIC,
+        HEADER_BYTES,
+        SECTION_ALIGNMENT,
+        align_up,
+        apply_compiled_batch_norm,
+        build_package,
+        compile_batch_norm_affine,
+        pack_conv_oihw4,
+        parse_header,
+        sha256_bytes,
+        unpack_conv_oihw4,
+    )
+except ImportError:  # Support direct execution from this directory.
+    from pack import (  # type: ignore[no-redef]
+        BinaryBuilder,
+        FORMAT_MAGIC,
+        HEADER_BYTES,
+        SECTION_ALIGNMENT,
+        align_up,
+        apply_compiled_batch_norm,
+        build_package,
+        compile_batch_norm_affine,
+        pack_conv_oihw4,
+        parse_header,
+        sha256_bytes,
+        unpack_conv_oihw4,
+    )
 
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 REAL_MODEL = REPO_ROOT / "web/public/models/campplus-t150-b32-fp16.onnx"
+REAL_FP32_MODEL = REPO_ROOT / "web/public/models/campplus-t150-b32.onnx"
 
 
 class LayoutTests(unittest.TestCase):
@@ -55,6 +72,12 @@ class LayoutTests(unittest.TestCase):
                     )
         np.testing.assert_array_equal(unpack_conv_oihw4(packed, logical.shape), logical)
         self.assertEqual(np.count_nonzero(packed) - np.count_nonzero(logical), 0)
+
+    def test_conv_vec4_layout_preserves_fp32_storage(self) -> None:
+        logical = np.arange(5 * 3 * 2, dtype=np.float32).reshape(5, 3, 2)
+        packed, _ = pack_conv_oihw4(logical)
+        self.assertEqual(packed.dtype, np.float32)
+        np.testing.assert_array_equal(unpack_conv_oihw4(packed, logical.shape), logical)
 
     def test_batch_norm_affine_matches_inference_equation(self) -> None:
         rng = np.random.default_rng(7)
@@ -137,6 +160,27 @@ class RealModelContractTests(unittest.TestCase):
         self.assertLessEqual(max(section_ends), len(first_binary))
         encoded = json.dumps(first_metadata, sort_keys=True)
         self.assertNotIn(str(REPO_ROOT), encoded)
+
+    def test_real_model_builds_shader_f16_free_fp32_package(self) -> None:
+        binary, metadata = build_package(
+            REAL_FP32_MODEL,
+            "campplus-fp32.bin",
+            internal_dtype="float32",
+        )
+        self.assertEqual(metadata["contract"]["internal_dtype"], "float32")
+        self.assertEqual(metadata["contract"]["required_webgpu_features"], [])
+        convolution_sections = [
+            section
+            for section in metadata["sections"]
+            if section["kind"] in ("conv_weight", "conv_bias")
+        ]
+        self.assertTrue(convolution_sections)
+        self.assertTrue(all(section["dtype"] == "float32" for section in convolution_sections))
+        self.assertEqual(
+            metadata["memory"]["planned_webgpu"]["recommended"]["activation_arena_bytes"],
+            98_304_000,
+        )
+        self.assertEqual(len(binary), metadata["binary"]["byte_length"])
 
 
 if __name__ == "__main__":

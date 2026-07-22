@@ -135,6 +135,9 @@ function selectDiagnosticSplit(
   batchSize: number,
 ): SelectedSegmentationSplit {
   const split = manifest.models.segmentation.split;
+  const precision = "float16" as const;
+  const precisionVariant =
+    split.direct_webgpu.precision_variants[precision];
   const declaredBufferBytes = split.buffer_bytes_by_batch[String(batchSize)];
   if (declaredBufferBytes === undefined) {
     throw new Error(`Split segmentation has no B${batchSize} buffer accounting`);
@@ -145,11 +148,12 @@ function selectDiagnosticSplit(
     sha256: record.sha256,
   });
   return {
+    precision,
     batchSize,
     frontend: selectModelVariant(manifestUrl, split.frontend, batchSize),
     tail: selectModelVariant(manifestUrl, split.tail, batchSize),
-    weights: asset(split.lstm.weights),
-    metadata: asset(split.lstm.metadata),
+    weights: asset(precisionVariant.lstm.weights),
+    metadata: asset(precisionVariant.lstm.metadata),
     // The isolated diagnostic loads its direct packages from a batch-specific
     // directory, so no production-manifest direct entry is required.
     directWebGpu: {
@@ -158,7 +162,7 @@ function selectDiagnosticSplit(
       explicitGpuBytes: 1,
     },
     declaredBufferBytes,
-    artifact: split.lstm,
+    artifact: precisionVariant.lstm,
   };
 }
 

@@ -30,8 +30,8 @@ the API and incur no measurement overhead.
 The user-agent total is an approximate browser estimate and does not guarantee
 coverage of GPU allocations. `knownGpuBufferBytes` remains separate: it is the
 exact WebGPU-buffer ownership of Senko's two resident inference backends,
-currently 84,001,024 bytes. Opaque browser/driver and ONNX Runtime GPU
-allocations are not part of that owned-buffer counter.
+84,001,024 bytes for FP16 or 132,535,040 bytes for the FP32 compatibility path.
+Opaque browser/driver allocations are not part of that owned-buffer counter.
 
 The benchmark runner launches a separate Chrome profile with exactly one
 Senko tab. Its page-memory result therefore covers that page plus the dedicated
@@ -73,9 +73,12 @@ allocates file-sized or per-window PCM byte buffers. The scratch capacity is
 included as `wavReadBufferBytes` in exact logical CPU memory accounting.
 
 Worker initialization requests two high-performance WebGPU devices and loads
-and warms both production model sets concurrently. The B8 pyannote VAD owns
-44,145,664 GPU-buffer bytes on one device; B16 CAM++ owns 39,855,360 bytes on
-the other, for exact summed ownership of 84,001,024 bytes. Streaming scheduling
+and warms both raw-WGSL model sets concurrently. On the preferred FP16 path,
+the B8 pyannote VAD owns 44,145,664 GPU-buffer bytes on one device and B16
+CAM++ owns 39,855,360 bytes on the other, for exact summed ownership of
+84,001,024 bytes. Without `shader-f16`, their paired FP32 packages own
+53,947,648 and 78,587,392 bytes respectively, totaling 132,535,040 bytes.
+Streaming scheduling
 submits VAD first, then overlaps up to two B16 CAM++ batches on the second
 device as stable speech windows become available. Both models remain resident
 during clustering and across subsequent recordings. Their buffers and devices

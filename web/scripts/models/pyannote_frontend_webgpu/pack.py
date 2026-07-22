@@ -617,6 +617,10 @@ def build_package(
                 "pooled_frames_per_workgroup": 64,
                 "waveform_tile_samples": 2_161,
                 "weight_vectors_per_output_group": 251,
+                # Keep the original conservative 12,660-byte declaration for
+                # FP16 so regenerating the already-deployed package remains
+                # byte-identical. The runtime computes the exact precision-
+                # specific requirement (10,652 bytes for FP16) itself.
                 "workgroup_storage_bytes": 12_660,
                 "note": "One workgroup handles 64 pooled frames for four filters; waveform and vec4 weights are staged once in workgroup memory.",
             },

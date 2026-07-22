@@ -108,6 +108,17 @@ export class RawWebGpuVadBackend implements VadBatchBackend {
           `Direct WebGPU tail is B${tail.metadata.batch}; selected B${selected.batchSize}`,
         );
       }
+      const frontendMetadata = frontend.gpuPackage.metadata.contract;
+      if (
+        frontendMetadata.intermediateDtype !== selected.precision ||
+        frontendMetadata.weightDtype !== selected.precision ||
+        lstm.weightPrecision !== selected.precision ||
+        tail.metadata.weightPrecision !== selected.precision
+      ) {
+        throw new Error(
+          `Direct WebGPU VAD package precision does not match selected ${selected.precision}`,
+        );
+      }
       const backend = new RawWebGpuVadBackend(
         selected.batchSize,
         device,

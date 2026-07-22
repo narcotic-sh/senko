@@ -36,6 +36,7 @@ export class RawCampPlusEmbeddingBackend implements EmbeddingBatchBackend {
     try {
       graph = await CampPlusRawGraph.create(device, selected.metadata.url, {
         batchSize: selected.batchSize,
+        storageDtype: selected.precision,
         fetch: verifiedMetadataFetch(selected.metadata),
       });
       const binary = graph.foundation.gpuPackage.metadata.binary;

@@ -19,6 +19,25 @@ test("timing mode strips page-memory instrumentation from the URL", () => {
   );
 });
 
+test("FP32 benchmark mode forces the production query switch", () => {
+  assert.equal(
+    buildBenchmarkUrl(
+      "http://127.0.0.1:4173/?memory=1&fixture=a",
+      "timing",
+      "float32",
+    ),
+    "http://127.0.0.1:4173/?fixture=a&precision=float32",
+  );
+  assert.equal(
+    parseBenchmarkArguments(["--precision", "float32"]).options.precision,
+    "float32",
+  );
+  assert.throws(
+    () => parseBenchmarkArguments(["--precision", "float16"]),
+    /auto or float32/,
+  );
+});
+
 test("page-memory mode enables only the diagnostic query switch", () => {
   assert.equal(
     buildBenchmarkUrl("http://127.0.0.1:5173/?fixture=a", "page-memory"),
@@ -90,10 +109,11 @@ test("argument parser keeps timing and profile dispositions explicit", () => {
   assert.equal(parseBenchmarkArguments([]).options.url, "http://127.0.0.1:4173/");
 });
 
-test("timing acceptance requires every accelerated capability", () => {
+test("timing acceptance requires shader-f16 only for the FP16 path", () => {
   const runtime = {
     secureContext: true,
     crossOriginIsolated: true,
+    modelPrecision: "float16",
     capabilities: {
       WebGPU: true,
       Worker: true,
@@ -110,6 +130,14 @@ test("timing acceptance requires every accelerated capability", () => {
       capabilities: { ...runtime.capabilities, "shader-f16": false },
     }),
     ["shader-f16"],
+  );
+  assert.deepEqual(
+    timingAcceptanceCapabilityFailures({
+      ...runtime,
+      modelPrecision: "float32",
+      capabilities: { ...runtime.capabilities, "shader-f16": false },
+    }),
+    [],
   );
 });
 
@@ -202,6 +230,22 @@ test("summary reports wall time separately from overlapping stage attribution", 
     postprocess: 6,
   });
   assert.equal(result.logicalMemory.knownGpuBufferBytes, 20);
+  const forcedFp32 = summarizePipelineResult(pipelineResult, {
+    mode: "timing",
+    acceptanceValidated: true,
+    requestedPrecision: "float32",
+    runtime: { capabilities: { "shader-f16": true } },
+  });
+  assert.equal(forcedFp32.timingAcceptanceEligible, false);
+  assert.equal(forcedFp32.mode, "timing-fp32-compatibility-diagnostic");
+  const nativeFp32 = summarizePipelineResult(pipelineResult, {
+    mode: "timing",
+    acceptanceValidated: true,
+    requestedPrecision: "auto",
+    runtime: { capabilities: { "shader-f16": false } },
+  });
+  assert.equal(nativeFp32.timingAcceptanceEligible, true);
+  assert.equal(nativeFp32.mode, "timing-acceptance");
   assert.doesNotThrow(() => validateCanonicalAcceptanceResult(pipelineResult));
   assert.equal(
     summarizePipelineResult(pipelineResult, { mode: "timing" })

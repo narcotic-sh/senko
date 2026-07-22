@@ -29,6 +29,10 @@ import {
   RawCampPlusFoundation,
   type RawCampPlusFoundationOptions,
 } from "./runtime";
+import {
+  campPlusStorageBytes,
+  type CampPlusStorageDtype,
+} from "./storage";
 
 const FRAMES = 150;
 const FEATURES = 80;
@@ -77,6 +81,8 @@ export function isCampPlusRawNumericVariant(
 
 export interface CampPlusRawGraphOptions extends CampPlusPackageLoadOptionsOnly {
   readonly batchSize?: CampPlusRawBatchSize;
+  /** Internal activation/weight storage. FP16 remains the production default. */
+  readonly storageDtype?: CampPlusStorageDtype;
   /** Selects an FCM kernel variant; omission uses the measured production default. */
   readonly fcmVariant?: FcmVariant;
   /** Selects a dense bottleneck kernel; omission uses the production baseline. */
@@ -197,23 +203,25 @@ export interface CampPlusRawGraphVariableGpuBytes {
  */
 export function campPlusRawArenaPlan(
   batchSize: CampPlusRawBatchSize,
+  storageDtype: CampPlusStorageDtype = "float16",
 ): CampPlusRawArenaPlan {
+  const storageBytes = campPlusStorageBytes(storageDtype);
   const fcmPeakBytes =
-    fcmBytes(batchSize, 80) +
-    fcmBytes(batchSize, 40) +
-    fcmBytes(batchSize, 40);
+    fcmBytes(batchSize, 80, storageBytes) +
+    fcmBytes(batchSize, 40, storageBytes) +
+    fcmBytes(batchSize, 40, storageBytes);
   const denseSlabBytes =
-    batchSize * DENSE_SLAB_CHANNELS * TDNN_FRAMES * 2;
+    batchSize * DENSE_SLAB_CHANNELS * TDNN_FRAMES * storageBytes;
   const denseScratchBytes =
-    batchSize * BOTTLENECK_CHANNELS * TDNN_FRAMES * 2;
-  const doubledMeanBytes = batchSize * BOTTLENECK_CHANNELS * 2;
+    batchSize * BOTTLENECK_CHANNELS * TDNN_FRAMES * storageBytes;
+  const doubledMeanBytes = batchSize * BOTTLENECK_CHANNELS * storageBytes;
   const denseBackbonePeakBytes =
     denseSlabBytes * 2 + denseScratchBytes + doubledMeanBytes;
   const minimumActivationArenaBytes = Math.max(
     fcmPeakBytes,
     denseBackbonePeakBytes,
   );
-  const activationArenaBytes = ARENA_BYTES[batchSize];
+  const activationArenaBytes = ARENA_BYTES[batchSize] * (storageBytes / 2);
   if (activationArenaBytes < minimumActivationArenaBytes) {
     throw new Error(
       `CAM++ B${batchSize} arena plan is ${activationArenaBytes} bytes; graph lifetimes require ${minimumActivationArenaBytes}`,
@@ -230,8 +238,12 @@ export function campPlusRawArenaPlan(
 /** Exact graph-owned variable buffers, excluding batch-independent weights and uniforms. */
 export function campPlusRawGraphVariableGpuBytes(
   batchSize: CampPlusRawBatchSize,
+  storageDtype: CampPlusStorageDtype = "float16",
 ): CampPlusRawGraphVariableGpuBytes {
-  const activationArena = campPlusRawArenaPlan(batchSize).activationArenaBytes;
+  const activationArena = campPlusRawArenaPlan(
+    batchSize,
+    storageDtype,
+  ).activationArenaBytes;
   const input = batchSize * FRAMES * FEATURES * 4;
   const output = batchSize * EMBEDDING_CHANNELS * 4;
   const readback = output * CAMPPLUS_RAW_MAX_IN_FLIGHT_RUNS;
@@ -247,8 +259,9 @@ export function campPlusRawGraphVariableGpuBytes(
 /** Largest storage binding/buffer required before constructing the device. */
 export function campPlusRawRequiredBufferBytes(
   batchSize: CampPlusRawBatchSize,
+  storageDtype: CampPlusStorageDtype = "float16",
 ): number {
-  const bytes = campPlusRawGraphVariableGpuBytes(batchSize);
+  const bytes = campPlusRawGraphVariableGpuBytes(batchSize, storageDtype);
   return Math.max(bytes.activationArena, bytes.input, bytes.output);
 }
 
@@ -263,6 +276,7 @@ export class CampPlusRawGraph {
   readonly tdnnVariant: PackedBctConvVariant;
   readonly pointwiseTransitVariant: PointwiseTransitVariant;
   readonly numericVariant: CampPlusRawNumericVariant;
+  readonly storageDtype: CampPlusStorageDtype;
   readonly fcmAccumulation: FcmAccumulation;
   readonly denseBottleneckAccumulation: DenseBottleneckAccumulation;
   readonly pointwiseTransitAccumulation: PointwiseTransitAccumulation;
@@ -296,10 +310,14 @@ export class CampPlusRawGraph {
     this.tdnnVariant = foundation.packedConvolution.variant;
     this.pointwiseTransitVariant = foundation.pointwiseTransit.variant;
     this.numericVariant = numericVariant;
+    this.storageDtype = foundation.storageDtype;
     this.fcmAccumulation = foundation.fcm.accumulation;
     this.denseBottleneckAccumulation = denseBottleneckAccumulation;
     this.pointwiseTransitAccumulation = foundation.pointwiseTransit.accumulation;
-    const variableBytes = campPlusRawGraphVariableGpuBytes(batchSize);
+    const variableBytes = campPlusRawGraphVariableGpuBytes(
+      batchSize,
+      foundation.storageDtype,
+    );
     const timestampBuffers = readbackSlots.reduce(
       (sum, slot) =>
         sum +
@@ -335,8 +353,12 @@ export class CampPlusRawGraph {
     options: CampPlusRawGraphOptions = {},
   ): Promise<CampPlusRawGraph> {
     const batchSize = options.batchSize ?? 32;
-    const arenaPlan = campPlusRawArenaPlan(batchSize);
-    const numericVariant = options.numericVariant ?? "production";
+    const storageDtype = options.storageDtype ?? "float16";
+    const arenaPlan = campPlusRawArenaPlan(batchSize, storageDtype);
+    const numericVariant =
+      storageDtype === "float32"
+        ? "float32-baseline"
+        : (options.numericVariant ?? "production");
     const numericConfiguration = NUMERIC_CONFIGURATIONS[numericVariant];
     const denseBottleneckVariant =
       options.denseBottleneckVariant ?? DEFAULT_DENSE_BOTTLENECK_VARIANT;
@@ -347,6 +369,7 @@ export class CampPlusRawGraph {
     const tdnnVariant = options.tdnnVariant ?? DEFAULT_PACKED_BCT_CONV_VARIANT;
     const loadOptions: RawCampPlusFoundationOptions = {
       activationArenaBytes: arenaPlan.activationArenaBytes,
+      storageDtype,
       ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
       ...(options.onProgress === undefined ? {} : { onProgress: options.onProgress }),
       ...(options.fcmVariant === undefined
@@ -708,16 +731,17 @@ function createSchedule(
   const head = foundation.gpuPackage.metadata.fusedProgram.headConvolutions;
   if (head.length !== 12) throw new Error("CAM++ FCM metadata must contain 12 convolutions");
 
-  const fcmA80 = tensorSlice(arena, "fcm-a-f80", 0, batchSize, 80);
-  const fcmA40 = tensorSlice(arena, "fcm-a-f40", 0, batchSize, 40);
-  const fcmA20 = tensorSlice(arena, "fcm-a-f20", 0, batchSize, 20);
-  const fcmA10 = tensorSlice(arena, "fcm-a-f10", 0, batchSize, 10);
-  const fcmABytes = fcmBytes(batchSize, 80);
-  const fcmB40 = tensorSlice(arena, "fcm-b-f40", fcmABytes, batchSize, 40);
-  const fcmB20 = tensorSlice(arena, "fcm-b-f20", fcmABytes, batchSize, 20);
-  const fcmCOffset = fcmABytes + fcmBytes(batchSize, 40);
-  const fcmC40 = tensorSlice(arena, "fcm-c-f40", fcmCOffset, batchSize, 40);
-  const fcmC20 = tensorSlice(arena, "fcm-c-f20", fcmCOffset, batchSize, 20);
+  const storageBytes = foundation.storageBytesPerElement;
+  const fcmA80 = tensorSlice(arena, "fcm-a-f80", 0, batchSize, 80, storageBytes);
+  const fcmA40 = tensorSlice(arena, "fcm-a-f40", 0, batchSize, 40, storageBytes);
+  const fcmA20 = tensorSlice(arena, "fcm-a-f20", 0, batchSize, 20, storageBytes);
+  const fcmA10 = tensorSlice(arena, "fcm-a-f10", 0, batchSize, 10, storageBytes);
+  const fcmABytes = fcmBytes(batchSize, 80, storageBytes);
+  const fcmB40 = tensorSlice(arena, "fcm-b-f40", fcmABytes, batchSize, 40, storageBytes);
+  const fcmB20 = tensorSlice(arena, "fcm-b-f20", fcmABytes, batchSize, 20, storageBytes);
+  const fcmCOffset = fcmABytes + fcmBytes(batchSize, 40, storageBytes);
+  const fcmC40 = tensorSlice(arena, "fcm-c-f40", fcmCOffset, batchSize, 40, storageBytes);
+  const fcmC20 = tensorSlice(arena, "fcm-c-f20", fcmCOffset, batchSize, 20, storageBytes);
 
   const fcm: FcmDispatch[] = [];
   fcm.push(
@@ -850,17 +874,19 @@ function createSchedule(
     }),
   );
 
-  const slabBytes = batchSize * DENSE_SLAB_CHANNELS * TDNN_FRAMES * 2;
+  const slabBytes =
+    batchSize * DENSE_SLAB_CHANNELS * TDNN_FRAMES * storageBytes;
   const slabA = arena.slice("dense-slab-a", 0, slabBytes);
   const slabB = arena.slice("dense-slab-b", slabBytes, slabBytes);
   const scratchOffset = slabBytes * 2;
-  const scratchBytes = batchSize * BOTTLENECK_CHANNELS * TDNN_FRAMES * 2;
+  const scratchBytes =
+    batchSize * BOTTLENECK_CHANNELS * TDNN_FRAMES * storageBytes;
   const scratch = arena.slice("dense-bottleneck-scratch", scratchOffset, scratchBytes);
   const meanOffset = scratchOffset + scratchBytes;
   const doubledMean = arena.slice(
     "dense-doubled-mean",
     meanOffset,
-    batchSize * BOTTLENECK_CHANNELS * 2,
+    batchSize * BOTTLENECK_CHANNELS * storageBytes,
   );
 
   const middle: GraphDispatch[] = [...fcm.slice(1)];
@@ -952,8 +978,12 @@ function createSchedule(
   return { first: fcm[0]!, middle, final, all };
 }
 
-function fcmBytes(batchSize: number, frequency: number): number {
-  return batchSize * 32 * frequency * FRAMES * 2;
+function fcmBytes(
+  batchSize: number,
+  frequency: number,
+  storageBytes: 2 | 4,
+): number {
+  return batchSize * 32 * frequency * FRAMES * storageBytes;
 }
 
 function unmapIfMapped(buffer: GPUBuffer): void {
@@ -966,6 +996,11 @@ function tensorSlice(
   byteOffset: number,
   batchSize: number,
   frequency: number,
+  storageBytes: 2 | 4,
 ): CampPlusArenaSlice {
-  return arena.slice(label, byteOffset, fcmBytes(batchSize, frequency));
+  return arena.slice(
+    label,
+    byteOffset,
+    fcmBytes(batchSize, frequency, storageBytes),
+  );
 }

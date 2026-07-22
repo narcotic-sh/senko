@@ -10,6 +10,7 @@ import {
   DENSE_BOTTLENECK_VARIANTS,
   DENSE_BOTTLENECK_WGSL,
   denseBottleneckTile4DirectWgsl,
+  denseBottleneckRequiredWorkgroupStorageBytes,
   denseBottleneckVariantConfiguration,
   isDenseBottleneckVariant,
 } from "./dense-cam";
@@ -106,5 +107,25 @@ describe("dense CAM++ WGSL variants", () => {
     expect(isDenseBottleneckVariant("direct-tile2-wg128")).toBe(true);
     expect(isDenseBottleneckVariant("direct-tile4-wg128")).toBe(true);
     expect(isDenseBottleneckVariant("direct-tile8-wg128")).toBe(false);
+  });
+
+  it("accounts cached FP32 diagnostic scratch before shader compilation", () => {
+    expect(
+      denseBottleneckRequiredWorkgroupStorageBytes(
+        1,
+        "workgroup-cache",
+        "float32",
+      ),
+    ).toBe(17_920);
+    expect(
+      denseBottleneckRequiredWorkgroupStorageBytes(
+        2,
+        "workgroup-cache",
+        "float32",
+      ),
+    ).toBe(35_840);
+    expect(
+      denseBottleneckRequiredWorkgroupStorageBytes(4, "direct", "float32"),
+    ).toBe(8_192);
   });
 });

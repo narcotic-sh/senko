@@ -37,6 +37,7 @@ export interface WorkerRuntimeInfo {
   readonly crossOriginIsolated: boolean;
   readonly sharedArrayBuffer: boolean;
   readonly webgpu: boolean;
+  readonly modelPrecision: "float16" | "float32";
 }
 
 export interface InitializedResponse {
@@ -369,7 +370,9 @@ export function isPipelineWorkerResponse(
         isRecord(value.runtime) &&
         typeof value.runtime.crossOriginIsolated === "boolean" &&
         typeof value.runtime.sharedArrayBuffer === "boolean" &&
-        typeof value.runtime.webgpu === "boolean"
+        typeof value.runtime.webgpu === "boolean" &&
+        (value.runtime.modelPrecision === "float16" ||
+          value.runtime.modelPrecision === "float32")
       );
     case "initialization-progress":
       return typeof value.message === "string" && value.message.length > 0;

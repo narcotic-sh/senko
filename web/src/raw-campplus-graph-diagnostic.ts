@@ -36,9 +36,12 @@ import {
   preferredRawCampPlusDeviceLimits,
   requireRawCampPlusAdapterLimits,
 } from "./pipeline/campplus-webgpu/runtime";
+import type { CampPlusStorageDtype } from "./pipeline/campplus-webgpu/storage";
 
-const METADATA_URL = "/models/campplus-t150-webgpu-fp16.json";
-const REFERENCE_URL = "/models/campplus-t150-b32-reference.f32";
+const REFERENCE_URLS = {
+  float16: "/models/campplus-t150-b32-reference.f32",
+  float32: "/models/campplus-t150-b32-fp32-reference.f32",
+} as const;
 const FRAMES = 150;
 const FEATURES = 80;
 const EMBEDDINGS = 192;
@@ -57,6 +60,7 @@ export async function runRawCampPlusGraphDiagnostic(root: HTMLElement): Promise<
   try {
     const parameters = new URLSearchParams(location.search);
     const batchSize = parseBatchSize(parameters.get("batch"));
+    const storageDtype = parseStorageDtype(parameters.get("precision"));
     const fcmVariant = parseFcmVariant(parameters.get("fcm-variant"));
     const denseBottleneckVariant = parseDenseBottleneckVariant(
       parameters.get("dense-bottleneck-variant"),
@@ -66,13 +70,16 @@ export async function runRawCampPlusGraphDiagnostic(root: HTMLElement): Promise<
       parameters.get("pointwise-transit-variant"),
     );
     const numericVariant = parseNumericVariant(parameters.get("numeric-variant"));
+    const coreWorkgroupStorage = parameters.get("core-workgroup-storage") === "1";
     const result = await execute(
       batchSize,
+      storageDtype,
       fcmVariant,
       denseBottleneckVariant,
       tdnnVariant,
       pointwiseTransitVariant,
       numericVariant,
+      coreWorkgroupStorage,
       (message) => {
         output.textContent = message;
       },
@@ -91,47 +98,65 @@ export async function runRawCampPlusGraphDiagnostic(root: HTMLElement): Promise<
 
 async function execute(
   batchSize: CampPlusRawBatchSize,
+  storageDtype: CampPlusStorageDtype,
   fcmVariant: FcmVariant,
   denseBottleneckVariant: DenseBottleneckVariant,
   tdnnVariant: PackedBctConvVariant,
   pointwiseTransitVariant: PointwiseTransitVariant,
   numericVariant: CampPlusRawNumericVariant,
+  coreWorkgroupStorage: boolean,
   report: (message: string) => void,
 ): Promise<Record<string, unknown>> {
   if (navigator.gpu === undefined) throw new Error("WebGPU is unavailable");
   const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
-  if (adapter === null || !adapter.features.has("shader-f16")) {
-    throw new Error("A shader-f16 WebGPU adapter is required");
+  if (adapter === null) throw new Error("A WebGPU adapter is required");
+  if (storageDtype === "float16" && !adapter.features.has("shader-f16")) {
+    throw new Error("The FP16 diagnostic requires shader-f16");
   }
-  const requiredBufferBytes = campPlusRawRequiredBufferBytes(batchSize);
+  const requiredBufferBytes = campPlusRawRequiredBufferBytes(
+    batchSize,
+    storageDtype,
+  );
   requireRawCampPlusAdapterLimits(adapter, requiredBufferBytes);
   const timestampQuery = adapter.features.has("timestamp-query");
-  const requiredFeatures: GPUFeatureName[] = ["shader-f16"];
+  const requiredFeatures: GPUFeatureName[] =
+    storageDtype === "float16" ? ["shader-f16"] : [];
   if (timestampQuery) requiredFeatures.push("timestamp-query");
+  const preferredLimits = preferredRawCampPlusDeviceLimits(
+    adapter,
+    requiredBufferBytes,
+  );
   const device = await adapter.requestDevice({
     requiredFeatures,
-    requiredLimits: preferredRawCampPlusDeviceLimits(
-      adapter,
-      requiredBufferBytes,
-    ),
+    requiredLimits: {
+      ...preferredLimits,
+      ...(coreWorkgroupStorage
+        ? { maxComputeWorkgroupStorageSize: 16_384 }
+        : {}),
+    },
   });
   let graph: CampPlusRawGraph | undefined;
   try {
     report(
-      `Streaming weights and compiling the raw B${batchSize} graph (${numericVariant}, ${fcmVariant}, ${tdnnVariant}, ${denseBottleneckVariant}, ${pointwiseTransitVariant})…`,
+      `Streaming weights and compiling the raw ${storageDtype} B${batchSize} graph (${numericVariant}, ${fcmVariant}, ${tdnnVariant}, ${denseBottleneckVariant}, ${pointwiseTransitVariant})…`,
     );
     const compileStart = performance.now();
-    graph = await CampPlusRawGraph.create(device, METADATA_URL, {
+    graph = await CampPlusRawGraph.create(
+      device,
+      `/models/campplus-t150-webgpu-${storageDtype === "float16" ? "fp16" : "fp32"}.json`,
+      {
       batchSize,
+      storageDtype,
       fcmVariant,
       denseBottleneckVariant,
       tdnnVariant,
       pointwiseTransitVariant,
       numericVariant,
-    });
+      },
+    );
     const loadAndCompileMs = performance.now() - compileStart;
     const features = deterministicFeatures(batchSize);
-    const expected = await fetchReference(batchSize);
+    const expected = await fetchReference(batchSize, storageDtype);
 
     report(`Warming one B${batchSize} 119-dispatch submission…`);
     const warm = await graph.run(features, { timestamps: timestampQuery });
@@ -155,6 +180,7 @@ async function execute(
     return {
       ok,
       batchSize,
+      storageDtype: graph.storageDtype,
       fcmVariant: graph.fcmVariant,
       denseBottleneckVariant: graph.denseBottleneckVariant,
       tdnnVariant: graph.tdnnVariant,
@@ -168,6 +194,8 @@ async function execute(
       submissionsPerRun: 1,
       loadAndCompileMs,
       timestampQuery,
+      maxComputeWorkgroupStorageSize:
+        device.limits.maxComputeWorkgroupStorageSize,
       warm: { wallMs: warm.wallMs, ...(warm.gpuMs === undefined ? {} : { gpuMs: warm.gpuMs }) },
       runs,
       settled: {
@@ -210,6 +238,12 @@ async function execute(
     graph?.destroy();
     device.destroy();
   }
+}
+
+export function parseStorageDtype(value: string | null): CampPlusStorageDtype {
+  if (value === null || value === "float16") return "float16";
+  if (value === "float32") return "float32";
+  throw new RangeError("Raw CAM++ precision must be float16 or float32");
 }
 
 export function parseBatchSize(value: string | null): CampPlusRawBatchSize {
@@ -294,8 +328,9 @@ export function deterministicFeatures(
 
 async function fetchReference(
   batchSize: CampPlusRawBatchSize,
+  storageDtype: CampPlusStorageDtype,
 ): Promise<Float32Array<ArrayBuffer>> {
-  const response = await fetch(REFERENCE_URL);
+  const response = await fetch(REFERENCE_URLS[storageDtype]);
   if (!response.ok) throw new Error("Unable to load the compact CAM++ graph oracle");
   const bytes = await response.arrayBuffer();
   if (bytes.byteLength !== REFERENCE_BATCH_SIZE * EMBEDDINGS * 4) {

@@ -16,6 +16,7 @@ import {
   PIPELINE_STAGE_LABELS,
   type PipelineAssetManifest,
   type PipelineMemorySummary,
+  type PipelineOptions,
   type PipelineResult,
 } from "./runtime/types";
 import {
@@ -25,15 +26,15 @@ import {
 
 const BROWSER_MANIFEST: PipelineAssetManifest = {
   schemaVersion: 1,
-  pipelineVersion: "browser-direct-vad-campplus-v2",
+  pipelineVersion: "browser-direct-vad-campplus-v3",
   assets: [
     {
       id: "model-manifest",
       role: "runtime-data",
       format: "json",
       url: "/models/manifest.json",
-      byteLength: 28_653,
-      sha256: "31dd62f9a99ec7f444de50c288728e62cc8db388555a78856b19ddfa6964e869",
+      byteLength: 31_493,
+      sha256: "7466593fa840665199f6d5a896ac36a6c527288aba4a17b40d8a27bb1eec4c42",
     },
   ],
 };
@@ -119,6 +120,16 @@ export interface PageLifecycleTarget {
 export interface SenkoBrowserAppDependencies {
   readonly detectCapabilities?: typeof detectRuntimeCapabilities;
   readonly createWorkerClient?: typeof createPipelineWorkerClient;
+  readonly pipelineOptions?: PipelineOptions;
+}
+
+/** `?precision=float32` forces the fallback even on shader-f16 adapters. */
+export function pipelineOptionsFromSearch(search: string): PipelineOptions {
+  const forceFloat32 =
+    new URLSearchParams(search).get("precision") === "float32";
+  return forceFloat32
+    ? { ...DEFAULT_PIPELINE_OPTIONS, preferFloat16: false }
+    : DEFAULT_PIPELINE_OPTIONS;
 }
 
 export class SenkoBrowserApp {
@@ -129,6 +140,7 @@ export class SenkoBrowserApp {
   readonly #pageMemorySampler: PageMemorySampler | undefined;
   readonly #detectCapabilities: typeof detectRuntimeCapabilities;
   readonly #createWorkerClient: typeof createPipelineWorkerClient;
+  readonly #pipelineOptions: PipelineOptions;
   #worker: PipelineWorkerClient | undefined;
   #startPromise: Promise<void> | undefined;
   #file: File | undefined;
@@ -155,6 +167,9 @@ export class SenkoBrowserApp {
       dependencies.detectCapabilities ?? detectRuntimeCapabilities;
     this.#createWorkerClient =
       dependencies.createWorkerClient ?? createPipelineWorkerClient;
+    this.#pipelineOptions =
+      dependencies.pipelineOptions ??
+      pipelineOptionsFromSearch(globalThis.location?.search ?? "");
   }
 
   public start(): Promise<void> {
@@ -180,14 +195,18 @@ export class SenkoBrowserApp {
 
       this.#worker = this.#createWorkerClient();
       this.#setStatus("Loading and compiling WebGPU models…", "loading");
-      await this.#worker.initialize(
+      const initialized = await this.#worker.initialize(
         BROWSER_MANIFEST,
-        DEFAULT_PIPELINE_OPTIONS,
+        this.#pipelineOptions,
         ({ message }) => this.#setStatus(`${message}…`, "loading"),
       );
       if (this.#disposed) return;
+      this.#root.dataset.modelPrecision = initialized.runtime.modelPrecision;
       this.#canRun = true;
-      this.#setStatus("WebGPU models ready.", "ready");
+      this.#setStatus(
+        `WebGPU ${initialized.runtime.modelPrecision === "float16" ? "FP16" : "FP32"} models ready.`,
+        "ready",
+      );
       this.#updateRunButton();
     } catch (error) {
       this.#worker?.dispose();

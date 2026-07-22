@@ -44,6 +44,7 @@ const DEFAULTS = Object.freeze({
   audio: join(REPOSITORY_ROOT, "test_audio.wav"),
   profileRoot: join(REPOSITORY_ROOT, ".research/chrome-benchmark-runs"),
   mode: "timing",
+  precision: "auto",
   keepProfile: false,
   readyTimeoutMs: 120_000,
   runTimeoutMs: 10 * 60_000,
@@ -61,6 +62,7 @@ Options:
   --audio <absolute-or-relative> WAV input (default: test_audio.wav)
   --chrome <path>                Chrome executable (or set CHROME_PATH)
   --mode <mode>                  timing, correctness, page-memory, or retained-memory
+  --precision <precision>        auto or float32 (default: ${DEFAULTS.precision})
   --profile-root <path>          Parent for the unique temporary profile
   --keep-profile                 Retain the unique profile after teardown
   --remove-profile               Remove it after teardown (the default)
@@ -131,6 +133,17 @@ export function parseBenchmarkArguments(argv) {
         index += 1;
         break;
       }
+      case "--precision": {
+        const precision = takeValue(index, flag);
+        if (precision !== "auto" && precision !== "float32") {
+          throw new Error(
+            `--precision must be auto or float32, received ${precision}`,
+          );
+        }
+        options.precision = precision;
+        index += 1;
+        break;
+      }
       case "--profile-root":
         options.profileRoot = takeValue(index, flag);
         index += 1;
@@ -177,7 +190,7 @@ export function parseBenchmarkArguments(argv) {
   return { help: false, options };
 }
 
-export function buildBenchmarkUrl(source, mode) {
+export function buildBenchmarkUrl(source, mode, precision = "auto") {
   const url = new URL(source);
   if (url.protocol !== "http:" && url.protocol !== "https:") {
     throw new Error(`Benchmark URL must use HTTP(S), received ${url.protocol}`);
@@ -186,6 +199,11 @@ export function buildBenchmarkUrl(source, mode) {
     url.searchParams.set("memory", "1");
   } else {
     url.searchParams.delete("memory");
+  }
+  if (precision === "float32") {
+    url.searchParams.set("precision", "float32");
+  } else {
+    url.searchParams.delete("precision");
   }
   return url.href;
 }
@@ -340,17 +358,24 @@ function isNonnegativeSafeInteger(value) {
 }
 
 export function summarizePipelineResult(result, metadata) {
+  const forcedFp32CompatibilityDiagnostic =
+    metadata.mode === "timing" &&
+    metadata.requestedPrecision === "float32" &&
+    metadata.runtime?.capabilities?.["shader-f16"] === true;
   const timingAcceptanceEligible =
     metadata.mode === "timing" &&
+    !forcedFp32CompatibilityDiagnostic &&
     metadata.acceptanceValidated === true &&
     metadata.offlineReference?.acceptance?.passed !== false;
   return {
     schemaVersion: 1,
     mode:
       metadata.mode === "timing"
-        ? timingAcceptanceEligible
-          ? "timing-acceptance"
-          : "timing-correctness-rejected"
+        ? forcedFp32CompatibilityDiagnostic
+          ? "timing-fp32-compatibility-diagnostic"
+          : timingAcceptanceEligible
+            ? "timing-acceptance"
+            : "timing-correctness-rejected"
         : metadata.mode === "correctness"
           ? "correctness-diagnostic"
           : "page-memory-diagnostic",
@@ -712,6 +737,7 @@ async function waitForModelsReady(cdp, sessionId, timeoutMs, signal) {
             return {
               text: status?.textContent?.trim() ?? "",
               kind: status?.getAttribute("data-kind") ?? "",
+              modelPrecision: document.querySelector("#app")?.dataset.modelPrecision,
             };
           })()`,
         );
@@ -730,7 +756,11 @@ async function waitForModelsReady(cdp, sessionId, timeoutMs, signal) {
         throw new Error(`Senko initialization failed: ${state.text}`);
       }
       return {
-        done: state?.text === "WebGPU models ready.",
+        done:
+          state?.kind === "ready" &&
+          (state?.text === "WebGPU models ready." ||
+            state?.modelPrecision === "float16" ||
+            state?.modelPrecision === "float32"),
         value: state,
         detail: state?.text,
       };
@@ -761,6 +791,7 @@ async function readRuntimeFingerprint(cdp, sessionId) {
         crossOriginIsolated: globalThis.crossOriginIsolated,
         hardwareConcurrency: navigator.hardwareConcurrency,
         capabilities,
+        modelPrecision: document.querySelector("#app")?.dataset.modelPrecision,
         webgpu: adapter === null || adapter === undefined
           ? { available: false, features: [] }
           : {
@@ -786,14 +817,14 @@ export function timingAcceptanceCapabilityFailures(runtime) {
   if (runtime?.crossOriginIsolated !== true) {
     failures.push("cross-origin isolation");
   }
-  for (const label of [
-    "WebGPU",
-    "Worker",
-    "WASM SIMD",
-    "WASM threads",
-    "shader-f16",
-  ]) {
+  for (const label of ["WebGPU", "Worker", "WASM SIMD", "WASM threads"]) {
     if (runtime?.capabilities?.[label] !== true) failures.push(label);
+  }
+  if (
+    runtime?.modelPrecision !== "float32" &&
+    runtime?.capabilities?.["shader-f16"] !== true
+  ) {
+    failures.push("shader-f16");
   }
   return [...new Set(failures)];
 }
@@ -1176,7 +1207,7 @@ async function preflightServer(url, mode, signal) {
 
 export async function runBrowserBenchmark(options) {
   const mode = options.mode;
-  const benchmarkUrl = buildBenchmarkUrl(options.url, mode);
+  const benchmarkUrl = buildBenchmarkUrl(options.url, mode, options.precision);
   const audioPath = resolve(options.audio);
   const profileRoot = resolve(options.profileRoot);
   const rawResultPath =
@@ -1252,6 +1283,14 @@ export async function runBrowserBenchmark(options) {
       abortController.signal,
     );
     const runtime = await readRuntimeFingerprint(cdp, sessionId);
+    if (
+      options.precision === "float32" &&
+      runtime?.modelPrecision !== "float32"
+    ) {
+      throw new Error(
+        `Forced FP32 benchmark initialized ${String(runtime?.modelPrecision)} models`,
+      );
+    }
     if (mode === "timing") {
       const capabilityFailures = timingAcceptanceCapabilityFailures(runtime);
       if (capabilityFailures.length > 0) {
@@ -1430,6 +1469,7 @@ export async function runBrowserBenchmark(options) {
       url: benchmarkUrl,
       chrome: chromeMetadata,
       runtime,
+      requestedPrecision: options.precision,
       input: { ...inputMetadata, sha256: audioSha256 },
       pageMemory,
       offlineReference: scoreOfflineReference(result, offlineReference),

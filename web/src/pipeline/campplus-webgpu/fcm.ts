@@ -3,6 +3,7 @@
 import { CampPlusActivationArena, type CampPlusArenaSlice } from "./arena";
 import type { CampPlusPackedSection, PackedConvolutionRef } from "./metadata";
 import { CampPlusGpuPackage } from "./package";
+import { campPlusStorageBytes, campPlusStorageWgsl } from "./storage";
 
 const CHANNELS = 32;
 const OUTPUT_GROUPS = CHANNELS / 4;
@@ -167,13 +168,27 @@ export class FcmKernels {
     variant: FcmVariant = DEFAULT_FCM_VARIANT,
     accumulation: FcmAccumulation = DEFAULT_FCM_ACCUMULATION,
   ): Promise<FcmKernels> {
-    const configuration = fcmVariantConfiguration(variant);
+    const storageDtype = gpuPackage.metadata.contract.internalDtype;
+    const storageBytes = campPlusStorageBytes(storageDtype);
+    let effectiveVariant = variant;
+    let configuration = fcmVariantConfiguration(effectiveVariant);
+    if (
+      storageDtype === "float32" &&
+      configuration.convWorkgroupStorageBytes * 2 >
+        device.limits.maxComputeWorkgroupStorageSize &&
+      effectiveVariant === "tile4-fold"
+    ) {
+      effectiveVariant = "tile2-fold";
+      configuration = fcmVariantConfiguration(effectiveVariant);
+    }
+    const requiredWorkgroupStorageBytes =
+      configuration.convWorkgroupStorageBytes * (storageBytes / 2);
     if (
       device.limits.maxComputeWorkgroupStorageSize <
-      configuration.convWorkgroupStorageBytes
+      requiredWorkgroupStorageBytes
     ) {
       throw new Error(
-        `CAM++ FCM ${variant} requires ${configuration.convWorkgroupStorageBytes} workgroup bytes`,
+        `CAM++ FCM ${effectiveVariant} requires ${requiredWorkgroupStorageBytes} workgroup bytes`,
       );
     }
     const firstLayout = device.createBindGroupLayout({
@@ -198,20 +213,26 @@ export class FcmKernels {
       ],
     });
     const labelSuffix =
-      variant === DEFAULT_FCM_VARIANT && accumulation === DEFAULT_FCM_ACCUMULATION
+      effectiveVariant === DEFAULT_FCM_VARIANT && accumulation === DEFAULT_FCM_ACCUMULATION
         ? ""
-        : `-${variant}-${accumulation}`;
+        : `-${effectiveVariant}-${accumulation}`;
     const [firstPipeline, convPipeline] = await Promise.all([
       checkedPipeline(
         device,
         `senko-campplus-fcm-first${labelSuffix}`,
-        fcmFirstWgsl(variant, accumulation),
+        campPlusStorageWgsl(
+          fcmFirstWgsl(effectiveVariant, accumulation),
+          storageDtype,
+        ),
         firstLayout,
       ),
       checkedPipeline(
         device,
         `senko-campplus-fcm-conv${labelSuffix}`,
-        fcmConvWgsl(variant, accumulation),
+        campPlusStorageWgsl(
+          fcmConvWgsl(effectiveVariant, accumulation),
+          storageDtype,
+        ),
         convLayout,
       ),
     ]);
@@ -223,7 +244,7 @@ export class FcmKernels {
       firstLayout,
       convPipeline,
       convLayout,
-      variant,
+      effectiveVariant,
       accumulation,
     );
   }
@@ -232,10 +253,17 @@ export class FcmKernels {
     const weight = this.convWeight(descriptor.convolution, CHANNELS, 1, 9);
     const bias = this.convBias(descriptor.convolution, CHANNELS);
     const inputBytes = descriptor.batchSize * FRAMES * 80 * 4;
-    validateSlice(descriptor.output, descriptor.batchSize * CHANNELS * 80 * FRAMES * 2, this.arena.byteLength);
+    const storageBytes = campPlusStorageBytes(
+      this.gpuPackage.metadata.contract.internalDtype,
+    );
+    validateSlice(
+      descriptor.output,
+      descriptor.batchSize * CHANNELS * 80 * FRAMES * storageBytes,
+      this.arena.byteLength,
+    );
     if (descriptor.input.size < inputBytes) throw new Error("FCM FP32 input buffer is too small");
     const parameters = new Uint32Array([
-      descriptor.output.byteOffset / 2,
+      descriptor.output.byteOffset / storageBytes,
       descriptor.batchSize,
       80,
       FRAMES,
@@ -293,14 +321,17 @@ export class FcmKernels {
         ? this.convBias(descriptor.residual.convolution, CHANNELS)
         : undefined;
     validateFcmDimensions(descriptor);
+    const storageBytes = campPlusStorageBytes(
+      this.gpuPackage.metadata.contract.internalDtype,
+    );
     validateSlice(
       descriptor.input,
-      descriptor.batchSize * CHANNELS * descriptor.inputFreq * FRAMES * 2,
+      descriptor.batchSize * CHANNELS * descriptor.inputFreq * FRAMES * storageBytes,
       this.arena.byteLength,
     );
     validateSlice(
       descriptor.output,
-      descriptor.batchSize * CHANNELS * descriptor.outputFreq * FRAMES * 2,
+      descriptor.batchSize * CHANNELS * descriptor.outputFreq * FRAMES * storageBytes,
       this.arena.byteLength,
     );
     let residualOffset = 0;
@@ -314,10 +345,10 @@ export class FcmKernels {
           : descriptor.outputFreq;
       validateSlice(
         descriptor.residual.input,
-        descriptor.batchSize * CHANNELS * inputFreq * FRAMES * 2,
+        descriptor.batchSize * CHANNELS * inputFreq * FRAMES * storageBytes,
         this.arena.byteLength,
       );
-      residualOffset = descriptor.residual.input.byteOffset / 2;
+      residualOffset = descriptor.residual.input.byteOffset / storageBytes;
       residualInputFreq = inputFreq;
       residualStride =
         descriptor.residual.kind === "learned" ? descriptor.residual.strideFreq : 1;
@@ -330,9 +361,9 @@ export class FcmKernels {
       throw new Error(`${descriptor.label} FCM input and output ranges overlap`);
     }
     const parameters = new Uint32Array([
-      descriptor.input.byteOffset / 2,
+      descriptor.input.byteOffset / storageBytes,
       residualOffset,
-      descriptor.output.byteOffset / 2,
+      descriptor.output.byteOffset / storageBytes,
       descriptor.batchSize,
       descriptor.inputFreq,
       descriptor.outputFreq,

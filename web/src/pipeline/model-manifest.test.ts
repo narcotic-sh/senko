@@ -31,6 +31,43 @@ const model: BrowserModel = {
 };
 
 function segmentationModel(): BrowserSegmentationModel {
+  const lstmArtifact = (precision: "float16" | "float32") => ({
+    format:
+      precision === "float16"
+        ? ("senko-persistent-lstm-f16-gc4h" as const)
+        : ("senko-persistent-lstm-f32-gc4h" as const),
+    boundary_layout: "batch,frame,feature" as const,
+    frames: 589 as const,
+    input_features: 60 as const,
+    output_features: 256 as const,
+    weights: {
+      file: `lstm-${precision}.bin`,
+      bytes: precision === "float16" ? 64 : 128,
+      sha256: "b".repeat(64),
+    },
+    metadata: {
+      file: `lstm-${precision}.json`,
+      bytes: 32,
+      sha256: "c".repeat(64),
+    },
+  });
+  const directVariant = (precision: "float16" | "float32") => ({
+    format:
+      precision === "float16"
+        ? ("senko-pyannote-direct-webgpu-f16-v1" as const)
+        : ("senko-pyannote-direct-webgpu-f32-v1" as const),
+    frontend_metadata: {
+      file: `frontend-webgpu-${precision}.json`,
+      bytes: 100,
+      sha256: "d".repeat(64),
+    },
+    tail_metadata: {
+      file: `tail-webgpu-${precision}.json`,
+      bytes: 80,
+      sha256: "e".repeat(64),
+    },
+    explicit_gpu_bytes: precision === "float16" ? 44_145_664 : 68_000_000,
+  });
   return {
     ...model,
     split: {
@@ -38,30 +75,19 @@ function segmentationModel(): BrowserSegmentationModel {
       boundary_layout: "batch,frame,feature",
       frontend: model,
       tail: model,
-      lstm: {
-        format: "senko-persistent-lstm-f16-gc4h",
-        boundary_layout: "batch,frame,feature",
-        frames: 589,
-        input_features: 60,
-        output_features: 256,
-        weights: { file: "lstm.bin", bytes: 64, sha256: "b".repeat(64) },
-        metadata: { file: "lstm.json", bytes: 32, sha256: "c".repeat(64) },
-      },
       direct_webgpu: {
-        batches: {
-          "8": {
-            format: "senko-pyannote-direct-webgpu-f16-v1",
-            frontend_metadata: {
-              file: "frontend-webgpu.json",
-              bytes: 100,
-              sha256: "d".repeat(64),
+        precision_variants: {
+          float16: {
+            lstm: lstmArtifact("float16"),
+            batches: {
+              "8": directVariant("float16"),
             },
-            tail_metadata: {
-              file: "tail-webgpu.json",
-              bytes: 80,
-              sha256: "e".repeat(64),
+          },
+          float32: {
+            lstm: lstmArtifact("float32"),
+            batches: {
+              "8": directVariant("float32"),
             },
-            explicit_gpu_bytes: 44_145_664,
           },
         },
       },
@@ -82,19 +108,36 @@ function segmentationModel(): BrowserSegmentationModel {
 }
 
 function directCampPlusModel(): BrowserModel {
+  const directVariant = (precision: "float16" | "float32") => ({
+    format:
+      precision === "float16"
+        ? ("senko-campplus-direct-webgpu-f16-v1" as const)
+        : ("senko-campplus-direct-webgpu-f32-v1" as const),
+    metadata: {
+      file: `campplus-${precision}.json`,
+      bytes: 178_145,
+      sha256: "b".repeat(64),
+    },
+    weights: {
+      file: `campplus-${precision}.bin`,
+      bytes: precision === "float16" ? 13_852_416 : 27_704_832,
+      sha256: "c".repeat(64),
+    },
+    production_batch: 16 as const,
+    supported_batches: [4, 8, 16, 32] as const,
+    explicit_gpu_buffer_bytes_by_batch: {
+      "4": precision === "float16" ? 21_434_112 : 35_000_000,
+      "8": precision === "float16" ? 27_164_928 : 42_000_000,
+      "16": precision === "float16" ? 39_855_360 : 55_000_000,
+      "32": precision === "float16" ? 64_621_824 : 80_000_000,
+    },
+  });
   return {
     ...model,
     direct_webgpu: {
-      format: "senko-campplus-direct-webgpu-f16-v1",
-      metadata: { file: "campplus.json", bytes: 178_145, sha256: "b".repeat(64) },
-      weights: { file: "campplus.bin", bytes: 13_852_416, sha256: "c".repeat(64) },
-      production_batch: 16,
-      supported_batches: [4, 8, 16, 32],
-      explicit_gpu_buffer_bytes_by_batch: {
-        "4": 21_434_112,
-        "8": 27_164_928,
-        "16": 39_855_360,
-        "32": 64_621_824,
+      precision_variants: {
+        float16: directVariant("float16"),
+        float32: directVariant("float32"),
       },
     },
   };
@@ -119,8 +162,13 @@ describe("model manifest selection", () => {
       directModel,
     );
     expect(selected.batchSize).toBe(16);
-    expect(selected.metadata.url).toBe("https://example.test/models/campplus.json");
-    expect(selected.weights.url).toBe("https://example.test/models/campplus.bin");
+    expect(selected.precision).toBe("float16");
+    expect(selected.metadata.url).toBe(
+      "https://example.test/models/campplus-float16.json",
+    );
+    expect(selected.weights.url).toBe(
+      "https://example.test/models/campplus-float16.bin",
+    );
     expect(selected.explicitGpuBufferBytes).toBe(39_855_360);
   });
 
@@ -147,18 +195,59 @@ describe("model manifest selection", () => {
     expect(selected.tail.asset.url).toBe(
       "https://example.test/models/test-b8.onnx",
     );
-    expect(selected.weights.url).toBe("https://example.test/models/lstm.bin");
-    expect(selected.metadata.url).toBe("https://example.test/models/lstm.json");
+    expect(selected.precision).toBe("float16");
+    expect(selected.weights.url).toBe(
+      "https://example.test/models/lstm-float16.bin",
+    );
+    expect(selected.metadata.url).toBe(
+      "https://example.test/models/lstm-float16.json",
+    );
     expect(selected.directWebGpu.frontendMetadata.url).toBe(
-      "https://example.test/models/frontend-webgpu.json",
+      "https://example.test/models/frontend-webgpu-float16.json",
     );
     expect(selected.directWebGpu.tailMetadata.url).toBe(
-      "https://example.test/models/tail-webgpu.json",
+      "https://example.test/models/tail-webgpu-float16.json",
     );
     expect(selected.directWebGpu.explicitGpuBytes).toBe(44_145_664);
     expect(selected.declaredBufferBytes.first_convolution_activation_bytes).toBe(
       40_896_000,
     );
+  });
+
+  it("selects a precision-consistent FP32 direct-WebGPU model set", () => {
+    const segmentation = selectSegmentationSplit(
+      "https://example.test/models/manifest.json",
+      segmentationModel(),
+      8,
+      "float32",
+    );
+    const campplus = selectCampPlusDirect(
+      "https://example.test/models/manifest.json",
+      directCampPlusModel(),
+      16,
+      "float32",
+    );
+
+    expect(segmentation).toMatchObject({
+      precision: "float32",
+      weights: { url: "https://example.test/models/lstm-float32.bin" },
+      metadata: { url: "https://example.test/models/lstm-float32.json" },
+      directWebGpu: {
+        frontendMetadata: {
+          url: "https://example.test/models/frontend-webgpu-float32.json",
+        },
+        tailMetadata: {
+          url: "https://example.test/models/tail-webgpu-float32.json",
+        },
+        explicitGpuBytes: 68_000_000,
+      },
+    });
+    expect(campplus).toMatchObject({
+      precision: "float32",
+      metadata: { url: "https://example.test/models/campplus-float32.json" },
+      weights: { url: "https://example.test/models/campplus-float32.bin" },
+      explicitGpuBufferBytes: 55_000_000,
+    });
   });
 
   it("verifies the root manifest length and SHA-256 before accepting it", async () => {

@@ -32,6 +32,7 @@ from onnxconverter_common import float16 as onnx_float16
 from torch import nn
 from torch.nn import functional as F
 
+from campplus_webgpu.pack import build_package as build_campplus_webgpu_package
 from pyannote_frontend_webgpu.pack import build_package as build_frontend_webgpu_package
 from pyannote_tail_webgpu.pack import build_package as build_tail_webgpu_package
 
@@ -1056,81 +1057,166 @@ def _write_or_verify_bytes(path: Path, expected: bytes, verify_only: bool) -> No
         temporary.unlink(missing_ok=True)
 
 
+def write_or_verify_direct_webgpu_campplus(
+    output_dir: Path,
+    verify_only: bool,
+) -> dict[str, Any]:
+    """Build both storage-precision variants of the raw CAM++ package."""
+    variants: dict[str, Any] = {}
+    for precision, source_name, suffix in (
+        ("float16", "campplus-t150-b32-fp16.onnx", "fp16"),
+        ("float32", "campplus-t150-b32.onnx", "fp32"),
+    ):
+        source = output_dir / source_name
+        if not source.is_file():
+            raise FileNotFoundError(
+                f"Cannot build direct WebGPU CAM++ without {source.name}."
+            )
+        binary_name = f"campplus-t150-webgpu-{suffix}.bin"
+        metadata_name = f"campplus-t150-webgpu-{suffix}.json"
+        binary, metadata = build_campplus_webgpu_package(
+            source,
+            binary_name,
+            internal_dtype=precision,
+        )
+        metadata_bytes = (
+            json.dumps(metadata, separators=(",", ":"), sort_keys=True) + "\n"
+        ).encode()
+        binary_path = output_dir / binary_name
+        metadata_path = output_dir / metadata_name
+        _write_or_verify_bytes(binary_path, binary, verify_only)
+        _write_or_verify_bytes(metadata_path, metadata_bytes, verify_only)
+
+        arena_by_batch = {
+            int(plan["frontend_microbatch"]): int(plan["activation_arena_bytes"])
+            for plan in metadata["memory"]["planned_webgpu"][
+                "frontend_microbatch_tradeoffs"
+            ]
+        }
+        explicit_gpu_bytes_by_batch: dict[str, int] = {}
+        for batch in (4, 8, 16, 32):
+            # One FP32 API input, one FP32 output, two readback slots, and the
+            # fixed 119-dispatch uniform set. Optional timestamp diagnostics
+            # are deliberately excluded from deployment accounting.
+            variable_bytes = batch * 150 * 80 * 4 + batch * 192 * 4 * 3
+            explicit_gpu_bytes_by_batch[str(batch)] = (
+                len(binary) + arena_by_batch[batch] + variable_bytes + 7_680
+            )
+        variants[precision] = {
+            "format": (
+                "senko-campplus-direct-webgpu-f16-v1"
+                if precision == "float16"
+                else "senko-campplus-direct-webgpu-f32-v1"
+            ),
+            "metadata": {
+                "file": metadata_name,
+                "bytes": len(metadata_bytes),
+                "sha256": hashlib.sha256(metadata_bytes).hexdigest(),
+            },
+            "weights": {
+                "file": binary_name,
+                "bytes": len(binary),
+                "sha256": hashlib.sha256(binary).hexdigest(),
+            },
+            "production_batch": 16,
+            "supported_batches": [4, 8, 16, 32],
+            "explicit_gpu_buffer_bytes_by_batch": explicit_gpu_bytes_by_batch,
+        }
+    return {"precision_variants": variants}
+
+
 def write_or_verify_direct_webgpu_vad(
     output_dir: Path,
     verify_only: bool,
-    lstm_package: dict[str, Any],
+    lstm_packages: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
     batch = 8
     frontend_source = output_dir / "pyannote-segmentation-3.0-frontend-b8.onnx"
     tail_source = output_dir / "pyannote-segmentation-3.0-tail-b8.onnx"
-    frontend_binary_name = "pyannote-segmentation-3.0-frontend-webgpu-f16.bin"
-    tail_binary_name = "pyannote-segmentation-3.0-tail-webgpu-f16.bin"
-    frontend_binary, frontend_metadata = build_frontend_webgpu_package(
-        frontend_source,
-        frontend_binary_name,
-        np.dtype(np.float16),
-    )
-    tail_binary, tail_metadata = build_tail_webgpu_package(
-        tail_source,
-        tail_binary_name,
-    )
-    artifacts = (
-        (output_dir / frontend_binary_name, frontend_binary),
-        (
-            output_dir / "pyannote-segmentation-3.0-frontend-webgpu-f16.json",
-            (json.dumps(frontend_metadata, indent=2) + "\n").encode(),
-        ),
-        (output_dir / tail_binary_name, tail_binary),
-        (
-            output_dir / "pyannote-segmentation-3.0-tail-webgpu-f16.json",
-            (json.dumps(tail_metadata, indent=2) + "\n").encode(),
-        ),
-    )
-    for path, payload in artifacts:
-        _write_or_verify_bytes(path, payload, verify_only)
-
-    frontend_metadata_path = artifacts[1][0]
-    tail_metadata_path = artifacts[3][0]
     recurrent_bytes = batch * PYANNOTE_FRAMES * PYANNOTE_LSTM_OUTPUT_FEATURES * 4
     input_affine_scratch_bytes = 4 * recurrent_bytes
-    lstm_gpu_bytes = (
-        int(lstm_package["weights"]["bytes"])
-        + 2 * recurrent_bytes
-        + input_affine_scratch_bytes
-        + PYANNOTE_LSTM_LAYERS * 32
-    )
-    frontend_gpu_bytes = (
-        int(
-            frontend_metadata["memory"]["planned_webgpu"]["aliased_arena"][
-                "minimum_resident_gpu_bytes"
-            ]
+    variants: dict[str, Any] = {}
+    for precision, storage_dtype in (
+        ("float16", np.dtype(np.float16)),
+        ("float32", np.dtype(np.float32)),
+    ):
+        suffix = "f16" if precision == "float16" else "f32"
+        frontend_binary_name = (
+            f"pyannote-segmentation-3.0-frontend-webgpu-{suffix}.bin"
         )
-        + 384
-    )
-    explicit_gpu_bytes = (
-        frontend_gpu_bytes
-        + lstm_gpu_bytes
-        + int(tail_metadata["memory"]["explicit_gpu_bytes"])
-    )
-    return {
-        "batches": {
-            str(batch): {
-                "format": "senko-pyannote-direct-webgpu-f16-v1",
-                "frontend_metadata": {
-                    "file": frontend_metadata_path.name,
-                    "bytes": frontend_metadata_path.stat().st_size,
-                    "sha256": sha256(frontend_metadata_path),
-                },
-                "tail_metadata": {
-                    "file": tail_metadata_path.name,
-                    "bytes": tail_metadata_path.stat().st_size,
-                    "sha256": sha256(tail_metadata_path),
-                },
-                "explicit_gpu_bytes": explicit_gpu_bytes,
-            }
+        tail_binary_name = f"pyannote-segmentation-3.0-tail-webgpu-{suffix}.bin"
+        frontend_binary, frontend_metadata = build_frontend_webgpu_package(
+            frontend_source,
+            frontend_binary_name,
+            storage_dtype,
+        )
+        tail_binary, tail_metadata = build_tail_webgpu_package(
+            tail_source,
+            tail_binary_name,
+            storage_dtype,
+        )
+        frontend_metadata_path = (
+            output_dir
+            / f"pyannote-segmentation-3.0-frontend-webgpu-{suffix}.json"
+        )
+        tail_metadata_path = (
+            output_dir / f"pyannote-segmentation-3.0-tail-webgpu-{suffix}.json"
+        )
+        artifacts = (
+            (output_dir / frontend_binary_name, frontend_binary),
+            (
+                frontend_metadata_path,
+                (json.dumps(frontend_metadata, indent=2) + "\n").encode(),
+            ),
+            (output_dir / tail_binary_name, tail_binary),
+            (
+                tail_metadata_path,
+                (json.dumps(tail_metadata, indent=2) + "\n").encode(),
+            ),
+        )
+        for path, payload in artifacts:
+            _write_or_verify_bytes(path, payload, verify_only)
+
+        lstm_package = lstm_packages[precision]
+        lstm_gpu_bytes = (
+            int(lstm_package["weights"]["bytes"])
+            + 2 * recurrent_bytes
+            + input_affine_scratch_bytes
+            + PYANNOTE_LSTM_LAYERS * 32
+        )
+        frontend_gpu_bytes = (
+            int(
+                frontend_metadata["memory"]["planned_webgpu"]["aliased_arena"][
+                    "minimum_resident_gpu_bytes"
+                ]
+            )
+            + 384
+        )
+        explicit_gpu_bytes = (
+            frontend_gpu_bytes
+            + lstm_gpu_bytes
+            + int(tail_metadata["memory"]["explicit_gpu_bytes"])
+        )
+        variants[precision] = {
+            "lstm": lstm_package,
+            "batches": {
+                str(batch): {
+                    "format": f"senko-pyannote-direct-webgpu-{suffix}-v1",
+                    "frontend_metadata": {
+                        "file": frontend_metadata_path.name,
+                        "bytes": frontend_metadata_path.stat().st_size,
+                        "sha256": sha256(frontend_metadata_path),
+                    },
+                    "tail_metadata": {
+                        "file": tail_metadata_path.name,
+                        "bytes": tail_metadata_path.stat().st_size,
+                        "sha256": sha256(tail_metadata_path),
+                    },
+                    "explicit_gpu_bytes": explicit_gpu_bytes,
+                }
+            },
         }
-    }
+    return {"precision_variants": variants}
 
 
 def export_pyannote_split(
@@ -1139,12 +1225,12 @@ def export_pyannote_split(
     output_dir: Path,
     verify_only: bool,
 ) -> dict[str, Any]:
-    # Keep an exact FP32 package as the diagnostic baseline, but select the
-    # browser-validated FP16 package in the production manifest.
-    write_or_verify_pyannote_lstm_package(
+    # Package both precisions: FP16 is preferred after browser validation and
+    # FP32 is the shader-f16-free compatibility path.
+    fp32_package = write_or_verify_pyannote_lstm_package(
         model, output_dir, verify_only, "float32"
     )
-    package = write_or_verify_pyannote_lstm_package(
+    fp16_package = write_or_verify_pyannote_lstm_package(
         model, output_dir, verify_only, "float16"
     )
     components = (
@@ -1200,15 +1286,18 @@ def export_pyannote_split(
         }
 
     direct_webgpu = (
-        write_or_verify_direct_webgpu_vad(output_dir, verify_only, package)
+        write_or_verify_direct_webgpu_vad(
+            output_dir,
+            verify_only,
+            {"float16": fp16_package, "float32": fp32_package},
+        )
         if 8 in batches
-        else {"batches": {}}
+        else {"precision_variants": {}}
     )
     return {
         "version": 1,
         "boundary_layout": "batch,frame,feature",
         "frontend": component_manifests["frontend"],
-        "lstm": package,
         "tail": component_manifests["tail"],
         "direct_webgpu": direct_webgpu,
         "buffer_bytes_by_batch": {
@@ -1228,6 +1317,7 @@ def export_family(
     reference = load_campplus_reference() if family == "campplus" else None
     records: list[dict[str, Any]] = []
     segmentation_split: dict[str, Any] | None = None
+    campplus_direct: dict[str, Any] | None = None
     try:
         for spec in specs_for(family, batches):
             path = output_dir / spec.file_name
@@ -1531,14 +1621,20 @@ def load_existing_campplus_direct(output_dir: Path) -> dict[str, Any] | None:
     direct = existing.get("models", {}).get("campplus", {}).get("direct_webgpu")
     if not isinstance(direct, dict):
         return None
-    metadata = output_dir / str(direct.get("metadata", {}).get("file", ""))
-    weights = output_dir / str(direct.get("weights", {}).get("file", ""))
-    if (
-        direct.get("format") != "senko-campplus-direct-webgpu-f16-v1"
-        or not metadata.is_file()
-        or not weights.is_file()
-    ):
+    variants = direct.get("precision_variants")
+    if not isinstance(variants, dict):
         return None
+    for precision, expected_format in (
+        ("float16", "senko-campplus-direct-webgpu-f16-v1"),
+        ("float32", "senko-campplus-direct-webgpu-f32-v1"),
+    ):
+        variant = variants.get(precision)
+        if not isinstance(variant, dict) or variant.get("format") != expected_format:
+            return None
+        metadata = output_dir / str(variant.get("metadata", {}).get("file", ""))
+        weights = output_dir / str(variant.get("weights", {}).get("file", ""))
+        if not metadata.is_file() or not weights.is_file():
+            return None
     return direct
 
 
@@ -1548,8 +1644,11 @@ def merge_segmentation_split(
 ) -> dict[str, Any] | None:
     old_split = load_existing_segmentation_split(output_dir)
     if new_split is None:
+        if old_split is not None:
+            _require_vad_precision_pair(old_split, output_dir)
         return old_split
     if old_split is None:
+        _require_vad_precision_pair(new_split, output_dir)
         return new_split
 
     merged = json.loads(json.dumps(new_split))
@@ -1574,21 +1673,76 @@ def merge_segmentation_split(
     merged["buffer_bytes_by_batch"] = dict(
         sorted(merged_buffers.items(), key=lambda item: int(item[0]))
     )
-    merged_direct = merged.setdefault("direct_webgpu", {"batches": {}})["batches"]
-    old_direct = old_split.get("direct_webgpu", {}).get("batches", {})
-    for batch, variant in old_direct.items():
-        if batch in merged_direct or not isinstance(variant, dict):
-            continue
-        frontend = output_dir / str(
-            variant.get("frontend_metadata", {}).get("file", "")
-        )
-        tail = output_dir / str(variant.get("tail_metadata", {}).get("file", ""))
-        if frontend.is_file() and tail.is_file():
-            merged_direct[batch] = variant
-    merged["direct_webgpu"]["batches"] = dict(
-        sorted(merged_direct.items(), key=lambda item: int(item[0]))
+    merged_variants = merged.setdefault(
+        "direct_webgpu", {"precision_variants": {}}
+    )["precision_variants"]
+    old_variants = old_split.get("direct_webgpu", {}).get(
+        "precision_variants", {}
     )
+    for precision, old_variant in old_variants.items():
+        if precision in merged_variants or not isinstance(old_variant, dict):
+            continue
+        lstm = old_variant.get("lstm", {})
+        weights = output_dir / str(lstm.get("weights", {}).get("file", ""))
+        metadata = output_dir / str(lstm.get("metadata", {}).get("file", ""))
+        batches = old_variant.get("batches", {})
+        if not weights.is_file() or not metadata.is_file() or not isinstance(batches, dict):
+            continue
+        available_batches: dict[str, Any] = {}
+        for batch, variant in batches.items():
+            if not isinstance(variant, dict):
+                continue
+            frontend = output_dir / str(
+                variant.get("frontend_metadata", {}).get("file", "")
+            )
+            tail = output_dir / str(
+                variant.get("tail_metadata", {}).get("file", "")
+            )
+            if frontend.is_file() and tail.is_file():
+                available_batches[batch] = variant
+        if available_batches:
+            merged_variants[precision] = {
+                **old_variant,
+                "batches": dict(
+                    sorted(available_batches.items(), key=lambda item: int(item[0]))
+                ),
+            }
+    merged["direct_webgpu"]["precision_variants"] = dict(
+        sorted(merged_variants.items())
+    )
+    _require_vad_precision_pair(merged, output_dir)
     return merged
+
+
+def _require_vad_precision_pair(split: dict[str, Any], output_dir: Path) -> None:
+    variants = split.get("direct_webgpu", {}).get("precision_variants", {})
+    actual = set(variants) if isinstance(variants, dict) else set()
+    required = {"float16", "float32"}
+    if actual != required:
+        missing = ", ".join(sorted(required - actual)) or "none"
+        raise RuntimeError(
+            "Direct-WebGPU VAD export requires both precision variants; "
+            f"missing: {missing}. Export pyannote batch 8 to regenerate them."
+        )
+    for precision in sorted(required):
+        variant = variants[precision]
+        if not isinstance(variant, dict):
+            raise RuntimeError(f"Direct-WebGPU VAD {precision} variant is malformed.")
+        lstm = variant.get("lstm", {})
+        batch = variant.get("batches", {}).get("8", {})
+        records = {
+            "LSTM weights": lstm.get("weights", {}),
+            "LSTM metadata": lstm.get("metadata", {}),
+            "frontend metadata": batch.get("frontend_metadata", {}),
+            "tail metadata": batch.get("tail_metadata", {}),
+        }
+        for label, record in records.items():
+            file = record.get("file") if isinstance(record, dict) else None
+            if not isinstance(file, str) or not file or not (output_dir / file).is_file():
+                raise RuntimeError(
+                    f"Direct-WebGPU VAD {precision} {label} asset is missing. "
+                    "Export pyannote batch 8 to regenerate the precision pair."
+                )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1640,6 +1794,7 @@ def main() -> int:
     families = ("pyannote", "campplus") if args.family == "all" else (args.family,)
     records: list[dict[str, Any]] = []
     segmentation_split: dict[str, Any] | None = None
+    campplus_direct: dict[str, Any] | None = None
     for family in families:
         batches = (
             args.pyannote_batches if family == "pyannote" else args.campplus_batches
@@ -1653,6 +1808,11 @@ def main() -> int:
         records.extend(family_records)
         if family_split is not None:
             segmentation_split = family_split
+        if family == "campplus" and 32 in batches:
+            campplus_direct = write_or_verify_direct_webgpu_campplus(
+                output_dir,
+                args.verify_only,
+            )
 
     if args.verify_only:
         print(f"Verified {len(records)} model artifact(s).")
@@ -1660,7 +1820,8 @@ def main() -> int:
 
     all_records = merge_records(output_dir, records)
     segmentation_split = merge_segmentation_split(output_dir, segmentation_split)
-    campplus_direct = load_existing_campplus_direct(output_dir)
+    if campplus_direct is None:
+        campplus_direct = load_existing_campplus_direct(output_dir)
     manifest_path = output_dir / "manifest.json"
     manifest_path.write_text(
         json.dumps(

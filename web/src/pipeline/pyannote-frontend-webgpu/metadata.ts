@@ -84,6 +84,7 @@ export function parsePyannoteFrontendMetadata(
       contract.intermediate_dtype !== "float32") ||
     contract.reduction_dtype !== "float32" ||
     (contract.weight_dtype !== "float16" && contract.weight_dtype !== "float32") ||
+    contract.weight_dtype !== contract.intermediate_dtype ||
     contract.channel_tile !== 4
   ) {
     throw new Error("Unsupported pyannote frontend tensor contract");
@@ -97,6 +98,15 @@ export function parsePyannoteFrontendMetadata(
   const sectionIds = new Set(sections.map((section) => section.id));
   if (sectionIds.size !== sections.length) {
     throw new Error("Duplicate pyannote frontend section id");
+  }
+  if (
+    sections.some(
+      (section) =>
+        section.kind !== "instance_norm_affine" &&
+        section.dtype !== contract.weight_dtype,
+    )
+  ) {
+    throw new Error("Pyannote frontend section precision does not match its contract");
   }
   const sectionAlignment = positiveInteger(
     binary.section_alignment,

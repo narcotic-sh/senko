@@ -5,7 +5,7 @@ import { PyannoteFrontendGpuPackage } from "./package";
 
 const UNIFORM_BYTES = 64;
 
-export interface F16BctNormDescriptor {
+export interface BctNormDescriptor {
   readonly label: string;
   readonly input: GPUBuffer;
   readonly inputBytes: number;
@@ -18,7 +18,7 @@ export interface F16BctNormDescriptor {
   readonly epsilon: number;
 }
 
-export class PyannoteF16BctNormDispatch {
+export class PyannoteBctNormDispatch {
   constructor(
     private readonly pipeline: GPUComputePipeline,
     private readonly bindGroup: GPUBindGroup,
@@ -41,7 +41,7 @@ export class PyannoteF16BctNormDispatch {
   }
 }
 
-export class PyannoteF16BctNormKernel {
+export class PyannoteBctNormKernel {
   private constructor(
     private readonly device: GPUDevice,
     private readonly gpuPackage: PyannoteFrontendGpuPackage,
@@ -51,27 +51,28 @@ export class PyannoteF16BctNormKernel {
   static async create(
     device: GPUDevice,
     gpuPackage: PyannoteFrontendGpuPackage,
-  ): Promise<PyannoteF16BctNormKernel> {
+  ): Promise<PyannoteBctNormKernel> {
+    const precision = gpuPackage.metadata.contract.intermediateDtype;
     const module = device.createShaderModule({
-      label: "senko-pyannote-f16-bct-instance-norm",
-      code: F16_BCT_NORM_WGSL,
+      label: `senko-pyannote-${precision}-bct-instance-norm`,
+      code: bctNormWgsl(precision),
     });
     const info = await module.getCompilationInfo();
     const errors = info.messages.filter((message) => message.type === "error");
     if (errors.length > 0) {
       throw new Error(
-        `Pyannote f16 InstanceNorm WGSL failed: ${errors.map((item) => item.message).join("; ")}`,
+        `Pyannote BCT InstanceNorm WGSL failed: ${errors.map((item) => item.message).join("; ")}`,
       );
     }
     const pipeline = await device.createComputePipelineAsync({
-      label: "senko-pyannote-f16-bct-instance-norm",
+      label: `senko-pyannote-${precision}-bct-instance-norm`,
       layout: "auto",
       compute: { module, entryPoint: "main" },
     });
-    return new PyannoteF16BctNormKernel(device, gpuPackage, pipeline);
+    return new PyannoteBctNormKernel(device, gpuPackage, pipeline);
   }
 
-  createDispatch(descriptor: F16BctNormDescriptor): PyannoteF16BctNormDispatch {
+  createDispatch(descriptor: BctNormDescriptor): PyannoteBctNormDispatch {
     if (
       descriptor.affine.kind !== "instance_norm_affine" ||
       descriptor.affine.layout !== "C4_GAMMA_BETA" ||
@@ -118,7 +119,7 @@ export class PyannoteF16BctNormKernel {
         { binding: 3, resource: { buffer: uniformBuffer, size: UNIFORM_BYTES } },
       ],
     });
-    return new PyannoteF16BctNormDispatch(
+    return new PyannoteBctNormDispatch(
       this.pipeline,
       bindGroup,
       uniformBuffer,
@@ -243,9 +244,15 @@ export class PyannoteF32BtfNormKernel {
   }
 }
 
-const F16_BCT_NORM_WGSL = /* wgsl */ `
-enable f16;
-struct HalfBuffer { values: array<f16> };
+export function bctNormWgsl(
+  precision: "float16" | "float32",
+): string {
+  const halfPrecision = precision === "float16";
+  return /* wgsl */ `
+${halfPrecision ? "enable f16;" : ""}
+struct InputBuffer {
+  values: array<${halfPrecision ? "f16" : "f32"}>
+};
 struct FloatBuffer { values: array<f32> };
 struct Parameters {
   batch: u32,
@@ -254,7 +261,7 @@ struct Parameters {
   reserved: u32,
   epsilon: f32,
 };
-@group(0) @binding(0) var<storage, read> input_values: HalfBuffer;
+@group(0) @binding(0) var<storage, read> input_values: InputBuffer;
 @group(0) @binding(1) var<storage, read> affine: FloatBuffer;
 @group(0) @binding(2) var<storage, read_write> statistics: FloatBuffer;
 @group(0) @binding(3) var<uniform> parameters: Parameters;
@@ -317,6 +324,12 @@ fn main(
   }
 }
 `;
+}
+
+/** Legacy names retained for diagnostic imports; package metadata selects precision. */
+export { PyannoteBctNormKernel as PyannoteF16BctNormKernel };
+export type PyannoteF16BctNormDispatch = PyannoteBctNormDispatch;
+export type F16BctNormDescriptor = BctNormDescriptor;
 
 const F32_BTF_NORM_WGSL = /* wgsl */ `
 struct FloatBuffer { values: array<f32> };

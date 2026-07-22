@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pack the eight-node pyannote dense tail as FP16 weights for one WGSL dispatch."""
+"""Pack the eight-node pyannote dense tail for one WGSL dispatch."""
 
 from __future__ import annotations
 
@@ -38,11 +38,11 @@ def sha256_bytes(data: bytes | bytearray | memoryview) -> str:
 
 def pack_matrix_i_o4(matrix: np.ndarray) -> tuple[np.ndarray, list[int]]:
     value = np.asarray(matrix)
-    if value.dtype != np.float16 or value.ndim != 2:
-        raise TypeError(f"expected float16 [I,O] matrix, got {value.dtype} {value.shape}")
+    if value.dtype not in (np.dtype(np.float16), np.dtype(np.float32)) or value.ndim != 2:
+        raise TypeError(f"expected float16/float32 [I,O] matrix, got {value.dtype} {value.shape}")
     input_features, output_features = map(int, value.shape)
     padded_output = align_up(output_features, TILE)
-    padded = np.zeros((input_features, padded_output), dtype=np.float16)
+    padded = np.zeros((input_features, padded_output), dtype=value.dtype)
     padded[:, :output_features] = value
     packed = padded.reshape(input_features, padded_output // TILE, TILE)
     return packed, list(packed.shape)
@@ -53,9 +53,12 @@ def unpack_matrix_i_o4(packed: np.ndarray, logical_shape: Iterable[int]) -> np.n
     return packed.reshape(input_features, -1)[:, :output_features].copy()
 
 
-def pack_bias_o4(bias: np.ndarray) -> np.ndarray:
-    value = np.asarray(bias, dtype=np.float16).reshape(-1)
-    padded = np.zeros(align_up(value.size, TILE), dtype=np.float16)
+def pack_bias_o4(
+    bias: np.ndarray,
+    storage_dtype: np.dtype[Any] = np.dtype(np.float16),
+) -> np.ndarray:
+    value = np.asarray(bias, dtype=storage_dtype).reshape(-1)
+    padded = np.zeros(align_up(value.size, TILE), dtype=storage_dtype)
     padded[: value.size] = value
     return padded.reshape(-1, TILE)
 
@@ -81,7 +84,7 @@ class Builder:
     ) -> None:
         offset = align_up(len(self.payload))
         self.payload.extend(b"\0" * (offset - len(self.payload)))
-        raw = np.ascontiguousarray(array, dtype="<f2").tobytes()
+        raw = np.ascontiguousarray(array, dtype=array.dtype.newbyteorder("<")).tobytes()
         self.payload.extend(raw)
         self.sections.append(
             {
@@ -90,7 +93,7 @@ class Builder:
                 "byte_offset": offset,
                 "byte_length": len(raw),
                 "element_count": int(array.size),
-                "dtype": "float16",
+                "dtype": "float16" if array.dtype == np.float16 else "float32",
                 "logical_shape": [int(value) for value in logical_shape],
                 "packed_shape": list(array.shape),
                 "layout": layout,
@@ -148,7 +151,14 @@ def _shapes(model: onnx.ModelProto) -> dict[str, list[int]]:
     return result
 
 
-def build_package(source: Path, binary_name: str) -> tuple[bytes, dict[str, Any]]:
+def build_package(
+    source: Path,
+    binary_name: str,
+    storage_dtype: np.dtype[Any] = np.dtype(np.float16),
+) -> tuple[bytes, dict[str, Any]]:
+    storage_dtype = np.dtype(storage_dtype)
+    if storage_dtype not in (np.dtype(np.float16), np.dtype(np.float32)):
+        raise TypeError("tail storage must be float16 or float32")
     source_bytes = source.read_bytes()
     source_hash = sha256_bytes(source_bytes)
     model = onnx.load_model_from_string(source_bytes)
@@ -184,8 +194,8 @@ def build_package(source: Path, binary_name: str) -> tuple[bytes, dict[str, Any]
         source_bias = np.asarray(static[bias_name])
         if source_weight.dtype != np.float32 or source_bias.dtype != np.float32:
             raise ValueError("tail source parameters must be float32")
-        weight = source_weight.astype(np.float16)
-        bias = pack_bias_o4(source_bias)
+        weight = source_weight.astype(storage_dtype)
+        bias = pack_bias_o4(source_bias, storage_dtype)
         packed_weight, _ = pack_matrix_i_o4(weight)
         builder.add(
             section_id=f"linear:{layer}:weight",
@@ -245,7 +255,7 @@ def build_package(source: Path, binary_name: str) -> tuple[bytes, dict[str, Any]
             "input_shape": [batch, 589, 256],
             "output_shape": [batch, 589, 7],
             "boundary_dtype": "float32",
-            "weight_dtype": "float16",
+            "weight_dtype": "float16" if storage_dtype == np.float16 else "float32",
             "accumulator_dtype": "float32",
         },
         "compute": {
@@ -267,12 +277,18 @@ def build_package(source: Path, binary_name: str) -> tuple[bytes, dict[str, Any]
     return binary, metadata
 
 
-def write_package(source: Path, output_dir: Path) -> tuple[Path, Path]:
+def write_package(
+    source: Path,
+    output_dir: Path,
+    storage_dtype: np.dtype[Any] = np.dtype(np.float16),
+) -> tuple[Path, Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
-    binary_name = "pyannote-segmentation-3.0-tail-webgpu-f16.bin"
-    binary, metadata = build_package(source, binary_name)
+    storage_dtype = np.dtype(storage_dtype)
+    precision = "f16" if storage_dtype == np.float16 else "f32"
+    binary_name = f"pyannote-segmentation-3.0-tail-webgpu-{precision}.bin"
+    binary, metadata = build_package(source, binary_name, storage_dtype)
     binary_path = output_dir / binary_name
-    metadata_path = output_dir / "pyannote-segmentation-3.0-tail-webgpu-f16.json"
+    metadata_path = output_dir / f"pyannote-segmentation-3.0-tail-webgpu-{precision}.json"
     binary_path.write_bytes(binary)
     metadata_path.write_text(json.dumps(metadata, indent=2) + "\n")
     return binary_path, metadata_path
@@ -282,8 +298,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source", type=Path)
     parser.add_argument("output_dir", type=Path)
+    parser.add_argument(
+        "--storage-precision",
+        choices=("f16", "f32"),
+        default="f16",
+    )
     args = parser.parse_args()
-    for path in write_package(args.source, args.output_dir):
+    storage_dtype = np.float16 if args.storage_precision == "f16" else np.float32
+    for path in write_package(args.source, args.output_dir, storage_dtype):
         print(path)
 
 

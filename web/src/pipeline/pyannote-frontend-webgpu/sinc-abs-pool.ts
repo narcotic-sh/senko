@@ -12,12 +12,17 @@ const POOL_FRAMES = 5_325;
 const OUTPUT_GROUPS = OUTPUT_CHANNELS / 4;
 const UNIFORM_BYTES = 64;
 const SIGNAL_TILE_ELEMENTS = 2_161;
-const FILTER_TILE_BYTES = KERNEL * 4 * 2;
+const FILTER_TILE_ELEMENTS = KERNEL * 4;
 
 export type PyannoteSincAccumulationSchedule = "serial" | "interleaved";
 
 export const PYANNOTE_SINC_WORKGROUP_STORAGE_BYTES =
-  SIGNAL_TILE_ELEMENTS * 4 + FILTER_TILE_BYTES;
+  SIGNAL_TILE_ELEMENTS * 4 + FILTER_TILE_ELEMENTS * 2;
+
+export const PYANNOTE_SINC_WORKGROUP_STORAGE_BYTES_BY_PRECISION = {
+  float16: PYANNOTE_SINC_WORKGROUP_STORAGE_BYTES,
+  float32: SIGNAL_TILE_ELEMENTS * 4 + FILTER_TILE_ELEMENTS * 4,
+} as const;
 
 export interface PyannoteSincStageBuffers {
   readonly waveform: GPUBuffer;
@@ -53,10 +58,12 @@ export class PyannoteSincAbsPoolKernel {
     gpuPackage: PyannoteFrontendGpuPackage,
     accumulationSchedule: PyannoteSincAccumulationSchedule = "interleaved",
   ): Promise<PyannoteSincAbsPoolKernel> {
+    const precision = gpuPackage.metadata.contract.intermediateDtype;
+    const workgroupStorageBytes =
+      PYANNOTE_SINC_WORKGROUP_STORAGE_BYTES_BY_PRECISION[precision];
     if (
       device.limits.maxComputeInvocationsPerWorkgroup < STATS_WORKGROUP_SIZE ||
-      device.limits.maxComputeWorkgroupStorageSize <
-        PYANNOTE_SINC_WORKGROUP_STORAGE_BYTES
+      device.limits.maxComputeWorkgroupStorageSize < workgroupStorageBytes
     ) {
       throw new Error("Raw pyannote Sinc stage exceeds this WebGPU device's compute limits");
     }
@@ -67,7 +74,7 @@ export class PyannoteSincAbsPoolKernel {
     });
     const sincModule = device.createShaderModule({
       label: `senko-pyannote-sinc-abs-pool-${accumulationSchedule}`,
-      code: sincAbsPoolWgsl(accumulationSchedule),
+      code: sincAbsPoolWgsl(precision, accumulationSchedule),
     });
     const [statsInfo, sincInfo] = await Promise.all([
       statsModule.getCompilationInfo(),
@@ -132,8 +139,13 @@ export class PyannoteSincAbsPoolKernel {
   createDispatch(buffers: PyannoteSincStageBuffers): PyannoteSincAbsPoolDispatch {
     this.assertAlive();
     const inputBytes = this.gpuPackage.metadata.contract.inputShape[0] * SAMPLES * 4;
+    const outputElementBytes =
+      this.gpuPackage.metadata.contract.intermediateDtype === "float16" ? 2 : 4;
     const outputBytes =
-      this.gpuPackage.metadata.contract.inputShape[0] * OUTPUT_CHANNELS * POOL_FRAMES * 2;
+      this.gpuPackage.metadata.contract.inputShape[0] *
+      OUTPUT_CHANNELS *
+      POOL_FRAMES *
+      outputElementBytes;
     if (buffers.waveform.size < inputBytes || buffers.pooled.size < outputBytes) {
       throw new Error("Pyannote Sinc stage buffer is smaller than its static B8 contract");
     }
@@ -251,6 +263,7 @@ export class PyannoteSincAbsPoolDispatch {
 }
 
 function validateSections(gpuPackage: PyannoteFrontendGpuPackage): void {
+  const precision = gpuPackage.metadata.contract.weightDtype;
   const affine = gpuPackage.section("instance_norm:0:affine");
   const weight = gpuPackage.section("conv:0:weight");
   const bias = gpuPackage.section("conv:0:bias");
@@ -260,13 +273,13 @@ function validateSections(gpuPackage: PyannoteFrontendGpuPackage): void {
     affine.logicalShape[0] !== 1 ||
     weight.kind !== "conv_weight" ||
     weight.layout !== "K_I_O4_O" ||
-    weight.dtype !== "float16" ||
+    weight.dtype !== precision ||
     weight.logicalShape[0] !== OUTPUT_CHANNELS ||
     weight.logicalShape[1] !== 1 ||
     weight.logicalShape[2] !== KERNEL ||
     bias.kind !== "conv_bias" ||
     bias.layout !== "O4" ||
-    bias.dtype !== "float16" ||
+    bias.dtype !== precision ||
     bias.logicalShape[0] !== OUTPUT_CHANNELS
   ) {
     throw new Error("Packed pyannote Sinc sections do not match the kernel contract");
@@ -347,9 +360,18 @@ fn main(
 }
 `;
 
-function sincAbsPoolWgsl(
-  accumulationSchedule: PyannoteSincAccumulationSchedule,
+export function sincAbsPoolWgsl(
+  precision: "float16" | "float32",
+  accumulationSchedule: PyannoteSincAccumulationSchedule = "interleaved",
 ): string {
+  const halfPrecision = precision === "float16";
+  const scalarType = halfPrecision ? "f16" : "f32";
+  const scalarBuffer = halfPrecision ? "HalfBuffer" : "FloatBuffer";
+  const vectorBuffer = halfPrecision ? "Half4Buffer" : "Float4Buffer";
+  const storageDeclarations = halfPrecision
+    ? `struct HalfBuffer { values: array<f16> };
+struct Half4Buffer { values: array<vec4<f16>> };`
+    : "struct Float4Buffer { values: array<vec4<f32>> };";
   const accumulate =
     accumulationSchedule === "interleaved"
       ? `var accumulated0 = vec4<f32>(bias.values[output_group]);
@@ -389,11 +411,10 @@ function sincAbsPoolWgsl(
     maximum = max(maximum, abs(accumulated));
   }`;
   return /* wgsl */ `
-enable f16;
+${halfPrecision ? "enable f16;" : ""}
 
 struct FloatBuffer { values: array<f32> };
-struct HalfBuffer { values: array<f16> };
-struct Half4Buffer { values: array<vec4<f16>> };
+${storageDeclarations}
 
 struct Parameters {
   batch: u32,
@@ -409,13 +430,13 @@ struct Parameters {
 
 @group(0) @binding(0) var<storage, read> waveform: FloatBuffer;
 @group(0) @binding(1) var<storage, read> statistics: FloatBuffer;
-@group(0) @binding(2) var<storage, read> filters: Half4Buffer;
-@group(0) @binding(3) var<storage, read> bias: Half4Buffer;
-@group(0) @binding(4) var<storage, read_write> pooled: HalfBuffer;
+@group(0) @binding(2) var<storage, read> filters: ${vectorBuffer};
+@group(0) @binding(3) var<storage, read> bias: ${vectorBuffer};
+@group(0) @binding(4) var<storage, read_write> pooled: ${scalarBuffer};
 @group(0) @binding(5) var<uniform> parameters: Parameters;
 
 var<workgroup> signal_tile: array<f32, ${SIGNAL_TILE_ELEMENTS}>;
-var<workgroup> filter_tile: array<vec4<f16>, 251>;
+var<workgroup> filter_tile: array<vec4<${scalarType}>, 251>;
 
 @compute @workgroup_size(64)
 fn main(
@@ -459,7 +480,7 @@ fn main(
     let output_index =
       (batch_index * parameters.output_channels + channel) * parameters.pool_frames
       + pooled_frame;
-    pooled.values[output_index] = f16(maximum[output_lane]);
+    pooled.values[output_index] = ${scalarType}(maximum[output_lane]);
   }
 }
 `;

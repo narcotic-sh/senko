@@ -253,8 +253,10 @@ function validateHeader(
 }
 
 function requireDeviceSupport(device: GPUDevice, metadata: CampPlusPackageMetadata): void {
-  if (!device.features.has("shader-f16")) {
-    throw new Error("Raw CAM++ requires WebGPU shader-f16 support");
+  for (const feature of metadata.contract.requiredWebGpuFeatures) {
+    if (!device.features.has(feature)) {
+      throw new Error(`Raw CAM++ ${metadata.contract.internalDtype} package requires ${feature}`);
+    }
   }
   if (metadata.binary.byteLength > device.limits.maxStorageBufferBindingSize) {
     throw new Error("CAM++ packed weights exceed maxStorageBufferBindingSize");

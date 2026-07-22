@@ -6,6 +6,7 @@ import {
   type ModelManifestIntegrity,
   type SelectedCampPlusDirect,
   type SelectedSegmentationSplit,
+  type WebGpuModelPrecision,
 } from "./model-manifest";
 import { RawCampPlusEmbeddingBackend } from "./raw-campplus-backend";
 import {
@@ -23,6 +24,8 @@ export interface BrowserModelSetOptions {
   readonly manifestIntegrity?: ModelManifestIntegrity;
   readonly vadBatchSize?: number;
   readonly embeddingBatchSize?: number;
+  /** Set false to exercise the complete FP32 fallback on shader-f16 hardware. */
+  readonly preferFloat16?: boolean;
   readonly warmupRuns?: number;
   readonly onProgress?: (progress: BrowserModelLoadProgress) => void;
 }
@@ -57,7 +60,7 @@ export class BrowserModelSet {
     readonly manifest: BrowserModelManifest,
     readonly vadVariant: SelectedSegmentationSplit,
     readonly embeddingVariant: SelectedCampPlusDirect,
-    readonly embeddingPrecision: "float16",
+    readonly precision: WebGpuModelPrecision,
     vad: RawWebGpuVadBackend,
     embedding: RawCampPlusEmbeddingBackend,
     readonly loadElapsedMs: number,
@@ -80,17 +83,6 @@ export class BrowserModelSet {
     );
     // Direct-WebGPU pyannote is currently packaged and tuned at B8.
     const vadBatchSize = options.vadBatchSize ?? 8;
-    const embeddingPrecision = "float16" as const;
-    const vadVariant = selectSegmentationSplit(
-      manifestUrl,
-      manifest.models.segmentation,
-      vadBatchSize,
-    );
-    const embeddingVariant = selectCampPlusDirect(
-      manifestUrl,
-      manifest.models.campplus,
-      options.embeddingBatchSize,
-    );
     const warmupRuns = options.warmupRuns ?? 1;
     let vadDevice: GPUDevice | undefined;
     let embeddingDevice: GPUDevice | undefined;
@@ -102,8 +94,27 @@ export class BrowserModelSet {
       // handles to the same high-performance physical adapter.
       const vadAdapter = await requestMaximumPerformanceAdapter(gpu);
       const embeddingAdapter = await requestMaximumPerformanceAdapter(gpu);
-      vadDevice = await requestMaximumPerformanceDevice(vadAdapter);
-      embeddingDevice = await requestMaximumPerformanceDevice(embeddingAdapter);
+      const precision = selectWebGpuModelPrecision(
+        [vadAdapter, embeddingAdapter],
+        options.preferFloat16 ?? true,
+      );
+      const vadVariant = selectSegmentationSplit(
+        manifestUrl,
+        manifest.models.segmentation,
+        vadBatchSize,
+        precision,
+      );
+      const embeddingVariant = selectCampPlusDirect(
+        manifestUrl,
+        manifest.models.campplus,
+        options.embeddingBatchSize,
+        precision,
+      );
+      vadDevice = await requestMaximumPerformanceDevice(vadAdapter, precision);
+      embeddingDevice = await requestMaximumPerformanceDevice(
+        embeddingAdapter,
+        precision,
+      );
 
       const directVadAssets = rawVadAssets(vadVariant);
       const loadVad = async (): Promise<RawWebGpuVadBackend> => {
@@ -169,7 +180,7 @@ export class BrowserModelSet {
         manifest,
         vadVariant,
         embeddingVariant,
-        embeddingPrecision,
+        precision,
         vadResult.value,
         embeddingResult.value,
         performance.now() - start,
@@ -245,12 +256,15 @@ export async function requestMaximumPerformanceAdapter(
 
 export async function requestMaximumPerformanceDevice(
   adapter: GPUAdapter,
+  precision: WebGpuModelPrecision = "float16",
 ): Promise<GPUDevice> {
-  if (!adapter.features.has("shader-f16")) {
+  if (precision === "float16" && !adapter.features.has("shader-f16")) {
     throw new Error("Direct WebGPU inference requires shader-f16 support");
   }
   return await adapter.requestDevice({
-    requiredFeatures: ["shader-f16"],
+    ...(precision === "float16"
+      ? { requiredFeatures: ["shader-f16"] as const }
+      : {}),
     requiredLimits: {
       maxBufferSize: adapter.limits.maxBufferSize,
       maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
@@ -263,4 +277,14 @@ export async function requestMaximumPerformanceDevice(
         adapter.limits.maxComputeWorkgroupsPerDimension,
     },
   });
+}
+
+export function selectWebGpuModelPrecision(
+  adapters: readonly GPUAdapter[],
+  preferFloat16 = true,
+): WebGpuModelPrecision {
+  return preferFloat16 &&
+    adapters.every((adapter) => adapter.features.has("shader-f16"))
+    ? "float16"
+    : "float32";
 }

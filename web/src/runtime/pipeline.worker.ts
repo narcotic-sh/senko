@@ -84,8 +84,9 @@ async function initialize(
         },
         warmupRuns: 1,
         vadBatchSize: 8,
+        preferFloat16: request.options.preferFloat16,
         // Direct WebGPU B16 is the measured CAM++ throughput/memory sweet spot.
-        // Together with B8 VAD, both resident devices own 64.7 MB explicitly.
+        // Precision-specific manifest records account the exact resident bytes.
         embeddingBatchSize: 16,
         onProgress: ({ message }) => {
           console.info(`[senko] ${message}`);
@@ -130,6 +131,7 @@ async function initialize(
       crossOriginIsolated: workerScope.crossOriginIsolated,
       sharedArrayBuffer: typeof SharedArrayBuffer !== "undefined",
       webgpu: true,
+      modelPrecision: modelSet.precision,
     },
   });
 }

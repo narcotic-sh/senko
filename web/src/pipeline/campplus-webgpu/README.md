@@ -51,6 +51,18 @@ source/payload hashes, and the whole-binary hash. It streams the 13,852,416-byte
 weight package directly into one GPU buffer, retaining no full weight copy on
 the JavaScript heap. Activations use one fixed, lifetime-aliased arena.
 
+## FP32 compatibility path
+
+When `shader-f16` is unavailable, the same graph, fusion boundaries, and
+119-dispatch schedule run with FP32 weights and activations. The precision
+transform removes `enable f16` and every `f16` type/conversion from the WGSL;
+the FP16 source strings and production selection are unchanged. On devices
+exposing at least 32 KiB of workgroup storage, FP32 retains the tile-4 FCM and
+transit geometry. At WebGPU's 16 KiB core floor it selects tile-2 FCM and the
+tile-2 512-channel transit cache, while retaining the direct tile-8 TDNN and
+direct tile-4 dense bottleneck. The B16 FP32 graph owns 78,587,392 explicit
+GPU-buffer bytes without optional timestamp-query buffers.
+
 ## Production batch and memory
 
 The pinned manifest and pipeline worker select B16. The graph explicitly owns
@@ -218,6 +230,8 @@ the compact oracle is 0.99998891.
 The retained browser diagnostics are intentionally separate from production:
 
 - `?raw-campplus-graph-diagnostic=1` runs the complete graph. Add
+  `&precision=float32` to load the shader-f16-free package and oracle, and add
+  `&core-workgroup-storage=1` to request the 16 KiB geometry. Add
   `&batch=16&fcm-variant=tile1-split`, `tile1-fold`, `tile2-fold`, or
   `tile4-fold` for the retained FCM A/B variants. Dense bottlenecks accept
   `&dense-bottleneck-variant=direct-tile1-wg128`, `direct-tile2-wg128`, or
@@ -245,7 +259,7 @@ root (after starting the production preview):
 
 ```bash
 node web/scripts/benchmark/run-browser-diagnostic.mjs \
-  --url 'http://127.0.0.1:4173/?raw-campplus-graph-diagnostic=1&batch=16&fcm-variant=tile4-fold&tdnn-variant=direct-tile8-wg96&dense-bottleneck-variant=direct-tile4-wg128&pointwise-transit-variant=chunk512' \
+  --url 'http://127.0.0.1:4173/?raw-campplus-graph-diagnostic=1&precision=float32&core-workgroup-storage=1&batch=16&fcm-variant=tile4-fold&tdnn-variant=direct-tile8-wg96&dense-bottleneck-variant=direct-tile4-wg128&pointwise-transit-variant=chunk512' \
   --remove-profile
 ```
 

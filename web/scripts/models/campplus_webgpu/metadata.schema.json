@@ -44,6 +44,30 @@
         "internal_dtype",
         "required_webgpu_features",
         "channel_tile"
+      ],
+      "properties": {
+        "internal_dtype": { "enum": ["float16", "float32"] },
+        "required_webgpu_features": {
+          "oneOf": [
+            { "const": [] },
+            { "const": ["shader-f16"] }
+          ]
+        },
+        "channel_tile": { "const": 4 }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "internal_dtype": { "const": "float16" },
+            "required_webgpu_features": { "const": ["shader-f16"] }
+          }
+        },
+        {
+          "properties": {
+            "internal_dtype": { "const": "float32" },
+            "required_webgpu_features": { "const": [] }
+          }
+        }
       ]
     },
     "inventory": { "type": "object" },

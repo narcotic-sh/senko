@@ -31,4 +31,22 @@ describe("parseCampPlusMetadata", () => {
     tdnn.convolution = { weight: "test-bias", bias: "test-bias" };
     expect(() => parseCampPlusMetadata(metadata)).toThrow(/missing or incompatible/);
   });
+
+  it("accepts a shader-f16-free FP32 package with FP32 convolution sections", () => {
+    const { metadata } = makeSyntheticCampPlusFixture();
+    const contract = metadata.contract as Record<string, unknown>;
+    contract.internal_dtype = "float32";
+    contract.required_webgpu_features = [];
+    const sections = metadata.sections as Array<Record<string, unknown>>;
+    sections[0]!.dtype = "float32";
+    sections[0]!.byte_length = 64;
+    sections[1]!.dtype = "float32";
+    sections[1]!.byte_length = 16;
+
+    const parsed = parseCampPlusMetadata(metadata);
+    expect(parsed.contract).toMatchObject({
+      internalDtype: "float32",
+      requiredWebGpuFeatures: [],
+    });
+  });
 });

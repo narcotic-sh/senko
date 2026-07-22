@@ -6,6 +6,7 @@ import type {
   PackedConvolutionRef,
 } from "./metadata";
 import { CampPlusGpuPackage } from "./package";
+import { campPlusStorageBytes, campPlusStorageWgsl } from "./storage";
 
 const CACHED_WORKGROUP_SIZE = 128;
 const MAX_CACHED_WEIGHT_VECTORS = 1600;
@@ -191,6 +192,9 @@ export class PackedBctConvKernel {
     variant: PackedBctConvVariant = DEFAULT_PACKED_BCT_CONV_VARIANT,
   ): Promise<PackedBctConvKernel> {
     const configuration = packedBctConvVariantConfiguration(variant);
+    const storageBytes = campPlusStorageBytes(
+      gpuPackage.metadata.contract.internalDtype,
+    );
     if (
       device.limits.maxComputeInvocationsPerWorkgroup < configuration.workgroupSize ||
       device.limits.maxComputeWorkgroupSizeX < configuration.workgroupSize
@@ -201,22 +205,24 @@ export class PackedBctConvKernel {
     }
     if (
       device.limits.maxComputeWorkgroupStorageSize <
-      configuration.workgroupStorageBytes
+      configuration.workgroupStorageBytes * (storageBytes / 2)
     ) {
       throw new Error(
-        `Raw CAM++ ${variant} requires ${configuration.workgroupStorageBytes} workgroup bytes`,
+        `Raw CAM++ ${variant} requires ${configuration.workgroupStorageBytes * (storageBytes / 2)} workgroup bytes`,
       );
     }
     const label = `senko-campplus-packed-bct-conv-${variant}`;
     const module = device.createShaderModule({
       label,
-      code:
+      code: campPlusStorageWgsl(
         configuration.weightSource === "workgroup-cache"
           ? PACKED_BCT_CONV_WGSL
           : packedBctDirectWgsl(
               configuration.outputTile,
               configuration.workgroupSize,
             ),
+        gpuPackage.metadata.contract.internalDtype,
+      ),
     });
     const compilation = await module.getCompilationInfo();
     const errors = compilation.messages.filter((message) => message.type === "error");
@@ -275,7 +281,10 @@ export class PackedBctConvKernel {
     const weight = this.gpuPackage.section(descriptor.convolution.weight);
     const bias = this.gpuPackage.section(descriptor.convolution.bias);
     validateConvolutionSections(weight, bias, descriptor);
-    validateDescriptor(descriptor, weight, this.arena.byteLength);
+    const storageBytes = campPlusStorageBytes(
+      this.gpuPackage.metadata.contract.internalDtype,
+    );
+    validateDescriptor(descriptor, weight, this.arena.byteLength, storageBytes);
     const affine =
       descriptor.preactivationAffine === undefined
         ? undefined
@@ -307,8 +316,8 @@ export class PackedBctConvKernel {
     const inputChannelOffset = descriptor.inputChannelOffset ?? 0;
     const outputChannelOffset = descriptor.outputChannelOffset ?? 0;
     const parameters = new Uint32Array([
-      descriptor.input.byteOffset / 2,
-      descriptor.output.byteOffset / 2,
+      descriptor.input.byteOffset / storageBytes,
+      descriptor.output.byteOffset / storageBytes,
       descriptor.batchSize,
       descriptor.inputChannels,
       outputChannels,
@@ -416,6 +425,7 @@ function validateDescriptor(
   descriptor: PackedBctConvDescriptor,
   weight: CampPlusPackedSection,
   arenaBytes: number,
+  storageBytes: 2 | 4,
 ): void {
   const integerFields = [
     descriptor.batchSize,
@@ -471,8 +481,10 @@ function validateDescriptor(
   ) {
     throw new RangeError(`${descriptor.label} has an invalid physical channel stride`);
   }
-  const inputBytes = descriptor.batchSize * inputStorageChannels * descriptor.inputFrames * 2;
-  const outputBytes = descriptor.batchSize * outputStorageChannels * descriptor.outputFrames * 2;
+  const inputBytes =
+    descriptor.batchSize * inputStorageChannels * descriptor.inputFrames * storageBytes;
+  const outputBytes =
+    descriptor.batchSize * outputStorageChannels * descriptor.outputFrames * storageBytes;
   validateArenaRange(descriptor.input, inputBytes, arenaBytes);
   validateArenaRange(descriptor.output, outputBytes, arenaBytes);
   if (rangesOverlap(descriptor.input, descriptor.output)) {

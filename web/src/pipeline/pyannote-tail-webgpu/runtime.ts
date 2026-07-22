@@ -51,12 +51,15 @@ export class RawPyannoteTail {
     metadataUrl: string,
     fetchAsset: typeof fetch = fetch,
   ): Promise<RawPyannoteTail> {
-    if (!device.features.has("shader-f16")) {
-      throw new Error("Raw pyannote tail requires shader-f16 support");
-    }
     const metadataResponse = await fetchAsset(metadataUrl);
     if (!metadataResponse.ok) throw new Error(`Raw tail metadata HTTP ${metadataResponse.status}`);
     const metadata = parsePyannoteTailMetadata(await metadataResponse.json());
+    if (
+      metadata.weightPrecision === "float16" &&
+      !device.features.has("shader-f16")
+    ) {
+      throw new Error("FP16 raw pyannote tail requires shader-f16 support");
+    }
     const binaryUrl = new URL(
       metadata.binary.file,
       new URL(metadataUrl, globalThis.location?.href ?? "http://localhost/"),
@@ -66,8 +69,8 @@ export class RawPyannoteTail {
     const bytes = new Uint8Array(await binaryResponse.arrayBuffer());
     validateBinary(bytes, metadata);
     const shader = device.createShaderModule({
-      label: "senko-pyannote-raw-tail",
-      code: TAIL_WGSL,
+      label: `senko-pyannote-raw-tail-${metadata.weightPrecision}`,
+      code: pyannoteTailWgsl(metadata.weightPrecision),
     });
     const info = await shader.getCompilationInfo();
     const errors = info.messages.filter((message) => message.type === "error");
@@ -104,13 +107,14 @@ export class RawPyannoteTail {
     device.queue.writeBuffer(weightsBuffer, 0, bytes);
     const parameters = new ArrayBuffer(UNIFORM_BYTES);
     const view = new DataView(parameters);
+    const weightVectorBytes = metadata.weightPrecision === "float16" ? 8 : 16;
     const offsets = [
-      section(metadata, "linear:0:weight").byteOffset / 8,
-      section(metadata, "linear:0:bias").byteOffset / 8,
-      section(metadata, "linear:1:weight").byteOffset / 8,
-      section(metadata, "linear:1:bias").byteOffset / 8,
-      section(metadata, "linear:2:weight").byteOffset / 8,
-      section(metadata, "linear:2:bias").byteOffset / 8,
+      section(metadata, "linear:0:weight").byteOffset / weightVectorBytes,
+      section(metadata, "linear:0:bias").byteOffset / weightVectorBytes,
+      section(metadata, "linear:1:weight").byteOffset / weightVectorBytes,
+      section(metadata, "linear:1:bias").byteOffset / weightVectorBytes,
+      section(metadata, "linear:2:weight").byteOffset / weightVectorBytes,
+      section(metadata, "linear:2:bias").byteOffset / weightVectorBytes,
     ];
     [metadata.batch, 589, 256, 128, 7, ...offsets].forEach((value, index) =>
       view.setUint32(index * 4, value, true),
@@ -227,10 +231,16 @@ function hex(bytes: Uint8Array): string {
   return result;
 }
 
-const TAIL_WGSL = /* wgsl */ `
-enable f16;
+export function pyannoteTailWgsl(
+  precision: "float16" | "float32",
+): string {
+  const halfPrecision = precision === "float16";
+  return /* wgsl */ `
+${halfPrecision ? "enable f16;" : ""}
 struct FloatBuffer { values: array<f32> };
-struct Half4Buffer { values: array<vec4<f16>> };
+struct WeightBuffer {
+  values: array<${halfPrecision ? "vec4<f16>" : "vec4<f32>"}>
+};
 struct Parameters {
   batch: u32,
   frames: u32,
@@ -246,7 +256,7 @@ struct Parameters {
   leaky_alpha: f32,
 };
 @group(0) @binding(0) var<storage, read> recurrent: FloatBuffer;
-@group(0) @binding(1) var<storage, read> packed: Half4Buffer;
+@group(0) @binding(1) var<storage, read> packed: WeightBuffer;
 @group(0) @binding(2) var<storage, read_write> logits: FloatBuffer;
 @group(0) @binding(3) var<uniform> parameters: Parameters;
 var<workgroup> input_cache: array<f32, 256>;
@@ -309,3 +319,6 @@ fn main(
   }
 }
 `;
+}
+
+export const TAIL_WGSL = pyannoteTailWgsl("float16");

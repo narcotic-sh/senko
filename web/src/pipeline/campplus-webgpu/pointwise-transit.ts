@@ -3,6 +3,7 @@
 import { CampPlusActivationArena, type CampPlusArenaSlice } from "./arena";
 import type { CampPlusPackedSection, PackedConvolutionRef } from "./metadata";
 import { CampPlusGpuPackage } from "./package";
+import { campPlusStorageBytes, campPlusStorageWgsl } from "./storage";
 
 const WORKGROUP_SIZE = 128;
 const MAX_INPUT_CHANNELS = 1024;
@@ -95,6 +96,8 @@ export class PointwiseTransitKernels {
     accumulation: PointwiseTransitAccumulation =
       DEFAULT_POINTWISE_TRANSIT_ACCUMULATION,
   ): Promise<PointwiseTransitKernels> {
+    const storageDtype = gpuPackage.metadata.contract.internalDtype;
+    const storageBytes = campPlusStorageBytes(storageDtype);
     if (
       device.limits.maxComputeWorkgroupStorageSize <
       POINTWISE_TRANSIT_REQUIRED_WORKGROUP_STORAGE_BYTES
@@ -117,24 +120,37 @@ export class PointwiseTransitKernels {
         },
       ],
     });
+    let effectiveVariant = variant;
+    let tile2Bytes =
+      (effectiveVariant === "chunk512" ? 512 : 1024) * 2 * 4 * storageBytes;
+    if (
+      tile2Bytes > device.limits.maxComputeWorkgroupStorageSize &&
+      storageDtype === "float32" &&
+      effectiveVariant === "full-cache"
+    ) {
+      effectiveVariant = "chunk512";
+      tile2Bytes = 512 * 2 * 4 * storageBytes;
+    }
+    if (tile2Bytes > device.limits.maxComputeWorkgroupStorageSize) {
+      throw new Error(
+        `CAM++ ${storageDtype} tiled transits require ${tile2Bytes} workgroup bytes`,
+      );
+    }
     const outputTile: 2 | 4 =
-      variant === "chunk512" ||
-      device.limits.maxComputeWorkgroupStorageSize >=
-        POINTWISE_TRANSIT_TILE4_WORKGROUP_STORAGE_BYTES
-        ? 4
-        : 2;
+      device.limits.maxComputeWorkgroupStorageSize >= tile2Bytes * 2 ? 4 : 2;
     const pipeline = await createPipeline(
       device,
       layout,
       outputTile,
-      variant,
+      effectiveVariant,
       accumulation,
+      storageDtype,
     );
     return new PointwiseTransitKernels(
       device,
       gpuPackage,
       arena,
-      variant,
+      effectiveVariant,
       accumulation,
       outputTile,
       pipeline,
@@ -143,7 +159,10 @@ export class PointwiseTransitKernels {
   }
 
   createDispatch(descriptor: PointwiseTransitDescriptor): PointwiseTransitDispatch {
-    validateDescriptor(descriptor, this.arena.byteLength);
+    const storageBytes = campPlusStorageBytes(
+      this.gpuPackage.metadata.contract.internalDtype,
+    );
+    validateDescriptor(descriptor, this.arena.byteLength, storageBytes);
     const weight = this.gpuPackage.section(descriptor.convolution.weight);
     const bias = this.gpuPackage.section(descriptor.convolution.bias);
     const affine = this.gpuPackage.section(descriptor.preactivationAffine);
@@ -154,8 +173,8 @@ export class PointwiseTransitKernels {
       throw new Error(`${descriptor.label} output groups are not divisible by tile ${outputTile}`);
     }
     const parameters = new Uint32Array([
-      descriptor.input.byteOffset / 2,
-      descriptor.output.byteOffset / 2,
+      descriptor.input.byteOffset / storageBytes,
+      descriptor.output.byteOffset / storageBytes,
       descriptor.batchSize,
       descriptor.inputChannels,
       descriptor.outputChannels,
@@ -214,6 +233,7 @@ export class PointwiseTransitKernels {
 function validateDescriptor(
   descriptor: PointwiseTransitDescriptor,
   arenaBytes: number,
+  storageBytes: 2 | 4,
 ): void {
   if (
     !Number.isSafeInteger(descriptor.batchSize) ||
@@ -234,9 +254,9 @@ function validateDescriptor(
     throw new RangeError(`${descriptor.label} has an invalid tiled-transit contract`);
   }
   const inputBytes =
-    descriptor.batchSize * descriptor.inputStorageChannels * descriptor.frames * 2;
+    descriptor.batchSize * descriptor.inputStorageChannels * descriptor.frames * storageBytes;
   const outputBytes =
-    descriptor.batchSize * descriptor.outputStorageChannels * descriptor.frames * 2;
+    descriptor.batchSize * descriptor.outputStorageChannels * descriptor.frames * storageBytes;
   validateSlice(descriptor.input, inputBytes, arenaBytes);
   validateSlice(descriptor.output, outputBytes, arenaBytes);
   if (rangesOverlap(descriptor.input, descriptor.output)) {
@@ -310,14 +330,17 @@ async function createPipeline(
   outputTile: 2 | 4,
   variant: PointwiseTransitVariant,
   accumulation: PointwiseTransitAccumulation,
+  storageDtype: "float16" | "float32",
 ): Promise<GPUComputePipeline> {
   const label = `senko-campplus-pointwise-transit-tile${outputTile}-${variant}-${accumulation}`;
   const module = device.createShaderModule({
     label,
-    code:
+    code: campPlusStorageWgsl(
       variant === "chunk512"
         ? pointwiseTransitChunk512Wgsl(outputTile, accumulation)
         : pointwiseTransitWgsl(outputTile, accumulation),
+      storageDtype,
+    ),
   });
   const compilation = await module.getCompilationInfo();
   const errors = compilation.messages.filter((message) => message.type === "error");

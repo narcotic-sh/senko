@@ -3,6 +3,7 @@
 import { CampPlusActivationArena, type CampPlusArenaSlice } from "./arena";
 import type { CampPlusPackedSection, PackedConvolutionRef } from "./metadata";
 import { CampPlusGpuPackage } from "./package";
+import { campPlusStorageBytes, campPlusStorageWgsl } from "./storage";
 
 const WORKGROUP_SIZE = 128;
 const INPUT_CHANNELS = 512;
@@ -91,7 +92,10 @@ export class FinalStatsDenseKernel {
     });
     const module = device.createShaderModule({
       label: "senko-campplus-final-stats-dense",
-      code: FINAL_STATS_DENSE_WGSL,
+      code: campPlusStorageWgsl(
+        FINAL_STATS_DENSE_WGSL,
+        gpuPackage.metadata.contract.internalDtype,
+      ),
     });
     const compilation = await module.getCompilationInfo();
     const errors = compilation.messages.filter((message) => message.type === "error");
@@ -112,6 +116,9 @@ export class FinalStatsDenseKernel {
     const weight = this.gpuPackage.section(descriptor.dense.weight);
     const bias = this.gpuPackage.section(descriptor.dense.bias);
     const affine = this.gpuPackage.section(descriptor.outputAffine);
+    const storageBytes = campPlusStorageBytes(
+      this.gpuPackage.metadata.contract.internalDtype,
+    );
     validateSections(weight, bias, affine);
     if (
       !Number.isSafeInteger(descriptor.batchSize) ||
@@ -122,7 +129,7 @@ export class FinalStatsDenseKernel {
       throw new RangeError(`${descriptor.label} has an invalid final tensor contract`);
     }
     const inputBytes =
-      descriptor.batchSize * descriptor.inputStorageChannels * FRAMES * 2;
+      descriptor.batchSize * descriptor.inputStorageChannels * FRAMES * storageBytes;
     if (
       descriptor.input.byteOffset % 256 !== 0 ||
       descriptor.input.byteLength < inputBytes ||
@@ -135,7 +142,7 @@ export class FinalStatsDenseKernel {
       throw new RangeError(`${descriptor.label} final FP32 output buffer is too small`);
     }
     const parameters = new Uint32Array([
-      descriptor.input.byteOffset / 2,
+      descriptor.input.byteOffset / storageBytes,
       descriptor.batchSize,
       INPUT_CHANNELS,
       descriptor.inputStorageChannels,

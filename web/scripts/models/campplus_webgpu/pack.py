@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pack the static FP16 CAM++ ONNX graph for direct WGSL consumption.
+"""Pack the static CAM++ ONNX graph for direct WGSL consumption.
 
 The package deliberately contains no ONNX protobuf. Convolution weights are
 retiled into 4x4 input/output-channel blocks, inference BatchNorm parameters
@@ -78,22 +78,22 @@ def _little_endian_bytes(array: np.ndarray) -> bytes:
 
 
 def pack_conv_oihw4(weight: np.ndarray) -> tuple[np.ndarray, list[int]]:
-    """Retile ONNX [O,I,spatial...] weights for vec4<f16> WGSL loads.
+    """Retile ONNX [O,I,spatial...] weights for vec4 WGSL loads.
 
     The physical order is [K, ceil(O/4), ceil(I/4), I-lane, O-lane]. A shader
-    loads four consecutive output weights for one input lane as vec4<f16> and
+    loads four consecutive output weights for one input lane as a vec4 and
     accumulates four output channels together.
     """
 
-    if weight.dtype != np.float16:
-        raise TypeError(f"CAM++ convolution weights must be float16, got {weight.dtype}")
+    if weight.dtype not in (np.dtype(np.float16), np.dtype(np.float32)):
+        raise TypeError(f"CAM++ convolution weights must be floating point, got {weight.dtype}")
     if weight.ndim not in (3, 4):
         raise ValueError(f"expected Conv1d/Conv2d OIHW tensor, got {weight.shape}")
     out_channels, in_channels = map(int, weight.shape[:2])
     kernel_elements = math.prod(weight.shape[2:])
     padded_out = align_up(out_channels, CHANNEL_TILE)
     padded_in = align_up(in_channels, CHANNEL_TILE)
-    padded = np.zeros((padded_out, padded_in, kernel_elements), dtype=np.float16)
+    padded = np.zeros((padded_out, padded_in, kernel_elements), dtype=weight.dtype)
     padded[:out_channels, :in_channels] = weight.reshape(
         out_channels, in_channels, kernel_elements
     )
@@ -533,16 +533,17 @@ def _activation_plan(
     shapes: dict[str, list[int]],
     binary_bytes: int,
     source_batch: int,
+    storage_element_bytes: int = 2,
 ) -> dict[str, Any]:
     nodes = _node_by_name(graph)
 
     def output_bytes(name: str) -> int:
         output = nodes[name].output[0]
-        return math.prod(shapes[output]) * 2
+        return math.prod(shapes[output]) * storage_element_bytes
 
     def input_bytes(name: str) -> int:
         value = nodes[name].input[0]
-        return math.prod(shapes[value]) * 2
+        return math.prod(shapes[value]) * storage_element_bytes
 
     residuals = [
         "/head/layer1/layer1.0",
@@ -555,7 +556,8 @@ def _activation_plan(
     head_candidates.append(
         {
             "site": first,
-            "bytes": math.prod(shapes[nodes[first].input[0]]) * 2 + output_bytes(first),
+            "bytes": math.prod(shapes[nodes[first].input[0]]) * storage_element_bytes
+            + output_bytes(first),
         }
     )
     for prefix in residuals:
@@ -578,7 +580,7 @@ def _activation_plan(
             if node.name.startswith(f"/xvector/block{block_index}/Concat")
         ]
         final_concat = concats[-1]
-        slab = math.prod(shapes[final_concat.output[0]]) * 2
+        slab = math.prod(shapes[final_concat.output[0]]) * storage_element_bytes
         scratch_name = f"/xvector/block{block_index}/tdnnd1/linear1/Conv"
         scratch = output_bytes(scratch_name)
         dense_candidates.append(
@@ -623,7 +625,7 @@ def _activation_plan(
         "dense_backbone_peak_bytes": dense_peak,
         "frontend_microbatch_tradeoffs": microbatch,
         "assumptions": [
-            "FP16 activations/convolution weights, FP32 BatchNorm affine, and FP32 final embeddings.",
+            f"{'FP16' if storage_element_bytes == 2 else 'FP32'} activations/convolution weights, FP32 BatchNorm affine, and FP32 final embeddings.",
             "Residual shortcut convolution/add/ReLU is fused into conv2 and has no output buffer.",
             "Dense blocks append into one maximum-channel slab; Concat is a metadata update.",
             "One reusable 128-channel bottleneck scratch tensor is retained.",
@@ -632,7 +634,15 @@ def _activation_plan(
     }
 
 
-def build_package(source: Path, binary_name: str) -> tuple[bytes, dict[str, Any]]:
+def build_package(
+    source: Path,
+    binary_name: str,
+    internal_dtype: str = "float16",
+) -> tuple[bytes, dict[str, Any]]:
+    if internal_dtype not in ("float16", "float32"):
+        raise ValueError("internal_dtype must be float16 or float32")
+    storage_dtype = np.dtype(np.float16 if internal_dtype == "float16" else np.float32)
+    storage_element_bytes = storage_dtype.itemsize
     source_bytes = source.read_bytes()
     source_hash = sha256_bytes(source_bytes)
     model = onnx.load_model_from_string(source_bytes)
@@ -668,9 +678,13 @@ def build_package(source: Path, binary_name: str) -> tuple[bytes, dict[str, Any]
         if len(node.input) < 2 or node.input[1] not in static:
             raise ValueError(f"dynamic convolution weight in {node.name}")
         weight = np.asarray(static[node.input[1]])
-        if weight.dtype != np.float16:
-            raise ValueError(f"non-FP16 convolution weight {node.input[1]}: {weight.dtype}")
-        packed_weight, packed_shape = pack_conv_oihw4(weight)
+        if weight.dtype not in (np.dtype(np.float16), np.dtype(np.float32)):
+            raise ValueError(
+                f"non-floating convolution weight {node.input[1]}: {weight.dtype}"
+            )
+        packed_weight, packed_shape = pack_conv_oihw4(
+            weight.astype(storage_dtype, copy=False)
+        )
         weight_id = builder.add(
             section_id=f"conv:{node.name}:weight",
             kind="conv_weight",
@@ -682,15 +696,15 @@ def build_package(source: Path, binary_name: str) -> tuple[bytes, dict[str, Any]
         )
         out_channels = int(weight.shape[0])
         if len(node.input) >= 3 and node.input[2]:
-            bias_source = np.asarray(static[node.input[2]], dtype=np.float16).reshape(-1)
+            bias_source = np.asarray(static[node.input[2]], dtype=storage_dtype).reshape(-1)
             bias_names = [node.input[2]]
         else:
-            bias_source = np.zeros(out_channels, dtype=np.float16)
+            bias_source = np.zeros(out_channels, dtype=storage_dtype)
             bias_names = []
         padded_bias = np.pad(
             bias_source,
             (0, align_up(out_channels, CHANNEL_TILE) - out_channels),
-        ).astype(np.float16, copy=False)
+        ).astype(storage_dtype, copy=False)
         bias_id = builder.add(
             section_id=f"conv:{node.name}:bias",
             kind="conv_bias",
@@ -773,7 +787,13 @@ def build_package(source: Path, binary_name: str) -> tuple[bytes, dict[str, Any]
     static_names = set(static)
     liveness = _graph_liveness(graph, shapes, types, static_names)
     fused_program = _fused_program(graph, shapes, conv_records, bn_records)
-    activation_plan = _activation_plan(graph, shapes, len(binary), input_shape[0])
+    activation_plan = _activation_plan(
+        graph,
+        shapes,
+        len(binary),
+        input_shape[0],
+        storage_element_bytes,
+    )
     total_macs = sum(conv_macs.values())
     metadata: dict[str, Any] = {
         "schema": "senko.campplus.webgpu-pack",
@@ -804,8 +824,9 @@ def build_package(source: Path, binary_name: str) -> tuple[bytes, dict[str, Any]
         "contract": {
             "input": {"name": input_name, "shape": input_shape, "dtype": "float32"},
             "output": {"name": output_name, "shape": output_shape, "dtype": "float32"},
-            "internal_dtype": "float16",
-            "required_webgpu_features": ["shader-f16"],
+            "internal_dtype": internal_dtype,
+            "required_webgpu_features":
+                ["shader-f16"] if internal_dtype == "float16" else [],
             "channel_tile": CHANNEL_TILE,
             "weights_are_batch_independent": True,
         },
@@ -870,6 +891,12 @@ def main(argv: list[str] | None = None) -> int:
         default=Path("web/public/models/campplus-t150-b32-fp16.onnx"),
     )
     parser.add_argument(
+        "--internal-dtype",
+        choices=("float16", "float32"),
+        default="float16",
+        help="packed convolution/activation storage type",
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         default=Path(".research/campplus-webgpu-pack/campplus-t150-webgpu-fp16.bin"),
@@ -885,7 +912,11 @@ def main(argv: list[str] | None = None) -> int:
         help="verify existing output is byte-for-byte reproducible without writing",
     )
     args = parser.parse_args(argv)
-    binary, metadata = build_package(args.input, args.output.name)
+    binary, metadata = build_package(
+        args.input,
+        args.output.name,
+        args.internal_dtype,
+    )
     _write_or_check(args.output, binary, args.check)
     _write_or_check(args.metadata, _json_bytes(metadata), args.check)
     summary = {

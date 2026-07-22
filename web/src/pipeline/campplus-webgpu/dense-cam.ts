@@ -8,6 +8,7 @@ import type {
   PackedConvolutionRef,
 } from "./metadata";
 import { CampPlusGpuPackage } from "./package";
+import { campPlusStorageBytes, campPlusStorageWgsl } from "./storage";
 
 const WORKGROUP_SIZE = 128;
 const BOTTLENECK_CHANNELS = 128;
@@ -94,6 +95,22 @@ export interface DenseBottleneckDescriptor {
   readonly weightSource?: DenseBottleneckWeightSource;
 }
 
+export function denseBottleneckRequiredWorkgroupStorageBytes(
+  outputTile: DenseBottleneckOutputTile,
+  weightSource: DenseBottleneckWeightSource,
+  storageDtype: "float16" | "float32",
+): number {
+  const reductionBytes = WORKGROUP_SIZE * outputTile * 16;
+  if (weightSource === "direct") return reductionBytes;
+  return (
+    MAX_DENSE_INPUT_CHANNELS *
+      outputTile *
+      4 *
+      campPlusStorageBytes(storageDtype) +
+    reductionBytes
+  );
+}
+
 export interface DenseLocalCamDescriptor {
   readonly label: string;
   readonly layer: CamDenseLayerMetadata;
@@ -156,6 +173,7 @@ export class DenseCamKernels {
     gpuPackage: CampPlusGpuPackage,
     arena: CampPlusActivationArena,
   ): Promise<DenseCamKernels> {
+    const storageDtype = gpuPackage.metadata.contract.internalDtype;
     if (device.limits.maxComputeInvocationsPerWorkgroup < WORKGROUP_SIZE) {
       throw new Error(`CAM++ dense kernels require ${WORKGROUP_SIZE} workgroup lanes`);
     }
@@ -179,20 +197,30 @@ export class DenseCamKernels {
       label: "senko-campplus-dense-local-cam-bindings",
       entries: storageEntries(7),
     });
-    const defaultConfiguration = denseBottleneckVariantConfiguration(
+    const defaultVariantConfiguration = denseBottleneckVariantConfiguration(
       DEFAULT_DENSE_BOTTLENECK_VARIANT,
     );
+    const defaultConfiguration: DenseBottleneckVariantConfiguration = {
+      ...defaultVariantConfiguration,
+      accumulation:
+        storageDtype === "float32"
+          ? "float32"
+          : defaultVariantConfiguration.accumulation,
+    };
     const [bottleneckPipeline, localCamPipeline] = await Promise.all([
       createCheckedPipeline(
         device,
         `senko-campplus-dense-bottleneck-${DEFAULT_DENSE_BOTTLENECK_VARIANT}`,
-        denseBottleneckPipelineWgsl(defaultConfiguration),
+        campPlusStorageWgsl(
+          denseBottleneckPipelineWgsl(defaultConfiguration),
+          storageDtype,
+        ),
         bottleneckLayout,
       ),
       createCheckedPipeline(
         device,
         "senko-campplus-dense-local-cam",
-        DENSE_LOCAL_CAM_WGSL,
+        campPlusStorageWgsl(DENSE_LOCAL_CAM_WGSL, storageDtype),
         localCamLayout,
       ),
     ]);
@@ -242,14 +270,18 @@ export class DenseCamKernels {
     if (outputTile === 4 && weightSource !== "direct") {
       throw new Error("The tile-4 CAM++ bottleneck requires direct weights");
     }
+    const requiredWorkgroupStorageBytes =
+      denseBottleneckRequiredWorkgroupStorageBytes(
+        outputTile,
+        weightSource,
+        this.gpuPackage.metadata.contract.internalDtype,
+      );
     if (
-      outputTile === 2 &&
-      weightSource === "workgroup-cache" &&
       this.device.limits.maxComputeWorkgroupStorageSize <
-        DENSE_CAM_TILE2_WORKGROUP_STORAGE_BYTES
+      requiredWorkgroupStorageBytes
     ) {
       throw new Error(
-        `The tile-2 CAM++ diagnostic requires ${DENSE_CAM_TILE2_WORKGROUP_STORAGE_BYTES} workgroup bytes`,
+        `The tile-${outputTile} CAM++ ${weightSource} diagnostic requires ${requiredWorkgroupStorageBytes} workgroup bytes`,
       );
     }
     const key = bottleneckPipelineKey(
@@ -262,19 +294,25 @@ export class DenseCamKernels {
     const pipeline = await createCheckedPipeline(
       this.device,
       `senko-campplus-dense-bottleneck-tile${outputTile}-wg${workgroupSize}-${weightSource}-${accumulation}`,
-      denseBottleneckPipelineWgsl({
-        accumulation,
-        outputTile,
-        workgroupSize,
-        weightSource,
-      }),
+      campPlusStorageWgsl(
+        denseBottleneckPipelineWgsl({
+          accumulation,
+          outputTile,
+          workgroupSize,
+          weightSource,
+        }),
+        this.gpuPackage.metadata.contract.internalDtype,
+      ),
       this.bottleneckLayout,
     );
     this.bottleneckPipelines.set(key, pipeline);
   }
 
   createBottleneckDispatch(descriptor: DenseBottleneckDescriptor): DenseCamDispatch {
-    validateDenseLayout(descriptor, this.arena.byteLength);
+    const storageBytes = campPlusStorageBytes(
+      this.gpuPackage.metadata.contract.internalDtype,
+    );
+    validateDenseLayout(descriptor, this.arena.byteLength, storageBytes);
     const weight = this.convSection(
       descriptor.layer.bottleneck,
       BOTTLENECK_CHANNELS,
@@ -298,9 +336,9 @@ export class DenseCamKernels {
     validateBias(bias, BOTTLENECK_CHANNELS);
     validateAffine(affine, descriptor.layer.inputChannels);
     const parameters = new Uint32Array([
-      descriptor.slab.byteOffset / 2,
-      descriptor.scratch.byteOffset / 2,
-      descriptor.doubledMean.byteOffset / 2,
+      descriptor.slab.byteOffset / storageBytes,
+      descriptor.scratch.byteOffset / storageBytes,
+      descriptor.doubledMean.byteOffset / storageBytes,
       descriptor.batchSize,
       descriptor.layer.inputChannels,
       descriptor.slabChannels,
@@ -342,7 +380,10 @@ export class DenseCamKernels {
   }
 
   createLocalCamDispatch(descriptor: DenseLocalCamDescriptor): DenseCamDispatch {
-    validateDenseLayout(descriptor, this.arena.byteLength);
+    const storageBytes = campPlusStorageBytes(
+      this.gpuPackage.metadata.contract.internalDtype,
+    );
+    validateDenseLayout(descriptor, this.arena.byteLength, storageBytes);
     if (descriptor.layer.appendChannel + CAM_OUTPUT_CHANNELS > descriptor.slabChannels) {
       throw new Error(`${descriptor.label} append exceeds its dense slab`);
     }
@@ -371,9 +412,9 @@ export class DenseCamKernels {
     validateBias(attention1Bias, 64);
     validateBias(attention2Bias, CAM_OUTPUT_CHANNELS);
     const parameters = new Uint32Array([
-      descriptor.scratch.byteOffset / 2,
-      descriptor.doubledMean.byteOffset / 2,
-      descriptor.slab.byteOffset / 2,
+      descriptor.scratch.byteOffset / storageBytes,
+      descriptor.doubledMean.byteOffset / storageBytes,
+      descriptor.slab.byteOffset / storageBytes,
       descriptor.batchSize,
       descriptor.slabChannels,
       descriptor.layer.frames,
@@ -440,6 +481,7 @@ export class DenseCamKernels {
 function validateDenseLayout(
   descriptor: DenseBottleneckDescriptor | DenseLocalCamDescriptor,
   arenaBytes: number,
+  storageBytes: 2 | 4,
 ): void {
   const { layer } = descriptor;
   if (
@@ -456,17 +498,17 @@ function validateDenseLayout(
   }
   validateSlice(
     descriptor.slab,
-    descriptor.batchSize * descriptor.slabChannels * layer.frames * 2,
+    descriptor.batchSize * descriptor.slabChannels * layer.frames * storageBytes,
     arenaBytes,
   );
   validateSlice(
     descriptor.scratch,
-    descriptor.batchSize * BOTTLENECK_CHANNELS * layer.frames * 2,
+    descriptor.batchSize * BOTTLENECK_CHANNELS * layer.frames * storageBytes,
     arenaBytes,
   );
   validateSlice(
     descriptor.doubledMean,
-    descriptor.batchSize * BOTTLENECK_CHANNELS * 2,
+    descriptor.batchSize * BOTTLENECK_CHANNELS * storageBytes,
     arenaBytes,
   );
   if (

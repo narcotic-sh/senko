@@ -126,3 +126,8 @@ export {
   type CampPlusRawGpuBytes,
   type RawCampPlusFoundationOptions,
 } from "./runtime";
+export {
+  campPlusStorageBytes,
+  campPlusStorageWgsl,
+  type CampPlusStorageDtype,
+} from "./storage";

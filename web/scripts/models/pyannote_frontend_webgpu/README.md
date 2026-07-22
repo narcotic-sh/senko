@@ -12,28 +12,32 @@ InstanceNorm(waveform)
 ```
 
 `pack.py` checks that exact contract, covers every initializer, retiles all
-convolution weights as `[kernel,input,output-group,output-lane]`, and emits a
-headered, 256-byte-aligned FP16-storage binary plus JSON metadata. Reductions,
-state, boundaries, and convolution accumulators remain FP32. The two Conv5
-kernels round only their normalized workgroup-local input tiles to FP16; their
-global inputs and outputs retain the package contract. No ONNX protobuf is
-needed by the raw runtime.
+convolution weights as `[kernel,input,output-group,output-lane]`, and emits
+headered, 256-byte-aligned FP16 or FP32 binaries plus JSON metadata. The FP16
+production path keeps reductions, state, boundaries, and accumulators in FP32.
+The shader-f16-free fallback keeps weights, intermediates, scratch, and math in
+FP32. No ONNX protobuf is needed by either raw runtime path.
 
 Generate the ignored deployment package from the B8 export:
 
 ```bash
 cd web/scripts/models
-.venv/bin/python pyannote_frontend_webgpu/pack.py \
-  ../../../.research/.typed-umap-dist/models/pyannote-segmentation-3.0-frontend-b8.onnx \
+uv run --python 3.13 python3 pyannote_frontend_webgpu/pack.py \
+  ../../public/models/pyannote-segmentation-3.0-frontend-b8.onnx \
   ../../public/models \
   --storage-precision f16
+
+uv run --python 3.13 python3 pyannote_frontend_webgpu/pack.py \
+  ../../public/models/pyannote-segmentation-3.0-frontend-b8.onnx \
+  ../../public/models \
+  --storage-precision f32
 ```
 
 Run the Python 3.13 parity and package tests:
 
 ```bash
 cd web/scripts/models
-.venv/bin/python -m unittest pyannote_frontend_webgpu/test_pack.py -v
+uv run --python 3.13 python3 -m unittest pyannote_frontend_webgpu.test_pack -v
 ```
 
 ## Compute inventory
@@ -72,6 +76,13 @@ The complete mixed-precision B8 runtime uses two aliased activation slots:
 
 The seven dispatches own 384 uniform bytes, so the exact frontend GPU allocation
 is 12,068,992 bytes.
+
+The FP32 fallback uses 13,632,000-byte slot A, the same 5,120,000-byte slot B,
+5,120-byte statistics, 251,904-byte weights, and 384 bytes of uniforms: exactly
+19,009,408 owned GPU-buffer bytes. Its Sinc scratch is 12,660 bytes. Conv5 uses
+16-channel blocks and 26,112 scratch bytes when the adapter reports enough
+workgroup storage; otherwise it selects an 8-channel, 13,056-byte lowering that
+stays below WebGPU's 16 KiB core floor.
 
 Workgroup scratch is transient and does not add to that persistent allocation.
 The production Sinc kernel uses 10,652 bytes: 2,161 FP32 signal values and 251

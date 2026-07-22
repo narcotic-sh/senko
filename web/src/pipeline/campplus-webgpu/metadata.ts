@@ -1,3 +1,5 @@
+import type { CampPlusStorageDtype } from "./storage";
+
 export type CampPlusSectionKind =
   | "conv_weight"
   | "conv_bias"
@@ -90,7 +92,8 @@ export interface CampPlusPackageMetadata {
   readonly contract: {
     readonly inputShape: readonly [number, 150, 80];
     readonly outputShape: readonly [number, 192];
-    readonly requiredWebGpuFeatures: readonly ["shader-f16"];
+    readonly internalDtype: CampPlusStorageDtype;
+    readonly requiredWebGpuFeatures: readonly ("shader-f16")[];
   };
   readonly memory: CampPlusMemoryPlan;
   readonly sections: readonly CampPlusPackedSection[];
@@ -144,8 +147,13 @@ export function parseCampPlusMetadata(value: unknown): CampPlusPackageMetadata {
   }
 
   const contractObject = expectObject(root.contract, "metadata.contract");
-  if (contractObject.internal_dtype !== "float16" || contractObject.channel_tile !== 4) {
-    throw new Error("CAM++ package requires FP16 internals and four-channel packing");
+  const internalDtype = expectEnum(
+    contractObject.internal_dtype,
+    ["float16", "float32"] as const,
+    "metadata.contract.internal_dtype",
+  );
+  if (contractObject.channel_tile !== 4) {
+    throw new Error("CAM++ package requires four-channel packing");
   }
   if (contractObject.weights_are_batch_independent !== true) {
     throw new Error("CAM++ packed weights must be batch independent");
@@ -176,11 +184,17 @@ export function parseCampPlusMetadata(value: unknown): CampPlusPackageMetadata {
     contractObject.required_webgpu_features,
     "metadata.contract.required_webgpu_features",
   );
-  if (requiredFeatures.length !== 1 || requiredFeatures[0] !== "shader-f16") {
-    throw new Error("CAM++ package v1 requires exactly the shader-f16 WebGPU feature");
+  const expectedFeatures = internalDtype === "float16" ? ["shader-f16"] : [];
+  if (
+    requiredFeatures.length !== expectedFeatures.length ||
+    requiredFeatures.some((feature, index) => feature !== expectedFeatures[index])
+  ) {
+    throw new Error(
+      `CAM++ ${internalDtype} package has incompatible required WebGPU features`,
+    );
   }
 
-  const sections = parseSections(root.sections, binary);
+  const sections = parseSections(root.sections, binary, internalDtype);
   const sectionMap = new Map(sections.map((section) => [section.id, section]));
   const fusedProgram = parseFusedProgram(root.fused_program, sectionMap);
   const memory = parseMemoryPlan(root.memory, binary.byteLength, inputShape[0]!);
@@ -195,7 +209,9 @@ export function parseCampPlusMetadata(value: unknown): CampPlusPackageMetadata {
     contract: {
       inputShape: [inputShape[0]!, 150, 80],
       outputShape: [outputShape[0]!, 192],
-      requiredWebGpuFeatures: ["shader-f16"],
+      internalDtype,
+      requiredWebGpuFeatures:
+        internalDtype === "float16" ? ["shader-f16"] : [],
     },
     memory,
     sections,
@@ -211,6 +227,7 @@ function parseSections(
     readonly headerBytes: number;
     readonly sectionAlignment: number;
   },
+  internalDtype: CampPlusStorageDtype,
 ): readonly CampPlusPackedSection[] {
   const values = expectArray(value, "metadata.sections");
   if (values.length !== binary.sectionCount) {
@@ -253,7 +270,15 @@ function parseSections(
     if (byteLength !== elementCount * width || product(packedShape) !== elementCount) {
       throw new Error(`${path} byte length and packed shape disagree`);
     }
-    validateSectionLayout(path, kind, dtype, layout, logicalShape, packedShape);
+    validateSectionLayout(
+      path,
+      kind,
+      dtype,
+      layout,
+      logicalShape,
+      packedShape,
+      internalDtype,
+    );
     return {
       id,
       kind,
@@ -284,10 +309,11 @@ function validateSectionLayout(
   layout: CampPlusSectionLayout,
   logical: readonly number[],
   packed: readonly number[],
+  internalDtype: CampPlusStorageDtype,
 ): void {
   if (kind === "conv_weight") {
-    if (dtype !== "float16" || layout !== "K_O4_I4_I_O" || logical.length < 3) {
-      throw new Error(`${path} is not a packed FP16 convolution weight`);
+    if (dtype !== internalDtype || layout !== "K_O4_I4_I_O" || logical.length < 3) {
+      throw new Error(`${path} is not a packed ${internalDtype} convolution weight`);
     }
     const kernelElements = product(logical.slice(2));
     const expected = [kernelElements, ceilDiv(logical[0]!, 4), ceilDiv(logical[1]!, 4), 4, 4];
@@ -296,12 +322,12 @@ function validateSectionLayout(
   }
   if (kind === "conv_bias") {
     if (
-      dtype !== "float16" ||
+      dtype !== internalDtype ||
       layout !== "O4" ||
       logical.length !== 1 ||
       !sameShape(packed, [ceilDiv(logical[0]!, 4), 4])
     ) {
-      throw new Error(`${path} is not a packed FP16 convolution bias`);
+      throw new Error(`${path} is not a packed ${internalDtype} convolution bias`);
     }
     return;
   }

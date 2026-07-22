@@ -38,13 +38,16 @@ const fakes = vi.hoisted(() => {
   const device = {
     queue: { onSubmittedWorkDone: vi.fn(async () => {}) },
   };
-  return { device, graph, pending };
+  const createGraph = vi.fn(
+    async (_device: unknown, _metadataUrl: string, _options: unknown) => graph,
+  );
+  return { createGraph, device, graph, pending };
 });
 
 vi.mock("./campplus-webgpu", () => ({
   CAMPPLUS_RAW_MAX_IN_FLIGHT_RUNS: 2,
   CampPlusRawGraph: {
-    create: async () => fakes.graph,
+    create: fakes.createGraph,
   },
 }));
 
@@ -52,6 +55,7 @@ import type { SelectedCampPlusDirect } from "./model-manifest";
 import { RawCampPlusEmbeddingBackend } from "./raw-campplus-backend";
 
 const SELECTED: SelectedCampPlusDirect = {
+  precision: "float16",
   batchSize: 16,
   metadata: { url: "https://example.test/campplus.json" },
   weights: {
@@ -65,6 +69,7 @@ const SELECTED: SelectedCampPlusDirect = {
 describe("RawCampPlusEmbeddingBackend in-flight lifecycle", () => {
   beforeEach(() => {
     fakes.pending.length = 0;
+    fakes.createGraph.mockClear();
     fakes.graph.destroy.mockClear();
     fakes.device.queue.onSubmittedWorkDone.mockClear();
   });
@@ -73,6 +78,11 @@ describe("RawCampPlusEmbeddingBackend in-flight lifecycle", () => {
     const backend = await RawCampPlusEmbeddingBackend.create(
       fakes.device as unknown as GPUDevice,
       SELECTED,
+    );
+    expect(fakes.createGraph).toHaveBeenCalledWith(
+      fakes.device,
+      "https://example.test/campplus.json",
+      expect.objectContaining({ batchSize: 16, storageDtype: "float16" }),
     );
     const features = new Float32Array(16 * 150 * 80);
     const first = backend.run(features);

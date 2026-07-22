@@ -67,6 +67,7 @@ describe("pipeline worker dual-device loss handling", () => {
     const models = {
       vadDevice: { lost: vadLost.promise },
       embeddingDevice: { lost: embeddingLost.promise },
+      precision: "float16",
       release,
     };
     const clustering = { warmup: vi.fn(), dispose };
@@ -113,7 +114,11 @@ describe("pipeline worker dual-device loss handling", () => {
     expect(fakes.loadModels).toHaveBeenCalledWith(
       "https://example.test/models/manifest.json",
       gpu,
-      expect.objectContaining({ vadBatchSize: 8, embeddingBatchSize: 16 }),
+      expect.objectContaining({
+        vadBatchSize: 8,
+        embeddingBatchSize: 16,
+        preferFloat16: true,
+      }),
     );
     loss().resolve({
       reason: "unknown",

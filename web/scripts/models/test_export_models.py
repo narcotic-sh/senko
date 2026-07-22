@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import json
+import shutil
 import sys
 import tempfile
 import unittest
@@ -13,11 +15,19 @@ from torch import nn
 
 
 SCRIPT_PATH = Path(__file__).with_name("export_models.py")
+if str(SCRIPT_PATH.parent) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_PATH.parent))
 SPEC = importlib.util.spec_from_file_location("export_models", SCRIPT_PATH)
 assert SPEC is not None and SPEC.loader is not None
 export_models = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = export_models
 SPEC.loader.exec_module(export_models)
+
+PUBLIC_MODELS = export_models.REPO_ROOT / "web" / "public" / "models"
+DIRECT_FRONTEND = PUBLIC_MODELS / "pyannote-segmentation-3.0-frontend-b8.onnx"
+DIRECT_TAIL = PUBLIC_MODELS / "pyannote-segmentation-3.0-tail-b8.onnx"
+DIRECT_CAM_FP16 = PUBLIC_MODELS / "campplus-t150-b32-fp16.onnx"
+DIRECT_CAM_FP32 = PUBLIC_MODELS / "campplus-t150-b32.onnx"
 
 
 class ExportModelToolsTest(unittest.TestCase):
@@ -134,6 +144,218 @@ class ExportModelToolsTest(unittest.TestCase):
         model = nn.Module()
         with self.assertRaisesRegex(ValueError, "Unsupported.*precision"):
             export_models.pack_pyannote_lstm(model, "float8")
+
+    @unittest.skipUnless(
+        DIRECT_FRONTEND.is_file() and DIRECT_TAIL.is_file(),
+        "direct VAD split ONNX artifacts are unavailable",
+    )
+    def test_direct_vad_export_emits_both_precision_variants(self) -> None:
+        packages = {
+            "float16": {
+                "format": "senko-persistent-lstm-f16-gc4h",
+                "weights": {"bytes": 2_760_704},
+            },
+            "float32": {
+                "format": "senko-persistent-lstm-f32-gc4h",
+                "weights": {"bytes": 5_521_408},
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory)
+            shutil.copyfile(DIRECT_FRONTEND, output_dir / DIRECT_FRONTEND.name)
+            shutil.copyfile(DIRECT_TAIL, output_dir / DIRECT_TAIL.name)
+            result = export_models.write_or_verify_direct_webgpu_vad(
+                output_dir,
+                False,
+                packages,
+            )
+            variants = result["precision_variants"]
+            self.assertEqual(set(variants), {"float16", "float32"})
+            self.assertEqual(
+                variants["float16"]["batches"]["8"]["explicit_gpu_bytes"],
+                44_145_664,
+            )
+            self.assertEqual(
+                variants["float32"]["batches"]["8"]["explicit_gpu_bytes"],
+                53_947_648,
+            )
+            self.assertTrue(
+                (output_dir / "pyannote-segmentation-3.0-tail-webgpu-f32.bin").is_file()
+            )
+            self.assertEqual(
+                export_models.write_or_verify_direct_webgpu_vad(
+                    output_dir,
+                    True,
+                    packages,
+                ),
+                result,
+            )
+
+    def test_partial_export_preserves_current_direct_vad_precision_variants(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory)
+            variants = {}
+            for precision, suffix in (("float16", "f16"), ("float32", "f32")):
+                weights = f"lstm-{suffix}.bin"
+                metadata = f"lstm-{suffix}.json"
+                frontend = f"frontend-{suffix}.json"
+                tail = f"tail-{suffix}.json"
+                for name in (weights, metadata, frontend, tail):
+                    (output_dir / name).write_bytes(b"present")
+                variants[precision] = {
+                    "lstm": {
+                        "weights": {"file": weights},
+                        "metadata": {"file": metadata},
+                    },
+                    "batches": {
+                        "8": {
+                            "frontend_metadata": {"file": frontend},
+                            "tail_metadata": {"file": tail},
+                        }
+                    },
+                }
+            old_split = {
+                "version": 1,
+                "frontend": {"batches": {}},
+                "tail": {"batches": {}},
+                "buffer_bytes_by_batch": {},
+                "direct_webgpu": {"precision_variants": variants},
+            }
+            (output_dir / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "models": {"segmentation": {"split": old_split}},
+                    }
+                )
+            )
+            new_split = {
+                "version": 1,
+                "frontend": {"batches": {}},
+                "tail": {"batches": {}},
+                "buffer_bytes_by_batch": {},
+                "direct_webgpu": {"precision_variants": {}},
+            }
+            merged = export_models.merge_segmentation_split(output_dir, new_split)
+            self.assertIsNotNone(merged)
+            self.assertEqual(
+                set(merged["direct_webgpu"]["precision_variants"]),
+                {"float16", "float32"},
+            )
+
+    def test_partial_export_rejects_an_incomplete_direct_vad_precision_pair(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory)
+            new_split = {
+                "version": 1,
+                "frontend": {"batches": {}},
+                "tail": {"batches": {}},
+                "buffer_bytes_by_batch": {},
+                "direct_webgpu": {
+                    "precision_variants": {"float16": {"lstm": {}, "batches": {}}}
+                },
+            }
+            with self.assertRaisesRegex(RuntimeError, "missing: float32"):
+                export_models.merge_segmentation_split(output_dir, new_split)
+
+    def test_campplus_only_export_rejects_dangling_direct_vad_assets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory)
+            variants = {}
+            for precision, suffix in (("float16", "f16"), ("float32", "f32")):
+                weights = f"lstm-{suffix}.bin"
+                metadata = f"lstm-{suffix}.json"
+                frontend = f"frontend-{suffix}.json"
+                tail = f"tail-{suffix}.json"
+                for name in (weights, metadata, frontend, tail):
+                    (output_dir / name).write_bytes(b"present")
+                variants[precision] = {
+                    "lstm": {
+                        "weights": {"file": weights},
+                        "metadata": {"file": metadata},
+                    },
+                    "batches": {
+                        "8": {
+                            "frontend_metadata": {"file": frontend},
+                            "tail_metadata": {"file": tail},
+                        }
+                    },
+                }
+            (output_dir / "tail-f32.json").unlink()
+            split = {
+                "version": 1,
+                "direct_webgpu": {"precision_variants": variants},
+            }
+            (output_dir / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "models": {"segmentation": {"split": split}},
+                    }
+                )
+            )
+            with self.assertRaisesRegex(RuntimeError, "float32 tail metadata"):
+                export_models.merge_segmentation_split(output_dir, None)
+
+    @unittest.skipUnless(
+        DIRECT_CAM_FP16.is_file() and DIRECT_CAM_FP32.is_file(),
+        "direct CAM++ source artifacts are unavailable",
+    )
+    def test_direct_campplus_export_emits_both_precision_variants(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory)
+            shutil.copyfile(DIRECT_CAM_FP16, output_dir / DIRECT_CAM_FP16.name)
+            shutil.copyfile(DIRECT_CAM_FP32, output_dir / DIRECT_CAM_FP32.name)
+            result = export_models.write_or_verify_direct_webgpu_campplus(
+                output_dir,
+                False,
+            )
+            variants = result["precision_variants"]
+            self.assertEqual(set(variants), {"float16", "float32"})
+            self.assertEqual(
+                variants["float16"]["explicit_gpu_buffer_bytes_by_batch"]["16"],
+                39_855_360,
+            )
+            self.assertEqual(
+                variants["float32"]["explicit_gpu_buffer_bytes_by_batch"]["16"],
+                78_587_392,
+            )
+            self.assertEqual(variants["float32"]["weights"]["bytes"], 27_394_048)
+            self.assertEqual(
+                export_models.write_or_verify_direct_webgpu_campplus(
+                    output_dir,
+                    True,
+                ),
+                result,
+            )
+
+    def test_partial_export_preserves_current_direct_campplus_variants(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory)
+            variants = {}
+            for precision, suffix in (("float16", "f16"), ("float32", "f32")):
+                metadata = f"camp-{suffix}.json"
+                weights = f"camp-{suffix}.bin"
+                (output_dir / metadata).write_bytes(b"metadata")
+                (output_dir / weights).write_bytes(b"weights")
+                variants[precision] = {
+                    "format": f"senko-campplus-direct-webgpu-{suffix}-v1",
+                    "metadata": {"file": metadata},
+                    "weights": {"file": weights},
+                }
+            direct = {"precision_variants": variants}
+            (output_dir / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "models": {"campplus": {"direct_webgpu": direct}},
+                    }
+                )
+            )
+            self.assertEqual(
+                export_models.load_existing_campplus_direct(output_dir),
+                direct,
+            )
 
     def test_freeze_pyannote_sincnet_filterbank_is_exact(self) -> None:
         class FakeEncoder(nn.Module):

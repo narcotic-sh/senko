@@ -18,8 +18,9 @@ The command creates these deployment artifacts in `web/public/models/`:
   input `[B, 1, 160000]`, output `[B, 589, 7]`;
 - matching pyannote frontend `[B,1,160000] -> [B,589,60]` and tail
   `[B,589,256] -> [B,589,7]` ONNX graphs with no LSTM nodes, plus a deterministic
-  GPU-ready production FP16-weight package for the four-layer bidirectional
-  LSTM and an exact FP32 package for explicit browser A/B tests;
+  GPU-ready FP16 and FP32 packages for the direct-WebGPU frontend, four-layer
+  bidirectional LSTM, and dense tail. Runtime selects FP16 when `shader-f16`
+  is available and the shader-f16-free FP32 set otherwise;
 - CAM++ FP32 at static batches 32, 64, and 128 with input `[B, 150, 80]` and
   output `[B, 192]`, plus a production B32 internal-FP16 graph retaining FP32
   input/output boundaries (`campplus-t150-b32-fp16.onnx`);
@@ -56,21 +57,20 @@ where the negative-step slice loses one tap and turns a 251-tap filter into an
 invalid 250-element reshape input. The exporter rejects pyannote artifacts that
 still contain those dynamic Sinc operators.
 
-With ONNX Runtime Web 1.27's JSEP backend, the resulting graph assigns every
-operator except the four ONNX `LSTM` nodes to WebGPU. JSEP does not register an
-LSTM WebGPU kernel, so the monolithic graph is retained only as a diagnostic
-CPU-fallback reference. Production uses the split frontend and tail as strict
-WebGPU ORT sessions and runs the four recurrent layers through Senko's
-persistent WGSL kernel. There is no production CPU execution fallback.
+With ONNX Runtime Web 1.27's JSEP backend, the monolithic diagnostic graph
+assigns every operator except the four ONNX `LSTM` nodes to WebGPU. JSEP does
+not register an LSTM WebGPU kernel, so that graph is retained only as a
+CPU-fallback reference. Production does not instantiate ORT: Senko runs the
+frontend, four recurrent layers, and tail through its raw WGSL runtimes. There
+is no production CPU execution fallback.
 
 The split artifacts implement that custom-kernel boundary. Their BTF layouts,
 PyTorch IFGO equations, forward/reverse conventions, binary offsets, exact GPU
 buffer sizes, persistent dispatch, and browser parity results are documented in
 [`PYANNOTE_LSTM_WEBGPU.md`](PYANNOTE_LSTM_WEBGPU.md). The split contract and all
 artifact hashes are also embedded at `models.segmentation.split` in the runtime
-manifest. ORT/JSEP is initialized from the selected `GPUAdapter`, and every
-external tensor and custom buffer is allocated from the exact device exposed by
-`ort.env.webgpu.device` after the first session is created.
+manifest. Each precision-matched frontend/LSTM/tail set is loaded onto one
+explicitly requested `GPUDevice`, so every intermediate remains on that device.
 
 Every export runs ONNX's full checker and ONNX Runtime CPU against its PyTorch
 source before it is accepted. Re-run those checks without rewriting models:
@@ -96,12 +96,14 @@ uv run --project web/scripts/models --locked \
   --batch 1 --lstm-precision float16
 ```
 
-The runtime manifest selects FP16 after its Chrome/M3 parity, throughput, and
-memory gates passed; FP32 remains a diagnostic baseline. See
+The runtime prefers FP16 after its Chrome/M3 parity, throughput, and memory
+gates passed. When `shader-f16` is unavailable it selects the complete FP32
+frontend/LSTM/tail package instead. See
 [`PYANNOTE_LSTM_WEBGPU.md`](PYANNOTE_LSTM_WEBGPU.md) for the Chrome diagnostic
 URLs used to compare FP32 and FP16 parity, throughput, and owned GPU memory.
 
-To export only a fast development bucket:
+To refresh only a fast development bucket while preserving the already
+generated B8 direct-WebGPU precision pair in the current manifest:
 
 ```bash
 uv run --project web/scripts/models --locked \
