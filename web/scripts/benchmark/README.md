@@ -82,6 +82,20 @@ evaluation across eight adjacent output vec4 groups. Direct packed-weight
 reads remove its 12,800-byte workgroup cache and barrier while preserving the
 exact kernel/channel FMA order for every output.
 
+A later 2026-07-22 production promotion keeps the three pointwise-transit
+accumulator vectors in FP16. Its first isolated one-hour timing acceptance was
+**9.972000 seconds** (CAM++ 8.749230 s, clustering 1.117765 s), with 9 speakers
+and 137 segments; this is a single run, not yet a replacement three-run median.
+The short fixture completed in 1.487360 s and its 4-speaker/49-segment payload
+was byte-identical to the preceding tile-8 VAD checkpoint. On the long fixture,
+the small embedding-numeric change retained 9 speakers and 137 segments and
+agreed with that preceding browser result at 99.9838% speech IoU and 99.9156%
+mapped-speaker agreement at 10 ms. It passed every offline-Senko gate at both
+10 ms and 50 ms. GPU-buffer and WASM totals stayed exactly 84,001,024 and
+12,058,624 bytes. The logical CPU peak changed by only 56 data-dependent bytes
+(9,822,864 to 9,822,920), entirely in clustering working-size accounting; the
+transit optimization allocates no new buffer.
+
 The latest gain comes from exact incremental VAD reduction and dual-device
 streaming. The first B8 VAD batch establishes an immutable speech-window
 prefix. For every later VAD dispatch, the worker submits VAD first and then up

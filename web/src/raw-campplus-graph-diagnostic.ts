@@ -162,6 +162,7 @@ async function execute(
       numericVariant: graph.numericVariant,
       fcmAccumulation: graph.fcmAccumulation,
       denseBottleneckAccumulation: graph.denseBottleneckAccumulation,
+      pointwiseTransitAccumulation: graph.pointwiseTransitAccumulation,
       dispatches: graph.dispatchCount,
       commandEncodersPerRun: 1,
       submissionsPerRun: 1,

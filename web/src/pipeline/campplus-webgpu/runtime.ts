@@ -22,9 +22,11 @@ import {
   type PackedBctConvVariant,
 } from "./packed-bct-conv";
 import {
+  DEFAULT_POINTWISE_TRANSIT_ACCUMULATION,
   POINTWISE_TRANSIT_REQUIRED_WORKGROUP_STORAGE_BYTES,
   POINTWISE_TRANSIT_TILE4_WORKGROUP_STORAGE_BYTES,
   PointwiseTransitKernels,
+  type PointwiseTransitAccumulation,
   type PointwiseTransitVariant,
   type PointwiseTransitDispatch,
 } from "./pointwise-transit";
@@ -50,6 +52,8 @@ export interface RawCampPlusFoundationOptions extends CampPlusPackageLoadOptions
   readonly packedBctConvVariant?: PackedBctConvVariant;
   /** Diagnostic transit kernel selection; omission uses the production default. */
   readonly pointwiseTransitVariant?: PointwiseTransitVariant;
+  /** Diagnostic-only transit accumulator selection; omission uses production FP16. */
+  readonly pointwiseTransitAccumulation?: PointwiseTransitAccumulation;
 }
 
 export const RAW_CAMPPLUS_REQUIRED_LIMITS = {
@@ -186,6 +190,8 @@ export class RawCampPlusFoundation {
           gpuPackage,
           arena,
           options.pointwiseTransitVariant,
+          options.pointwiseTransitAccumulation ??
+            DEFAULT_POINTWISE_TRANSIT_ACCUMULATION,
         ),
       ]);
       return new RawCampPlusFoundation(

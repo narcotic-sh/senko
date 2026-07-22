@@ -15,6 +15,9 @@ export const POINTWISE_TRANSIT_VARIANTS = [
 ] as const;
 export type PointwiseTransitVariant = (typeof POINTWISE_TRANSIT_VARIANTS)[number];
 export const DEFAULT_POINTWISE_TRANSIT_VARIANT: PointwiseTransitVariant = "chunk512";
+export type PointwiseTransitAccumulation = "float32" | "float16";
+export const DEFAULT_POINTWISE_TRANSIT_ACCUMULATION: PointwiseTransitAccumulation =
+  "float16";
 
 export function isPointwiseTransitVariant(value: string): value is PointwiseTransitVariant {
   return (POINTWISE_TRANSIT_VARIANTS as readonly string[]).includes(value);
@@ -78,6 +81,7 @@ export class PointwiseTransitKernels {
     private readonly gpuPackage: CampPlusGpuPackage,
     private readonly arena: CampPlusActivationArena,
     readonly variant: PointwiseTransitVariant,
+    readonly accumulation: PointwiseTransitAccumulation,
     private readonly outputTile: 2 | 4,
     private readonly pipeline: GPUComputePipeline,
     private readonly layout: GPUBindGroupLayout,
@@ -88,6 +92,8 @@ export class PointwiseTransitKernels {
     gpuPackage: CampPlusGpuPackage,
     arena: CampPlusActivationArena,
     variant: PointwiseTransitVariant = DEFAULT_POINTWISE_TRANSIT_VARIANT,
+    accumulation: PointwiseTransitAccumulation =
+      DEFAULT_POINTWISE_TRANSIT_ACCUMULATION,
   ): Promise<PointwiseTransitKernels> {
     if (
       device.limits.maxComputeWorkgroupStorageSize <
@@ -117,12 +123,19 @@ export class PointwiseTransitKernels {
         POINTWISE_TRANSIT_TILE4_WORKGROUP_STORAGE_BYTES
         ? 4
         : 2;
-    const pipeline = await createPipeline(device, layout, outputTile, variant);
+    const pipeline = await createPipeline(
+      device,
+      layout,
+      outputTile,
+      variant,
+      accumulation,
+    );
     return new PointwiseTransitKernels(
       device,
       gpuPackage,
       arena,
       variant,
+      accumulation,
       outputTile,
       pipeline,
       layout,
@@ -296,14 +309,15 @@ async function createPipeline(
   layout: GPUBindGroupLayout,
   outputTile: 2 | 4,
   variant: PointwiseTransitVariant,
+  accumulation: PointwiseTransitAccumulation,
 ): Promise<GPUComputePipeline> {
-  const label = `senko-campplus-pointwise-transit-tile${outputTile}-${variant}`;
+  const label = `senko-campplus-pointwise-transit-tile${outputTile}-${variant}-${accumulation}`;
   const module = device.createShaderModule({
     label,
     code:
       variant === "chunk512"
-        ? pointwiseTransitChunk512Wgsl(outputTile)
-        : pointwiseTransitWgsl(outputTile),
+        ? pointwiseTransitChunk512Wgsl(outputTile, accumulation)
+        : pointwiseTransitWgsl(outputTile, accumulation),
   });
   const compilation = await module.getCompilationInfo();
   const errors = compilation.messages.filter((message) => message.type === "error");
@@ -317,17 +331,49 @@ async function createPipeline(
   });
 }
 
-export function pointwiseTransitWgsl(outputTile: 2 | 4): string {
+function pointwiseAccumulationSteps(
+  tile: number,
+  cacheBase: string,
+  accumulation: PointwiseTransitAccumulation,
+): string {
+  const activation = (lane: number): string =>
+    accumulation === "float16"
+      ? `vec4<f16>(activated_${lane})`
+      : `vec4<f32>(f32(activated_${lane}))`;
+  const weight = (offset: string): string => {
+    const source = `weight_cache[${cacheBase}${offset}]`;
+    return accumulation === "float16" ? source : `vec4<f32>(${source})`;
+  };
+  return `      accumulator_${tile} = fma(${activation(0)}, ${weight("")}, accumulator_${tile});
+      accumulator_${tile} = fma(${activation(1)}, ${weight(" + 1u")}, accumulator_${tile});
+      accumulator_${tile} = fma(${activation(2)}, ${weight(" + 2u")}, accumulator_${tile});
+      accumulator_${tile} = fma(${activation(3)}, ${weight(" + 3u")}, accumulator_${tile});`;
+}
+
+function pointwiseAccumulatorDeclaration(
+  indentation: string,
+  tile: number,
+  accumulation: PointwiseTransitAccumulation,
+): string {
+  const bias = `biases[first_output_group + ${tile}u]`;
+  const initialValue = accumulation === "float16" ? bias : `vec4<f32>(${bias})`;
+  return `${indentation}var accumulator_${tile} = ${initialValue};`;
+}
+
+export function pointwiseTransitWgsl(
+  outputTile: 2 | 4,
+  accumulation: PointwiseTransitAccumulation = DEFAULT_POINTWISE_TRANSIT_ACCUMULATION,
+): string {
+  const accumulatorType = accumulation === "float16" ? "f16" : "f32";
+  const finishedAccumulator =
+    accumulation === "float16" ? "accumulator" : "vec4<f16>(accumulator)";
   const accumulatorDeclarations = Array.from(
     { length: outputTile },
-    (_, tile) => `    var accumulator_${tile} = vec4<f32>(biases[first_output_group + ${tile}u]);`,
+    (_, tile) => pointwiseAccumulatorDeclaration("    ", tile, accumulation),
   ).join("\n");
   const accumulationSteps = Array.from({ length: outputTile }, (_, tile) => {
     const cacheBase = `${tile}u * parameters.input_channels + channel_base`;
-    return `      accumulator_${tile} = fma(vec4<f32>(f32(activated_0)), vec4<f32>(weight_cache[${cacheBase}]), accumulator_${tile});
-      accumulator_${tile} = fma(vec4<f32>(f32(activated_1)), vec4<f32>(weight_cache[${cacheBase} + 1u]), accumulator_${tile});
-      accumulator_${tile} = fma(vec4<f32>(f32(activated_2)), vec4<f32>(weight_cache[${cacheBase} + 2u]), accumulator_${tile});
-      accumulator_${tile} = fma(vec4<f32>(f32(activated_3)), vec4<f32>(weight_cache[${cacheBase} + 3u]), accumulator_${tile});`;
+    return pointwiseAccumulationSteps(tile, cacheBase, accumulation);
   }).join("\n");
   const stores = Array.from(
     { length: outputTile },
@@ -360,8 +406,8 @@ struct Parameters {
 @group(0) @binding(4) var<uniform> parameters: Parameters;
 var<workgroup> weight_cache: array<vec4<f16>, ${MAX_INPUT_CHANNELS * outputTile}>;
 
-fn finish_output(accumulator: vec4<f32>) -> vec4<f16> {
-  var rounded = vec4<f16>(accumulator);
+fn finish_output(accumulator: vec4<${accumulatorType}>) -> vec4<f16> {
+  var rounded = ${finishedAccumulator};
   if (parameters.output_relu != 0u) {
     rounded = max(rounded, vec4<f16>(f16(0.0)));
   }
@@ -428,18 +474,21 @@ ${stores}
  * Tile-4 transit with a 512-channel strip-mined weight cache. This cuts
  * workgroup storage from 32 KiB to 16 KiB while preserving input/FMA order.
  */
-export function pointwiseTransitChunk512Wgsl(outputTile: 2 | 4): string {
+export function pointwiseTransitChunk512Wgsl(
+  outputTile: 2 | 4,
+  accumulation: PointwiseTransitAccumulation = DEFAULT_POINTWISE_TRANSIT_ACCUMULATION,
+): string {
   const cacheChannels = 512;
+  const accumulatorType = accumulation === "float16" ? "f16" : "f32";
+  const finishedAccumulator =
+    accumulation === "float16" ? "accumulator" : "vec4<f16>(accumulator)";
   const accumulatorDeclarations = Array.from(
     { length: outputTile },
-    (_, tile) => `  var accumulator_${tile} = vec4<f32>(biases[first_output_group + ${tile}u]);`,
+    (_, tile) => pointwiseAccumulatorDeclaration("  ", tile, accumulation),
   ).join("\n");
   const accumulationSteps = Array.from({ length: outputTile }, (_, tile) => {
     const cacheBase = `${tile}u * ${cacheChannels}u + cache_channel_base`;
-    return `      accumulator_${tile} = fma(vec4<f32>(f32(activated_0)), vec4<f32>(weight_cache[${cacheBase}]), accumulator_${tile});
-      accumulator_${tile} = fma(vec4<f32>(f32(activated_1)), vec4<f32>(weight_cache[${cacheBase} + 1u]), accumulator_${tile});
-      accumulator_${tile} = fma(vec4<f32>(f32(activated_2)), vec4<f32>(weight_cache[${cacheBase} + 2u]), accumulator_${tile});
-      accumulator_${tile} = fma(vec4<f32>(f32(activated_3)), vec4<f32>(weight_cache[${cacheBase} + 3u]), accumulator_${tile});`;
+    return pointwiseAccumulationSteps(tile, cacheBase, accumulation);
   }).join("\n");
   const stores = Array.from(
     { length: outputTile },
@@ -472,8 +521,8 @@ struct Parameters {
 @group(0) @binding(4) var<uniform> parameters: Parameters;
 var<workgroup> weight_cache: array<vec4<f16>, ${cacheChannels * outputTile}>;
 
-fn finish_output(accumulator: vec4<f32>) -> vec4<f16> {
-  var rounded = vec4<f16>(accumulator);
+fn finish_output(accumulator: vec4<${accumulatorType}>) -> vec4<f16> {
+  var rounded = ${finishedAccumulator};
   if (parameters.output_relu != 0u) {
     rounded = max(rounded, vec4<f16>(f16(0.0)));
   }

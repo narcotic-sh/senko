@@ -34,9 +34,11 @@ channels while reading packed weights directly, so no extra activation or
 weight-cache buffer is needed. The three pointwise transit layers use
 `chunk512`: their tile-4 shaders strip-mine input channels in 512-channel
 chunks, reducing workgroup storage from 32 KiB to 16 KiB while preserving
-accumulation order. Production compiles only these selected dense and transit
-pipelines. The raw-graph diagnostic retains a combined `float32-baseline`
-numeric selection for controlled A/B checks; it is not used by production.
+accumulation order. Their accumulator vectors now remain FP16 as well, avoiding
+per-term widening around the packed FP16 weights. Production compiles only
+these selected dense and transit pipelines. The raw-graph diagnostic retains a
+combined `float32-baseline` numeric selection for controlled A/B checks; it is
+not used by production.
 
 The initial TDNN uses `direct-tile8-wg96`. It replaces the cached tile-1
 geometry with a 96-lane workgroup that evaluates each input once for eight
@@ -124,13 +126,14 @@ in this run while remaining below the current 200 MB explicit-memory budget.
 ## Current validation
 
 A same-session B16 numeric A/B was repeated twice in isolated Chrome, for six
-settled submissions per path. Full FP16 accumulation is now production; the
-old combined FP32 path remains available as `numeric-variant=float32-baseline`.
+settled submissions per path. This first promoted FP16 accumulation in FCM and
+dense bottlenecks; its pointwise transits still accumulated in FP32. The old
+combined FP32 path remains available as `numeric-variant=float32-baseline`.
 
 | Numeric path | Median graph GPU | Median wall | Mean FCM profile | Mean dense-block profile | Max / mean error vs oracle | Cosine vs oracle |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | FP32 diagnostic baseline | 22.675456 ms | 23.600 ms | 6.750208 ms | 12.255232 ms | 0.0029297 / 0.0003676 | 0.99999941 |
-| FP16 production | 21.430272 ms | 22.215 ms | 6.062080 ms | 12.025856 ms | 0.0136719 / 0.0016981 | 0.99998891 |
+| FP16 FCM + dense, FP32 transits | 21.430272 ms | 22.215 ms | 6.062080 ms | 12.025856 ms | 0.0136719 / 0.0016981 | 0.99998891 |
 
 FP16 reduced median whole-graph GPU time by 5.49% and wall time by 5.87%; its
 FCM profile improved by 10.19% and the three dense blocks together by 1.87%.
@@ -139,6 +142,17 @@ timestamp buffers, so the speedup has no production residency cost. A bounded
 32-term FP16-partial experiment retained cosine 0.99999836 but improved median
 GPU time by only 2.02%; it and its code were removed in favor of the faster
 full-FP16 path.
+
+The subsequent transit-only A/B kept the same `chunk512` geometry and changed
+only its accumulator vectors. Across two isolated runs per path, pooled B16
+whole-graph GPU medians moved from 21.463040 ms with FP32 transits to
+21.299200 ms with FP16 transits. The three transit profile groups fell from
+2.719744 ms to 2.523136 ms in the representative profiles. Explicit GPU
+buffers remained exactly 39,855,424 bytes. Full FP16 graph parity remained
+well inside the oracle gate at 0.0146484 maximum error, 0.0019723 mean error,
+and 0.99998526 cosine similarity. Production and the combined diagnostic
+baseline therefore now select FP16 and FP32, respectively, across FCM, dense
+bottlenecks, and pointwise transits.
 
 Before the FP16 promotion, the target M3 geometry combination (`tile4-fold`,
 `direct-tile8-wg96` TDNN, `direct-tile4-wg128` dense bottlenecks, and

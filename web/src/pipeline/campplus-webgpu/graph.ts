@@ -21,6 +21,7 @@ import {
   type PackedBctConvVariant,
 } from "./packed-bct-conv";
 import type {
+  PointwiseTransitAccumulation,
   PointwiseTransitDispatch,
   PointwiseTransitVariant,
 } from "./pointwise-transit";
@@ -50,6 +51,7 @@ export type CampPlusRawNumericVariant =
 interface CampPlusRawNumericConfiguration {
   readonly fcmAccumulation: FcmAccumulation;
   readonly denseBottleneckAccumulation: DenseBottleneckAccumulation;
+  readonly pointwiseTransitAccumulation: PointwiseTransitAccumulation;
 }
 
 const NUMERIC_CONFIGURATIONS: Readonly<
@@ -58,10 +60,12 @@ const NUMERIC_CONFIGURATIONS: Readonly<
   production: {
     fcmAccumulation: "float16",
     denseBottleneckAccumulation: "float16",
+    pointwiseTransitAccumulation: "float16",
   },
   "float32-baseline": {
     fcmAccumulation: "float32",
     denseBottleneckAccumulation: "float32",
+    pointwiseTransitAccumulation: "float32",
   },
 };
 
@@ -261,6 +265,7 @@ export class CampPlusRawGraph {
   readonly numericVariant: CampPlusRawNumericVariant;
   readonly fcmAccumulation: FcmAccumulation;
   readonly denseBottleneckAccumulation: DenseBottleneckAccumulation;
+  readonly pointwiseTransitAccumulation: PointwiseTransitAccumulation;
 
   private readonly readbackSlots: readonly CampPlusRawReadbackSlot[];
   private destroyed = false;
@@ -293,6 +298,7 @@ export class CampPlusRawGraph {
     this.numericVariant = numericVariant;
     this.fcmAccumulation = foundation.fcm.accumulation;
     this.denseBottleneckAccumulation = denseBottleneckAccumulation;
+    this.pointwiseTransitAccumulation = foundation.pointwiseTransit.accumulation;
     const variableBytes = campPlusRawGraphVariableGpuBytes(batchSize);
     const timestampBuffers = readbackSlots.reduce(
       (sum, slot) =>
@@ -347,6 +353,8 @@ export class CampPlusRawGraph {
         ? {}
         : { fcmVariant: options.fcmVariant }),
       fcmAccumulation: numericConfiguration.fcmAccumulation,
+      pointwiseTransitAccumulation:
+        numericConfiguration.pointwiseTransitAccumulation,
       packedBctConvVariant: tdnnVariant,
       ...(options.pointwiseTransitVariant === undefined
         ? {}
