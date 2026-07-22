@@ -288,6 +288,35 @@ the parsed result JSON, making it safe to redirect directly into a retained A/B
 artifact. The isolated Chrome process and profile are removed in `finally`
 unless `--keep-profile` is requested.
 
+The retained dual-device diagnostic is query-gated and does not change the
+production model lifecycle. It runs production B8 VAD and B16 CAM++ backends on
+two devices reporting the same Apple Metal adapter. `cam-runs=1..4` selects the
+work ratio and `cam-inflight=1..2` selects CAM++ submission depth:
+
+```bash
+node web/scripts/benchmark/run-browser-diagnostic.mjs \
+  --url 'http://127.0.0.1:4173/?dual-device-concurrency-diagnostic=1&rounds=12&warmups=3&cam-runs=2&cam-inflight=1' \
+  --event senko-dual-device-concurrency-diagnostic \
+  --selector '#dual-device-concurrency-result' \
+  --remove-profile
+```
+
+Three initial two-CAM isolated runs saved 15.17-22.41 ms per balanced group
+(1.187-1.266x; median 19.98 ms and 1.238x), with bit-exact outputs, stable
+late/early timing, 64,700,672 bytes of summed explicit GPU buffers, and about
+11.75 MB of page-agent memory. Chrome consumes each `GPUAdapter` handle after
+one `requestDevice`, so the page requests two handles and verifies identical
+reported adapter identity, features, and limits.
+
+An eight-round work-ratio sweep saved 14.42, 16.92, and 16.28 ms for one, two,
+and three sequential CAM++ calls per VAD call. The concurrent three-call trace
+placed CAM++ call 3 fully after VAD completion, so two calls maximize hidden
+work. Queueing both calls immediately into the production graph's two readback
+slots saved 17.08 ms (1.212x), only 0.16 ms above sequential CAM submission.
+The streaming projection should therefore use about 17 ms per overlapping VAD
+batch: roughly 46 opportunities × 17 ms = 0.78 seconds on the one-hour file,
+not idealized full VAD hiding.
+
 ## Standalone RSS monitors
 
 For manual measurements, launch a clean Chrome process with a unique

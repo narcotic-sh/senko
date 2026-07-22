@@ -6,7 +6,12 @@ if (root === null) {
 }
 
 const search = new URLSearchParams(location.search);
-if (search.has("raw-campplus-graph-diagnostic")) {
+if (search.has("dual-device-concurrency-diagnostic")) {
+  void import("./dual-device-concurrency-diagnostic").then(
+    ({ runDualDeviceConcurrencyDiagnostic }) =>
+      runDualDeviceConcurrencyDiagnostic(root),
+  );
+} else if (search.has("raw-campplus-graph-diagnostic")) {
   void import("./raw-campplus-graph-diagnostic").then(
     ({ runRawCampPlusGraphDiagnostic }) => runRawCampPlusGraphDiagnostic(root),
   );
