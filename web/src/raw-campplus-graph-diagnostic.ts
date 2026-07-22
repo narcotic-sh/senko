@@ -2,6 +2,7 @@
 
 import {
   CampPlusRawGraph,
+  campPlusRawRequiredBufferBytes,
   type CampPlusRawBatchSize,
 } from "./pipeline/campplus-webgpu/graph";
 import {
@@ -38,6 +39,7 @@ const REFERENCE_URL = "/models/campplus-t150-b32-reference.f32";
 const FRAMES = 150;
 const FEATURES = 80;
 const EMBEDDINGS = 192;
+const REFERENCE_BATCH_SIZE = 32;
 
 interface FloatComparison {
   readonly maxAbsoluteError: number;
@@ -95,13 +97,17 @@ async function execute(
   if (adapter === null || !adapter.features.has("shader-f16")) {
     throw new Error("A shader-f16 WebGPU adapter is required");
   }
-  requireRawCampPlusAdapterLimits(adapter);
+  const requiredBufferBytes = campPlusRawRequiredBufferBytes(batchSize);
+  requireRawCampPlusAdapterLimits(adapter, requiredBufferBytes);
   const timestampQuery = adapter.features.has("timestamp-query");
   const requiredFeatures: GPUFeatureName[] = ["shader-f16"];
   if (timestampQuery) requiredFeatures.push("timestamp-query");
   const device = await adapter.requestDevice({
     requiredFeatures,
-    requiredLimits: preferredRawCampPlusDeviceLimits(adapter),
+    requiredLimits: preferredRawCampPlusDeviceLimits(
+      adapter,
+      requiredBufferBytes,
+    ),
   });
   let graph: CampPlusRawGraph | undefined;
   try {
@@ -163,11 +169,28 @@ async function execute(
       ...(profile === undefined ? {} : { profile }),
       parity,
       fingerprint: fingerprint(actual),
+      reference: {
+        sourceBatchSize: REFERENCE_BATCH_SIZE,
+        repeatedRows: batchSize > REFERENCE_BATCH_SIZE,
+      },
       explicitGpuBytes: graph.gpuBytes,
       retainedCpuBytes: {
         inputFeatures: features.byteLength,
         expectedEmbeddings: expected.byteLength,
+        warmEmbeddings: warm.embeddings.byteLength,
         returnedEmbeddings: actual.byteLength,
+        diagnosticRetainedTypedArrays:
+          features.byteLength +
+          expected.byteLength +
+          warm.embeddings.byteLength +
+          actual.byteLength,
+        diagnosticTransientPeakTypedArrays:
+          features.byteLength +
+          expected.byteLength +
+          warm.embeddings.byteLength +
+          actual.byteLength * 2,
+        twoInFlightCallerStaging:
+          (features.byteLength + actual.byteLength) * 2,
         metadataApproximate: JSON.stringify(graph.foundation.gpuPackage.metadata).length,
         productionBinaryAfterUpload: 0,
       },
@@ -178,11 +201,19 @@ async function execute(
   }
 }
 
-function parseBatchSize(value: string | null): CampPlusRawBatchSize {
+export function parseBatchSize(value: string | null): CampPlusRawBatchSize {
   if (value === null) return 32;
   const parsed = Number(value);
-  if (parsed === 4 || parsed === 8 || parsed === 16 || parsed === 32) return parsed;
-  throw new RangeError("Raw CAM++ batch must be 4, 8, 16, or 32");
+  if (
+    parsed === 4 ||
+    parsed === 8 ||
+    parsed === 16 ||
+    parsed === 32 ||
+    parsed === 64
+  ) {
+    return parsed;
+  }
+  throw new RangeError("Raw CAM++ batch must be 4, 8, 16, 32, or 64");
 }
 
 export function parseFcmVariant(value: string | null): FcmVariant {
@@ -221,28 +252,53 @@ export function parsePointwiseTransitVariant(
   );
 }
 
-function deterministicFeatures(batchSize: number): Float32Array<ArrayBuffer> {
+export function deterministicFeatures(
+  batchSize: CampPlusRawBatchSize,
+): Float32Array<ArrayBuffer> {
   const values = new Float32Array(batchSize * FRAMES * FEATURES);
   for (let batch = 0; batch < batchSize; batch += 1) {
+    // The checked oracle is B32. B64 repeats those independent rows, which
+    // validates all 64 graph lanes without introducing a second model export.
+    const referenceBatch = batch % REFERENCE_BATCH_SIZE;
     for (let frame = 0; frame < FRAMES; frame += 1) {
       for (let feature = 0; feature < FEATURES; feature += 1) {
         values[(batch * FRAMES + frame) * FEATURES + feature] =
-          Math.sin(batch * 0.17 + frame * 0.041 + feature * 0.013) * 0.65 +
-          Math.cos(batch * 0.07 - frame * 0.023 + feature * 0.009) * 0.3;
+          Math.sin(referenceBatch * 0.17 + frame * 0.041 + feature * 0.013) * 0.65 +
+          Math.cos(referenceBatch * 0.07 - frame * 0.023 + feature * 0.009) * 0.3;
       }
     }
   }
   return values;
 }
 
-async function fetchReference(batchSize: number): Promise<Float32Array<ArrayBuffer>> {
+async function fetchReference(
+  batchSize: CampPlusRawBatchSize,
+): Promise<Float32Array<ArrayBuffer>> {
   const response = await fetch(REFERENCE_URL);
   if (!response.ok) throw new Error("Unable to load the compact CAM++ graph oracle");
   const bytes = await response.arrayBuffer();
-  if (bytes.byteLength !== 32 * EMBEDDINGS * 4) {
+  if (bytes.byteLength !== REFERENCE_BATCH_SIZE * EMBEDDINGS * 4) {
     throw new Error("CAM++ graph oracle has the wrong byte length");
   }
-  return new Float32Array(bytes, 0, batchSize * EMBEDDINGS).slice();
+  return repeatReferenceRows(new Float32Array(bytes), batchSize);
+}
+
+export function repeatReferenceRows(
+  source: Float32Array<ArrayBuffer>,
+  batchSize: CampPlusRawBatchSize,
+): Float32Array<ArrayBuffer> {
+  if (source.length !== REFERENCE_BATCH_SIZE * EMBEDDINGS) {
+    throw new RangeError("CAM++ source oracle must contain exactly 32 embedding rows");
+  }
+  const expanded = new Float32Array(batchSize * EMBEDDINGS);
+  for (let batch = 0; batch < batchSize; batch += 1) {
+    const sourceStart = (batch % REFERENCE_BATCH_SIZE) * EMBEDDINGS;
+    expanded.set(
+      source.subarray(sourceStart, sourceStart + EMBEDDINGS),
+      batch * EMBEDDINGS,
+    );
+  }
+  return expanded;
 }
 
 function compare(actual: Float32Array, expected: Float32Array): FloatComparison {

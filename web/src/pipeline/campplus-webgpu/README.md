@@ -76,9 +76,36 @@ and every CAM++ buffer is destroyed before CPU clustering begins. A subsequent
 recording reconstructs VAD on the same worker device. Disposing the worker's
 model set also destroys the `GPUDevice`.
 
-All supported graph batches and their exact explicit buffer totals are pinned
-in `public/models/manifest.json`; B4, B8, and B32 remain useful diagnostics,
-but they are not the production choice.
+All production-selectable graph batches and their exact explicit buffer totals
+are pinned in `public/models/manifest.json`; B4, B8, and B32 remain useful
+diagnostics, but they are not the production choice. B64 is deliberately
+available only from the raw full-graph diagnostic and is not exposed through
+the model selector or pipeline worker.
+
+The diagnostic B64 graph uses the package's batch-independent weights with an
+exact 98,304,000-byte activation arena. Its FCM lifetime is the peak; after
+TDNN the same allocation is reused by a 20,905,984-byte dense-backbone live
+set. With the checked weights and two readback slots, it owns 115,383,552
+explicit GPU-buffer bytes without timestamps, or 115,383,616 bytes when the
+diagnostic's two timestamp-query slots are enabled. The diagnostic reuses one
+3,072,000-byte host input and retains 3,219,456 bytes of typed arrays after
+timing; its conservative serial-transition peak is 3,268,608 bytes. A
+hypothetical two-in-flight B64 caller would stage 6,242,304 host bytes across
+two inputs and two returned embeddings.
+
+A same-session isolated-Chrome diagnostic measured the production kernels as
+follows (persistent bytes include the diagnostic's 64 timestamp bytes):
+
+| Batch | Settled wall | Settled GPU | GPU / embedding | Explicit GPU bytes |
+| ---: | ---: | ---: | ---: | ---: |
+| 16 | 23.467 ms | 22.654 ms | 1.4159 ms | 39,855,424 |
+| 32 | 45.172 ms | 43.997 ms | 1.3749 ms | 64,621,888 |
+| 64 | 87.360 ms | 85.918 ms | 1.3425 ms | 115,383,616 |
+
+For the 5,712-window long fixture, including each graph's measured load and
+warm-up once, these isolated numbers predict CAM++ stages of 8.262 s at B16,
+8.083 s at B32, and 7.977 s at B64. B64 therefore buys about 285 ms over B16
+in this run while remaining below the current 200 MB explicit-memory budget.
 
 ## Current validation
 
@@ -119,14 +146,16 @@ The retained browser diagnostics are intentionally separate from production:
   `direct-tile4-wg128`; the initial TDNN accepts `&tdnn-variant=` followed by
   any retained packed-convolution variant, including `cached-tile1-wg128` and
   production `direct-tile8-wg96`; transits accept
-  `&pointwise-transit-variant=full-cache` or `chunk512`;
+  `&pointwise-transit-variant=full-cache` or `chunk512`. Use `&batch=64` for
+  the diagnostic-only high-throughput graph; its inputs and expected outputs
+  repeat the independent B32 oracle rows;
 - `?raw-campplus-file-parity=1` compares real FBank windows with the retained
   ORT reference;
 - `?raw-campplus-dense-diagnostic=1` profiles the earlier B32 kernel geometry;
   and
 - `?raw-campplus-diagnostic=1` checks the packed convolution foundation.
 
-The B32 diagnostics are development oracles, not statements about current
+The B32/B64 diagnostics are development oracles, not statements about current
 production batching or residency.
 
 Run graph diagnostics through the isolated Chrome launcher from the repository

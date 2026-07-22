@@ -123,6 +123,16 @@ describe("model manifest selection", () => {
     expect(selected.explicitGpuBufferBytes).toBe(39_855_360);
   });
 
+  it("keeps diagnostic B64 out of production model selection", () => {
+    expect(() =>
+      selectCampPlusDirect(
+        "https://example.test/models/manifest.json",
+        directCampPlusModel(),
+        64,
+      ),
+    ).toThrow("does not support B64");
+  });
+
   it("resolves every artifact in the split segmentation contract", () => {
     const segmentation = segmentationModel();
     const selected = selectSegmentationSplit(

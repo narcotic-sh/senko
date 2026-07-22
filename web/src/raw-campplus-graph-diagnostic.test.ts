@@ -5,13 +5,37 @@ import { FCM_VARIANTS } from "./pipeline/campplus-webgpu/fcm";
 import { PACKED_BCT_CONV_VARIANTS } from "./pipeline/campplus-webgpu/packed-bct-conv";
 import { POINTWISE_TRANSIT_VARIANTS } from "./pipeline/campplus-webgpu/pointwise-transit";
 import {
+  deterministicFeatures,
+  parseBatchSize,
   parseDenseBottleneckVariant,
   parseFcmVariant,
   parsePointwiseTransitVariant,
   parseTdnnVariant,
+  repeatReferenceRows,
 } from "./raw-campplus-graph-diagnostic";
 
 describe("raw CAM++ graph diagnostic FCM selection", () => {
+  it("accepts diagnostic B64 while keeping B32 as the diagnostic default", () => {
+    expect(parseBatchSize(null)).toBe(32);
+    expect(parseBatchSize("64")).toBe(64);
+    expect(() => parseBatchSize("128")).toThrow("4, 8, 16, 32, or 64");
+  });
+
+  it("repeats the checked B32 input and oracle rows for B64 parity", () => {
+    const features = deterministicFeatures(64);
+    const rowFeatureCount = 150 * 80;
+    expect(
+      features.slice(32 * rowFeatureCount, 33 * rowFeatureCount),
+    ).toEqual(features.slice(0, rowFeatureCount));
+
+    const source = new Float32Array(32 * 192);
+    for (let row = 0; row < 32; row += 1) source[row * 192] = row + 0.5;
+    const expanded = repeatReferenceRows(source, 64);
+    expect(expanded).toHaveLength(64 * 192);
+    expect(expanded[32 * 192]).toBe(0.5);
+    expect(expanded[63 * 192]).toBe(31.5);
+  });
+
   it("defaults to the measured production variant", () => {
     expect(parseFcmVariant(null)).toBe("tile4-fold");
   });

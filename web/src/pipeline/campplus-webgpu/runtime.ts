@@ -60,23 +60,48 @@ export const RAW_CAMPPLUS_PREFERRED_LIMITS = {
   maxComputeWorkgroupStorageSize: POINTWISE_TRANSIT_TILE4_WORKGROUP_STORAGE_BYTES,
 } as const satisfies Record<string, number>;
 
-export function preferredRawCampPlusDeviceLimits(adapter: GPUAdapter): Record<string, number> {
-  requireRawCampPlusAdapterLimits(adapter);
+export function preferredRawCampPlusDeviceLimits(
+  adapter: GPUAdapter,
+  requiredBufferBytes = 0,
+): Record<string, number> {
+  requireRawCampPlusAdapterLimits(adapter, requiredBufferBytes);
   return {
     maxComputeWorkgroupStorageSize: Math.min(
       adapter.limits.maxComputeWorkgroupStorageSize,
       RAW_CAMPPLUS_PREFERRED_LIMITS.maxComputeWorkgroupStorageSize,
     ),
+    ...(requiredBufferBytes === 0
+      ? {}
+      : {
+          maxBufferSize: requiredBufferBytes,
+          maxStorageBufferBindingSize: requiredBufferBytes,
+        }),
   };
 }
 
-export function requireRawCampPlusAdapterLimits(adapter: GPUAdapter): void {
+export function requireRawCampPlusAdapterLimits(
+  adapter: GPUAdapter,
+  requiredBufferBytes = 0,
+): void {
+  if (!Number.isSafeInteger(requiredBufferBytes) || requiredBufferBytes < 0) {
+    throw new RangeError("Raw CAM++ required buffer size must be a non-negative integer");
+  }
   if (
     adapter.limits.maxComputeWorkgroupStorageSize <
     RAW_CAMPPLUS_REQUIRED_LIMITS.maxComputeWorkgroupStorageSize
   ) {
     throw new Error(
       `Raw CAM++ needs ${RAW_CAMPPLUS_REQUIRED_LIMITS.maxComputeWorkgroupStorageSize} workgroup bytes; adapter exposes ${adapter.limits.maxComputeWorkgroupStorageSize}`,
+    );
+  }
+  if (adapter.limits.maxBufferSize < requiredBufferBytes) {
+    throw new Error(
+      `Raw CAM++ needs a ${requiredBufferBytes}-byte buffer; adapter exposes ${adapter.limits.maxBufferSize}`,
+    );
+  }
+  if (adapter.limits.maxStorageBufferBindingSize < requiredBufferBytes) {
+    throw new Error(
+      `Raw CAM++ needs a ${requiredBufferBytes}-byte storage binding; adapter exposes ${adapter.limits.maxStorageBufferBindingSize}`,
     );
   }
 }

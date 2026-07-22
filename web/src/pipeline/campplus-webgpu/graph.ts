@@ -33,7 +33,7 @@ const BOTTLENECK_CHANNELS = 128;
 const EMBEDDING_CHANNELS = 192;
 export const CAMPPLUS_RAW_MAX_IN_FLIGHT_RUNS = 2;
 
-export type CampPlusRawBatchSize = 4 | 8 | 16 | 32;
+export type CampPlusRawBatchSize = 4 | 8 | 16 | 32 | 64;
 
 export interface CampPlusRawGraphOptions extends CampPlusPackageLoadOptionsOnly {
   readonly batchSize?: CampPlusRawBatchSize;
@@ -125,7 +125,90 @@ const ARENA_BYTES = {
   8: 12_902_400,
   16: 25_190_400,
   32: 49_152_000,
+  // B64 is diagnostic-only. Unlike the smaller metadata-authored hybrid
+  // plans, its raw full graph needs no preserved B32 dense-backbone state, so
+  // the exact FCM live peak is the complete arena requirement.
+  64: 98_304_000,
 } as const satisfies Record<CampPlusRawBatchSize, number>;
+
+export interface CampPlusRawArenaPlan {
+  readonly activationArenaBytes: number;
+  readonly minimumActivationArenaBytes: number;
+  readonly fcmPeakBytes: number;
+  readonly denseBackbonePeakBytes: number;
+}
+
+export interface CampPlusRawGraphVariableGpuBytes {
+  readonly activationArena: number;
+  readonly input: number;
+  readonly output: number;
+  readonly readback: number;
+  readonly total: number;
+}
+
+/**
+ * Exact graph-local activation lifetimes for one raw full-graph batch.
+ *
+ * FCM uses three aliased regions at its peak (A80, B40, C40). After TDNN,
+ * those values are dead and the same arena becomes two dense slabs followed
+ * by one bottleneck scratch tensor and its doubled-mean vector.
+ */
+export function campPlusRawArenaPlan(
+  batchSize: CampPlusRawBatchSize,
+): CampPlusRawArenaPlan {
+  const fcmPeakBytes =
+    fcmBytes(batchSize, 80) +
+    fcmBytes(batchSize, 40) +
+    fcmBytes(batchSize, 40);
+  const denseSlabBytes =
+    batchSize * DENSE_SLAB_CHANNELS * TDNN_FRAMES * 2;
+  const denseScratchBytes =
+    batchSize * BOTTLENECK_CHANNELS * TDNN_FRAMES * 2;
+  const doubledMeanBytes = batchSize * BOTTLENECK_CHANNELS * 2;
+  const denseBackbonePeakBytes =
+    denseSlabBytes * 2 + denseScratchBytes + doubledMeanBytes;
+  const minimumActivationArenaBytes = Math.max(
+    fcmPeakBytes,
+    denseBackbonePeakBytes,
+  );
+  const activationArenaBytes = ARENA_BYTES[batchSize];
+  if (activationArenaBytes < minimumActivationArenaBytes) {
+    throw new Error(
+      `CAM++ B${batchSize} arena plan is ${activationArenaBytes} bytes; graph lifetimes require ${minimumActivationArenaBytes}`,
+    );
+  }
+  return {
+    activationArenaBytes,
+    minimumActivationArenaBytes,
+    fcmPeakBytes,
+    denseBackbonePeakBytes,
+  };
+}
+
+/** Exact graph-owned variable buffers, excluding batch-independent weights and uniforms. */
+export function campPlusRawGraphVariableGpuBytes(
+  batchSize: CampPlusRawBatchSize,
+): CampPlusRawGraphVariableGpuBytes {
+  const activationArena = campPlusRawArenaPlan(batchSize).activationArenaBytes;
+  const input = batchSize * FRAMES * FEATURES * 4;
+  const output = batchSize * EMBEDDING_CHANNELS * 4;
+  const readback = output * CAMPPLUS_RAW_MAX_IN_FLIGHT_RUNS;
+  return {
+    activationArena,
+    input,
+    output,
+    readback,
+    total: activationArena + input + output + readback,
+  };
+}
+
+/** Largest storage binding/buffer required before constructing the device. */
+export function campPlusRawRequiredBufferBytes(
+  batchSize: CampPlusRawBatchSize,
+): number {
+  const bytes = campPlusRawGraphVariableGpuBytes(batchSize);
+  return Math.max(bytes.activationArena, bytes.input, bytes.output);
+}
 
 /** Static 119-dispatch CAM++ graph, encoded into one command buffer/submission. */
 export class CampPlusRawGraph {
@@ -164,9 +247,7 @@ export class CampPlusRawGraph {
     this.denseBottleneckVariant = denseBottleneckVariant;
     this.tdnnVariant = foundation.packedConvolution.variant;
     this.pointwiseTransitVariant = foundation.pointwiseTransit.variant;
-    const input = batchSize * FRAMES * FEATURES * 4;
-    const output = batchSize * EMBEDDING_CHANNELS * 4;
-    const readback = output * CAMPPLUS_RAW_MAX_IN_FLIGHT_RUNS;
+    const variableBytes = campPlusRawGraphVariableGpuBytes(batchSize);
     const timestampBuffers = readbackSlots.reduce(
       (sum, slot) =>
         sum +
@@ -181,16 +262,16 @@ export class CampPlusRawGraph {
     this.gpuBytes = {
       weights: foundation.gpuBytes.weights,
       activationArena: foundation.gpuBytes.activationArena,
-      input,
-      output,
-      readback,
+      input: variableBytes.input,
+      output: variableBytes.output,
+      readback: variableBytes.readback,
       timestampBuffers,
       dispatchUniforms,
       total:
         foundation.gpuBytes.total +
-        input +
-        output +
-        readback +
+        variableBytes.input +
+        variableBytes.output +
+        variableBytes.readback +
         timestampBuffers +
         dispatchUniforms,
     };
@@ -202,13 +283,14 @@ export class CampPlusRawGraph {
     options: CampPlusRawGraphOptions = {},
   ): Promise<CampPlusRawGraph> {
     const batchSize = options.batchSize ?? 32;
+    const arenaPlan = campPlusRawArenaPlan(batchSize);
     const denseBottleneckVariant =
       options.denseBottleneckVariant ?? DEFAULT_DENSE_BOTTLENECK_VARIANT;
     const denseBottleneckConfiguration =
       denseBottleneckVariantConfiguration(denseBottleneckVariant);
     const tdnnVariant = options.tdnnVariant ?? DEFAULT_PACKED_BCT_CONV_VARIANT;
     const loadOptions: RawCampPlusFoundationOptions = {
-      activationArenaBytes: ARENA_BYTES[batchSize],
+      activationArenaBytes: arenaPlan.activationArenaBytes,
       ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
       ...(options.onProgress === undefined ? {} : { onProgress: options.onProgress }),
       ...(options.fcmVariant === undefined
@@ -232,8 +314,20 @@ export class CampPlusRawGraph {
       const declaredPlan = foundation.gpuPackage.metadata.memory.tradeoffs.find(
         (item) => item.frontendMicrobatch === batchSize,
       );
-      if (declaredPlan?.activationArenaBytes !== ARENA_BYTES[batchSize]) {
+      if (
+        declaredPlan !== undefined &&
+        declaredPlan.activationArenaBytes !== arenaPlan.activationArenaBytes
+      ) {
+        throw new Error(`Packed CAM++ metadata has the wrong B${batchSize} arena plan`);
+      }
+      if (declaredPlan === undefined && batchSize !== 64) {
         throw new Error(`Packed CAM++ metadata is missing the B${batchSize} arena plan`);
+      }
+      if (
+        declaredPlan === undefined &&
+        foundation.gpuPackage.metadata.contract.inputShape[0] !== 32
+      ) {
+        throw new Error("Diagnostic B64 requires the checked B32 batch-independent package");
       }
       const inputBytes = batchSize * FRAMES * FEATURES * 4;
       const outputBytes = batchSize * EMBEDDING_CHANNELS * 4;
