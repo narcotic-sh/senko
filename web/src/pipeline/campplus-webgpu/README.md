@@ -101,9 +101,9 @@ and tile-8/WG128 were likewise tested and rejected without retaining their
 experimental code.
 
 The latest cooled production acceptance of the one-hour fixture completed in
-12.939250 seconds: VAD 2.890530 seconds, CAM++ embedding 8.242635 seconds,
-clustering 1.766425 seconds, and postprocessing 0.004110 seconds. FBank took
-3.000765 seconds but overlaps CAM++. The short fixture completed in 1.973510
+12.687805 seconds: VAD 2.889695 seconds, CAM++ embedding 8.261905 seconds,
+clustering 1.497055 seconds, and postprocessing 0.003820 seconds. FBank took
+2.959555 seconds but overlaps CAM++. The short fixture completed in 1.956935
 seconds with the exact expected 4-speaker/49-segment result. The long result
 passed the offline-Senko timeline gates with 9 speakers and 137 segments.
 Exact-boundary windows compared with native Core ML had mean embedding cosine

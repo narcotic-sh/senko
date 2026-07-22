@@ -4,7 +4,11 @@ import { performance } from "node:perf_hooks";
 import { describe, expect, it } from "vitest";
 
 import { clusterSparseGraph } from "../../src/clustering/hierarchy";
-import { buildExactEuclideanKnn } from "../../src/clustering/knn";
+import {
+  buildApproximateCosineKnn,
+  buildExactEuclideanKnn,
+  normalizeRows,
+} from "../../src/clustering/knn";
 import type { ClusteringNumericKernels } from "../../src/clustering/numeric-kernels";
 import {
   mergeSimilarCentroids,
@@ -38,6 +42,16 @@ describe.skipIf(!enabled)("clustering WASM benchmark", () => {
           warmupMs: performance.now() - warmupStarted,
         }),
       );
+      const seedParity = benchmarkSeedParity(embeddings, kernels);
+      console.info(JSON.stringify(seedParity.reference));
+      console.info(JSON.stringify(seedParity.candidate));
+      expect(seedParity.candidate.exactIndices).toBe(true);
+      expect(seedParity.candidate.exactSimilarities).toBe(true);
+      expect(seedParity.candidate.memory.heapBytes).toBe(9 * 1024 * 1024);
+      expect(seedParity.candidate.memory.peakArenaUsedBytes).toBeLessThanOrEqual(
+        seedParity.candidate.memory.arenaCapacityBytes,
+      );
+
       const reference = runPipeline(embeddings);
       console.info(JSON.stringify({ backend: "typescript", ...reference.stats }));
 
@@ -71,6 +85,63 @@ interface BenchmarkStats {
   readonly postprocessMs: number;
   readonly clusterCount: number;
   readonly umap: UmapProjectionStats;
+}
+
+function benchmarkSeedParity(
+  embeddings: Float32Array,
+  kernels: WasmClusteringKernels,
+): {
+  readonly reference: {
+    readonly backend: "typescript-seed";
+    readonly totalMs: number;
+  };
+  readonly candidate: {
+    readonly backend: "wasm-fused-seed";
+    readonly totalMs: number;
+    readonly exactIndices: boolean;
+    readonly exactSimilarities: boolean;
+    readonly memory: ReturnType<typeof readKernelMemoryStats>;
+  };
+} {
+  const options = resolveClusteringOptions({ neighborCount: 64 });
+  const referenceStarted = performance.now();
+  const normalized = normalizeRows(embeddings, COUNT, DIMENSION);
+  const reference = buildApproximateCosineKnn(
+    normalized,
+    COUNT,
+    DIMENSION,
+    options,
+  );
+  const referenceMs = performance.now() - referenceStarted;
+
+  const candidateStarted = performance.now();
+  const candidate = kernels.buildNormalizedApproximateCosineKnn(
+    embeddings,
+    COUNT,
+    DIMENSION,
+    options,
+  );
+  const candidateMs = performance.now() - candidateStarted;
+  return {
+    reference: {
+      backend: "typescript-seed",
+      totalMs: referenceMs,
+    },
+    candidate: {
+      backend: "wasm-fused-seed",
+      totalMs: candidateMs,
+      exactIndices: equalInt32(candidate.indices, reference.indices),
+      exactSimilarities: equalFloat32(
+        candidate.similarities,
+        reference.similarities,
+      ),
+      memory: readKernelMemoryStats(kernels),
+    },
+  };
+}
+
+function readKernelMemoryStats(kernels: WasmClusteringKernels) {
+  return kernels.memoryStats;
 }
 
 function runPipeline(
@@ -159,6 +230,14 @@ function equalInt32(left: Int32Array, right: Int32Array): boolean {
   if (left.length !== right.length) return false;
   for (let index = 0; index < left.length; index += 1) {
     if (left[index] !== right[index]) return false;
+  }
+  return true;
+}
+
+function equalFloat32(left: Float32Array, right: Float32Array): boolean {
+  if (left.length !== right.length) return false;
+  for (let index = 0; index < left.length; index += 1) {
+    if (!Object.is(left[index], right[index])) return false;
   }
   return true;
 }

@@ -43,6 +43,18 @@ describe("WasmClusteringKernels", () => {
       expect(approximate.indices).toEqual(expectedApproximate.indices);
       expect(approximate.similarities).toEqual(expectedApproximate.similarities);
 
+      const fusedApproximate =
+        kernels.buildNormalizedApproximateCosineKnn(
+          embeddings,
+          count,
+          dim,
+          options,
+        );
+      expect(fusedApproximate.indices).toEqual(expectedApproximate.indices);
+      expect(fusedApproximate.similarities).toEqual(
+        expectedApproximate.similarities,
+      );
+
       const exact = kernels.buildExactEuclideanKnn(
         embeddings,
         count,

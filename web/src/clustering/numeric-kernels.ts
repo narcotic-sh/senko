@@ -44,6 +44,14 @@ export interface ClusteringNumericKernels {
     options: ResolvedClusteringOptions,
   ): NumericKnnGraph;
 
+  /** Normalize in place in the numeric backend and build the UMAP seed graph. */
+  buildNormalizedApproximateCosineKnn(
+    embeddings: Float32Array,
+    count: number,
+    dim: number,
+    options: ResolvedClusteringOptions,
+  ): NumericKnnGraph;
+
   refineEuclideanNeighbors(
     embeddings: Float32Array,
     count: number,

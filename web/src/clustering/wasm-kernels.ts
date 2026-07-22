@@ -6,7 +6,10 @@ import type {
   NumericKnnGraph,
   NumericNeighborHeap,
 } from "./numeric-kernels";
-import type { ResolvedClusteringOptions } from "./types";
+import {
+  DEFAULT_CLUSTERING_OPTIONS,
+  type ResolvedClusteringOptions,
+} from "./types";
 
 let compiledModule: Promise<WebAssembly.Module> | undefined;
 
@@ -119,19 +122,21 @@ export class WasmClusteringKernels implements ClusteringNumericKernels {
       state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
       values[index] = ((state >>> 8) / 0x01000000) * 2 - 1;
     }
-    const seedIndices = new Int32Array(count * seedNeighborCount);
-    for (let row = 0; row < count; row += 1) {
-      for (let rank = 0; rank < seedNeighborCount; rank += 1) {
-        seedIndices[row * seedNeighborCount + rank] =
-          (row + rank + 1) % count;
-      }
-    }
+    const seed = this.buildNormalizedApproximateCosineKnn(
+      values,
+      count,
+      dim,
+      {
+        ...DEFAULT_CLUSTERING_OPTIONS,
+        neighborCount: seedNeighborCount,
+      },
+    );
     this.refineEuclideanNeighbors(
       values,
       count,
       dim,
       20,
-      seedIndices,
+      seed.indices,
       seedNeighborCount,
       0x6d2b79f5,
     );
@@ -164,12 +169,61 @@ export class WasmClusteringKernels implements ClusteringNumericKernels {
     options: ResolvedClusteringOptions,
   ): NumericKnnGraph {
     requireMatrix("normalized embeddings", normalized, count, dim);
-    const neighborCount = Math.min(options.neighborCount, Math.max(0, count - 1));
+    const neighborCount = Math.min(
+      options.neighborCount,
+      Math.max(0, count - 1),
+    );
     if (neighborCount === 0) {
       return emptyKnnGraph();
     }
     const exports = this.beginOperation();
     const valuesPointer = this.copyFloat32(exports, normalized);
+    return this.buildApproximateCosineKnnInCurrentArena(
+      exports,
+      valuesPointer,
+      count,
+      dim,
+      neighborCount,
+      options,
+    );
+  }
+
+  buildNormalizedApproximateCosineKnn(
+    embeddings: Float32Array,
+    count: number,
+    dim: number,
+    options: ResolvedClusteringOptions,
+  ): NumericKnnGraph {
+    requireMatrix("embeddings", embeddings, count, dim);
+    const neighborCount = Math.min(options.neighborCount, Math.max(0, count - 1));
+    if (neighborCount === 0) {
+      return emptyKnnGraph();
+    }
+    const exports = this.beginOperation();
+    const valuesPointer = this.copyFloat32(exports, embeddings);
+    this.requireSuccess(
+      "normalize rows",
+      exports.cluster_normalize_rows(valuesPointer, valuesPointer, count, dim),
+      exports,
+    );
+    return this.buildApproximateCosineKnnInCurrentArena(
+      exports,
+      valuesPointer,
+      count,
+      dim,
+      neighborCount,
+      options,
+    );
+  }
+
+  private buildApproximateCosineKnnInCurrentArena(
+    exports: ClusteringWasmExports,
+    valuesPointer: number,
+    count: number,
+    dim: number,
+    neighborCount: number,
+    options: ResolvedClusteringOptions,
+  ): NumericKnnGraph {
     const outputLength = count * neighborCount;
     const indicesPointer = this.allocate(
       exports,

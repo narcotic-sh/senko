@@ -8,7 +8,9 @@ post-processing behavior without materializing an `N x N` matrix:
    specialized typed-array UMAP: 20 neighbors, minimum distance 0, 50 epochs,
    and a fixed Mulberry32 seed.
 2. Seed UMAP neighborhoods with deterministic random-hyperplane LSH, re-rank
-   candidates exactly, then refine them with Euclidean neighbor descent.
+   candidates exactly, then refine them with Euclidean neighbor descent. The
+   production WASM path normalizes and builds this seed graph in one arena
+   operation, so it never returns a separate normalized embedding matrix.
 3. Construct the fuzzy simplicial graph using radix-sorted typed edge arrays
    and optimize the layout in one flat `Float32Array`.
 4. Build an exact Euclidean 40-nearest-neighbor graph over the 10-dimensional
@@ -27,12 +29,15 @@ than exhaustively compared. The post-UMAP exact graph is quadratic in distance
 computations but linear in retained memory.
 
 `onUmapStats` exposes stage timings and deterministic typed-array allocation
-accounting. On the native hour-long reference, UMAP's logical peak is about
-7.5 MB including its 0.23 MB output. Process-level profiling is higher because
-it includes V8, input data, and downstream clustering allocations.
+accounting. On the native hour-long reference, the production WASM-assisted
+path's logical peak is about 5.1 MB including its 0.23 MB output. The fixed
+9 MiB WASM heap and caller-owned embeddings are reported separately.
+Process-level profiling is higher because it also includes V8 and downstream
+clustering allocations.
 
-Production workers preload one fixed-memory WASM kernel instance. Euclidean
-neighbor refinement and exact post-UMAP k-NN run there; TypeScript retains
-layout, hierarchy selection, and Senko's `CommonClustering` orchestration.
+Production workers preload one fixed-memory WASM kernel instance. Fused
+normalization plus seed k-NN, Euclidean neighbor refinement, and exact
+post-UMAP k-NN run there; TypeScript retains layout, hierarchy selection, and
+Senko's `CommonClustering` orchestration.
 See [`scripts/clustering-wasm/README.md`](../../scripts/clustering-wasm/README.md)
 for the reproducible benchmark and fixed-memory accounting.

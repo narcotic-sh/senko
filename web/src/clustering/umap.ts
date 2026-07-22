@@ -1,4 +1,8 @@
-import { buildApproximateCosineKnn, normalizeRows } from "./knn";
+import {
+  buildApproximateCosineKnn,
+  normalizeRows,
+  type KnnGraph,
+} from "./knn";
 import type { ClusteringNumericKernels } from "./numeric-kernels";
 import type {
   ResolvedClusteringOptions,
@@ -73,17 +77,25 @@ export function projectWithUmap(
   const random = createDeterministicRandom(options.umapRandomSeed);
 
   const seedStarted = performance.now();
-  const normalized = normalizeRows(embeddings, count, dim);
-  allocations.retain(normalized.byteLength);
   const seedNeighborCount = Math.min(64, count - 1);
-  allocations.observeAdditional(
-    estimateApproximateKnnPeakBytes(count, dim, seedNeighborCount, options),
-  );
-  const seed = buildApproximateCosineKnn(normalized, count, dim, {
-    ...options,
-    neighborCount: seedNeighborCount,
-  });
-  allocations.release(normalized.byteLength);
+  const seedOptions = { ...options, neighborCount: seedNeighborCount };
+  let seed: KnnGraph;
+  if (kernels === undefined) {
+    const normalized = normalizeRows(embeddings, count, dim);
+    allocations.retain(normalized.byteLength);
+    allocations.observeAdditional(
+      estimateApproximateKnnPeakBytes(count, dim, seedNeighborCount, options),
+    );
+    seed = buildApproximateCosineKnn(normalized, count, dim, seedOptions);
+    allocations.release(normalized.byteLength);
+  } else {
+    seed = kernels.buildNormalizedApproximateCosineKnn(
+      embeddings,
+      count,
+      dim,
+      seedOptions,
+    );
+  }
   allocations.retain(seed.indices.byteLength + seed.similarities.byteLength);
   const seedKnnMs = performance.now() - seedStarted;
 

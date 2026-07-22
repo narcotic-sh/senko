@@ -71,11 +71,11 @@ appropriate before treating this single sample as a stable median.
 
 | Fixture | Worker wall | VAD | FBank | CAM++ | Clustering | Postprocess | Result |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| `test_audio_short.wav` | **1.973510 s** | 0.450380 s | 0.383775 s | 1.311960 s | 0.194610 s | 0.001340 s | 4 speakers, 49 segments |
-| `test_audio.wav` | **12.939250 s** | 2.890530 s | 3.000765 s | 8.242635 s | 1.766425 s | 0.004110 s | 9 speakers, 137 segments |
+| `test_audio_short.wav` | **1.956935 s** | 0.437705 s | 0.382130 s | 1.312075 s | 0.191095 s | 0.001545 s | 4 speakers, 49 segments |
+| `test_audio.wav` | **12.687805 s** | 2.889695 s | 2.959555 s | 8.261905 s | 1.497055 s | 0.003820 s | 9 speakers, 137 segments |
 
-The long checkpoint is 2.061 seconds below the 15-second stretch target and
-2.939 seconds above the aspirational 10-second target. The production CAM++
+The long checkpoint is 2.312 seconds below the 15-second stretch target and
+2.688 seconds above the aspirational 10-second target. The production CAM++
 graph now combines `tile4-fold` FCM, `direct-tile8-wg96` initial TDNN,
 `direct-tile4-wg128` dense bottlenecks, and `chunk512` pointwise transits. The
 TDNN replaces cached tile-1 with a 96-lane workgroup that shares each input
@@ -89,6 +89,14 @@ GPU median. Its fingerprint was identical to baseline and explicit GPU buffers
 did not change. Tile-16 and tile-8/WG128 were measured and rejected without
 retaining their experimental code. The earlier dense, transit, and FCM A/B
 results remain documented in the raw runtime README and retained artifacts.
+
+Long-file UMAP now performs row normalization and deterministic 64-neighbor
+seed discovery as one warmed operation in the fixed clustering WASM arena. On
+the 5,713-row reference fixture, seed construction fell from 395.021 ms to
+179.750 ms while returning byte-identical indices and similarities. Three
+complete hybrid clustering trials took 1.424-1.437 seconds with byte-identical
+final labels and ARI 1.0. The production long-file clustering stage consequently
+fell from 1.766425 seconds to 1.497055 seconds in the isolated acceptance run.
 
 A thermally contended raw-graph A/B measured B16 at 59.5317 ms per 16 items
 and B32 at 115.5783 ms per 32 items. B32 improved per-item throughput by only
@@ -127,13 +135,13 @@ and its native labels scatter. The evidence therefore favors eight meaningful
 speakers. Senko does not add fixture-specific label or count forcing to obtain
 that result; the browser retains the native postprocessing semantics.
 
-The current exact/lower-bound memory accounting is unchanged by the dense and
-transit kernel optimizations:
+The fused WASM seed lowers long-file logical working memory while leaving the
+fixed WASM heap and explicit GPU-buffer ceiling unchanged:
 
 | Fixture | Known CPU peak | Explicit GPU-buffer peak | Fixed WASM heaps | Isolated page + worker diagnostic |
 | --- | ---: | ---: | ---: | ---: |
 | `test_audio_short.wav` | 5,571,936 B | 39,855,360 B | 9,961,472 B | 11,899,769 B post-run-1 baseline |
-| `test_audio.wav` | 12,250,848 B | 39,855,360 B | 9,961,472 B | 17,448,302 B peak; 12,002,711 B complete |
+| `test_audio.wav` | 9,824,152 B | 39,855,360 B | 9,961,472 B | 18,950,563 B sampled peak; 12,015,761 B post-run baseline |
 
 These columns are complementary measurements and must not be added together.
 The page value is Chrome's coarse `measureUserAgentSpecificMemory()` result for
@@ -142,11 +150,16 @@ new isolated Chrome profile with one tab, so it excludes the user's other
 Chrome windows and tabs. The 118,273,444-byte long-file `Blob` is externally
 held and streamed without making a file-sized copy; it is therefore reported
 separately from `knownCpuPeakBytes`. The long run's largest named CPU working
-allocation is 7,544,032 bytes for clustering.
+allocation is 5,117,336 bytes for clustering.
 
-Production's fixed ownership remains 12,250,848 bytes at the known long-file
+Production's fixed ownership is 9,824,152 bytes at the known long-file
 CPU peak, 39,855,360 bytes of explicit GPU buffers, and 9,961,472 bytes across
 the fixed WASM heaps. The external zero-copy audio `Blob` is 118,273,444 bytes.
+The one-shot page-memory sampler observed 18,950,563 bytes at completion before
+collection of transient clustering arrays. The retained-memory protocol below
+measured the comparable post-GC baseline near 12 MB and is the stronger leak
+signal; Chrome's coarse page samples and the exact logical allocation ledger
+answer different questions.
 
 The ring adds the named `camOutputBatchBytes = 24,576` host allocation for two
 returned B16 output arrays. That lifetime is below the existing VAD peak on the
@@ -165,8 +178,8 @@ Chrome's coarse measurement. For historical comparison, the pre-ring
 diagnostic measured 11,893,545 and 12,037,500 bytes, a +143,955-byte delta,
 across 2,933.05 ms and 3,221.89 ms non-acceptance runs.
 
-The current long-file retained-memory diagnostic measured 11,986,837 bytes
-after run 1 and 12,081,119 bytes after run 2, a +94,282-byte delta (0.79%).
+The current long-file retained-memory diagnostic measured 12,015,761 bytes
+after run 1 and 12,108,155 bytes after run 2, a +92,394-byte delta (0.77%).
 Both passes completed with neither model resident, so this is the comparable
 per-run growth signal rather than the larger one-time transition from the
 initial VAD-resident state. The difference is small enough to be consistent
