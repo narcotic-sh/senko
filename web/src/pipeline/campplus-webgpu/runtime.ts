@@ -12,10 +12,12 @@ import {
 } from "./fcm";
 import { FinalStatsDenseKernel } from "./final-stats-dense";
 import {
+  DEFAULT_PACKED_BCT_CONV_VARIANT,
   PACKED_BCT_REQUIRED_WORKGROUP_STORAGE_BYTES,
   PackedBctConvKernel,
   type PackedBctConvDescriptor,
   type PackedBctConvDispatch,
+  type PackedBctConvVariant,
 } from "./packed-bct-conv";
 import {
   POINTWISE_TRANSIT_REQUIRED_WORKGROUP_STORAGE_BYTES,
@@ -40,6 +42,8 @@ export interface RawCampPlusFoundationOptions extends CampPlusPackageLoadOptions
   readonly activationArenaBytes?: number;
   /** Diagnostic FCM kernel selection; omission uses the measured production default. */
   readonly fcmVariant?: FcmVariant;
+  /** Diagnostic packed TDNN selection; omission uses the production default. */
+  readonly packedBctConvVariant?: PackedBctConvVariant;
   /** Diagnostic transit kernel selection; omission uses the production default. */
   readonly pointwiseTransitVariant?: PointwiseTransitVariant;
 }
@@ -133,7 +137,12 @@ export class RawCampPlusFoundation {
         finalStatsDense,
         pointwiseTransit,
       ] = await Promise.all([
-        PackedBctConvKernel.create(device, gpuPackage, arena),
+        PackedBctConvKernel.create(
+          device,
+          gpuPackage,
+          arena,
+          options.packedBctConvVariant ?? DEFAULT_PACKED_BCT_CONV_VARIANT,
+        ),
         DenseCamKernels.create(device, gpuPackage, arena),
         FcmKernels.create(
           device,

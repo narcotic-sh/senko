@@ -10,7 +10,11 @@ import {
 } from "./dense-cam";
 import type { FcmDispatch, FcmVariant } from "./fcm";
 import type { FinalStatsDenseDispatch } from "./final-stats-dense";
-import type { PackedBctConvDispatch } from "./packed-bct-conv";
+import {
+  DEFAULT_PACKED_BCT_CONV_VARIANT,
+  type PackedBctConvDispatch,
+  type PackedBctConvVariant,
+} from "./packed-bct-conv";
 import type {
   PointwiseTransitDispatch,
   PointwiseTransitVariant,
@@ -37,6 +41,8 @@ export interface CampPlusRawGraphOptions extends CampPlusPackageLoadOptionsOnly 
   readonly fcmVariant?: FcmVariant;
   /** Selects a dense bottleneck kernel; omission uses the production baseline. */
   readonly denseBottleneckVariant?: DenseBottleneckVariant;
+  /** Selects the packed initial-TDNN kernel; omission uses the production default. */
+  readonly tdnnVariant?: PackedBctConvVariant;
   /** Selects a pointwise transit kernel; omission uses the production default. */
   readonly pointwiseTransitVariant?: PointwiseTransitVariant;
 }
@@ -129,6 +135,7 @@ export class CampPlusRawGraph {
   readonly dispatchCount: number;
   readonly fcmVariant: FcmVariant;
   readonly denseBottleneckVariant: DenseBottleneckVariant;
+  readonly tdnnVariant: PackedBctConvVariant;
   readonly pointwiseTransitVariant: PointwiseTransitVariant;
 
   private readonly readbackSlots: readonly CampPlusRawReadbackSlot[];
@@ -155,6 +162,7 @@ export class CampPlusRawGraph {
     this.dispatchCount = schedule.all.length;
     this.fcmVariant = foundation.fcm.variant;
     this.denseBottleneckVariant = denseBottleneckVariant;
+    this.tdnnVariant = foundation.packedConvolution.variant;
     this.pointwiseTransitVariant = foundation.pointwiseTransit.variant;
     const input = batchSize * FRAMES * FEATURES * 4;
     const output = batchSize * EMBEDDING_CHANNELS * 4;
@@ -198,6 +206,7 @@ export class CampPlusRawGraph {
       options.denseBottleneckVariant ?? DEFAULT_DENSE_BOTTLENECK_VARIANT;
     const denseBottleneckConfiguration =
       denseBottleneckVariantConfiguration(denseBottleneckVariant);
+    const tdnnVariant = options.tdnnVariant ?? DEFAULT_PACKED_BCT_CONV_VARIANT;
     const loadOptions: RawCampPlusFoundationOptions = {
       activationArenaBytes: ARENA_BYTES[batchSize],
       ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
@@ -205,6 +214,7 @@ export class CampPlusRawGraph {
       ...(options.fcmVariant === undefined
         ? {}
         : { fcmVariant: options.fcmVariant }),
+      packedBctConvVariant: tdnnVariant,
       ...(options.pointwiseTransitVariant === undefined
         ? {}
         : { pointwiseTransitVariant: options.pointwiseTransitVariant }),

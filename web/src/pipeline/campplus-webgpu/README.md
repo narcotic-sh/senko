@@ -36,6 +36,12 @@ strip-mine input channels in 512-channel chunks, reducing workgroup storage
 from 32 KiB to 16 KiB while preserving accumulation order. Production compiles
 only these selected dense and transit pipelines.
 
+The initial TDNN uses `direct-tile8-wg96`. It replaces the cached tile-1
+geometry with a 96-lane workgroup that evaluates each input once for eight
+adjacent output vec4 groups. Reading packed weights directly removes the
+12,800-byte workgroup cache and its synchronization barrier while preserving
+the kernel/channel FMA order of every output exactly.
+
 The packed package loader validates metadata, section ranges, fixed headers,
 source/payload hashes, and the whole-binary hash. It streams the 13,852,416-byte
 weight package directly into one GPU buffer, retaining no full weight copy on
@@ -77,24 +83,27 @@ but they are not the production choice.
 ## Current validation
 
 On the target M3 Mac, the production combination (`tile4-fold`,
-`direct-tile4-wg128`, and `chunk512`) has produced an exact 24.969216 ms B16
-whole-graph GPU sample. In the interleaved transit A/B, `chunk512` had a
-25.100288 ms pooled graph median versus 27.590656 ms for the full-cache shader.
-The preceding dense A/B measured 27.7217 ms for direct tile-4 versus 30.8019 ms
-for direct tile-2. Output fingerprints and parity results were identical in
-both experiments, and neither optimization changes explicit GPU-buffer
-residency.
+`direct-tile8-wg96` TDNN, `direct-tile4-wg128` dense bottlenecks, and
+`chunk512` transits) measured a 22.806528 ms nine-run pooled B16 whole-graph GPU
+median. The TDNN itself fell from 3.080192 ms for cached tile-1 to
+0.655360-0.720896 ms for the winner. The preceding transit A/B measured
+25.100288 ms for `chunk512` versus 27.590656 ms for the full-cache shader, and
+the dense A/B measured 27.7217 ms for direct tile-4 versus 30.8019 ms for
+direct tile-2. Output fingerprints and parity results were identical, and none
+of these optimizations changes explicit GPU-buffer residency.
 
-An FCM tile-8 follow-up was measured and rejected rather than retained. Its
-representative whole-graph time was approximately 26.782 ms versus 24.969216 ms
-for production tile-4, and its FCM group took approximately 8.389 ms versus
-6.750 ms. The larger 20 KiB workgroup footprint reduced occupancy enough to
-outweigh the lower dispatch count.
+An FCM tile-8 follow-up was measured and rejected rather than retained. In its
+contemporaneous paired run, its representative whole-graph time was
+approximately 26.782 ms versus 24.969216 ms for tile-4, and its FCM group took
+approximately 8.389 ms versus 6.750 ms. The larger 20 KiB workgroup footprint
+reduced occupancy enough to outweigh the lower dispatch count. TDNN tile-16
+and tile-8/WG128 were likewise tested and rejected without retaining their
+experimental code.
 
 The latest cooled production acceptance of the one-hour fixture completed in
-13.680845 seconds: VAD 2.885215 seconds, CAM++ embedding 9.091250 seconds,
-clustering 1.683555 seconds, and postprocessing 0.003610 seconds. FBank took
-3.067940 seconds but overlaps CAM++. The short fixture completed in 2.094945
+12.939250 seconds: VAD 2.890530 seconds, CAM++ embedding 8.242635 seconds,
+clustering 1.766425 seconds, and postprocessing 0.004110 seconds. FBank took
+3.000765 seconds but overlaps CAM++. The short fixture completed in 1.973510
 seconds with the exact expected 4-speaker/49-segment result. The long result
 passed the offline-Senko timeline gates with 9 speakers and 137 segments.
 Exact-boundary windows compared with native Core ML had mean embedding cosine
@@ -107,7 +116,9 @@ The retained browser diagnostics are intentionally separate from production:
   `&batch=16&fcm-variant=tile1-split`, `tile1-fold`, `tile2-fold`, or
   `tile4-fold` for the retained FCM A/B variants. Dense bottlenecks accept
   `&dense-bottleneck-variant=direct-tile1-wg128`, `direct-tile2-wg128`, or
-  `direct-tile4-wg128`; transits accept
+  `direct-tile4-wg128`; the initial TDNN accepts `&tdnn-variant=` followed by
+  any retained packed-convolution variant, including `cached-tile1-wg128` and
+  production `direct-tile8-wg96`; transits accept
   `&pointwise-transit-variant=full-cache` or `chunk512`;
 - `?raw-campplus-file-parity=1` compares real FBank windows with the retained
   ORT reference;
@@ -123,7 +134,7 @@ root (after starting the production preview):
 
 ```bash
 node web/scripts/benchmark/run-browser-diagnostic.mjs \
-  --url 'http://127.0.0.1:4173/?raw-campplus-graph-diagnostic=1&batch=16&fcm-variant=tile4-fold&dense-bottleneck-variant=direct-tile4-wg128&pointwise-transit-variant=chunk512' \
+  --url 'http://127.0.0.1:4173/?raw-campplus-graph-diagnostic=1&batch=16&fcm-variant=tile4-fold&tdnn-variant=direct-tile8-wg96&dense-bottleneck-variant=direct-tile4-wg128&pointwise-transit-variant=chunk512' \
   --remove-profile
 ```
 

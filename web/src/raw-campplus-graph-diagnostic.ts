@@ -17,6 +17,12 @@ import {
   type FcmVariant,
 } from "./pipeline/campplus-webgpu/fcm";
 import {
+  DEFAULT_PACKED_BCT_CONV_VARIANT,
+  PACKED_BCT_CONV_VARIANTS,
+  isPackedBctConvVariant,
+  type PackedBctConvVariant,
+} from "./pipeline/campplus-webgpu/packed-bct-conv";
+import {
   DEFAULT_POINTWISE_TRANSIT_VARIANT,
   POINTWISE_TRANSIT_VARIANTS,
   isPointwiseTransitVariant,
@@ -50,6 +56,7 @@ export async function runRawCampPlusGraphDiagnostic(root: HTMLElement): Promise<
     const denseBottleneckVariant = parseDenseBottleneckVariant(
       parameters.get("dense-bottleneck-variant"),
     );
+    const tdnnVariant = parseTdnnVariant(parameters.get("tdnn-variant"));
     const pointwiseTransitVariant = parsePointwiseTransitVariant(
       parameters.get("pointwise-transit-variant"),
     );
@@ -57,6 +64,7 @@ export async function runRawCampPlusGraphDiagnostic(root: HTMLElement): Promise<
       batchSize,
       fcmVariant,
       denseBottleneckVariant,
+      tdnnVariant,
       pointwiseTransitVariant,
       (message) => {
         output.textContent = message;
@@ -78,6 +86,7 @@ async function execute(
   batchSize: CampPlusRawBatchSize,
   fcmVariant: FcmVariant,
   denseBottleneckVariant: DenseBottleneckVariant,
+  tdnnVariant: PackedBctConvVariant,
   pointwiseTransitVariant: PointwiseTransitVariant,
   report: (message: string) => void,
 ): Promise<Record<string, unknown>> {
@@ -97,13 +106,14 @@ async function execute(
   let graph: CampPlusRawGraph | undefined;
   try {
     report(
-      `Streaming weights and compiling the raw B${batchSize} graph (${fcmVariant}, ${denseBottleneckVariant}, ${pointwiseTransitVariant})…`,
+      `Streaming weights and compiling the raw B${batchSize} graph (${fcmVariant}, ${tdnnVariant}, ${denseBottleneckVariant}, ${pointwiseTransitVariant})…`,
     );
     const compileStart = performance.now();
     graph = await CampPlusRawGraph.create(device, METADATA_URL, {
       batchSize,
       fcmVariant,
       denseBottleneckVariant,
+      tdnnVariant,
       pointwiseTransitVariant,
     });
     const loadAndCompileMs = performance.now() - compileStart;
@@ -134,6 +144,7 @@ async function execute(
       batchSize,
       fcmVariant: graph.fcmVariant,
       denseBottleneckVariant: graph.denseBottleneckVariant,
+      tdnnVariant: graph.tdnnVariant,
       pointwiseTransitVariant: graph.pointwiseTransitVariant,
       dispatches: graph.dispatchCount,
       commandEncodersPerRun: 1,
@@ -189,6 +200,14 @@ export function parseDenseBottleneckVariant(
   if (isDenseBottleneckVariant(value)) return value;
   throw new RangeError(
     `Raw CAM++ dense bottleneck variant must be one of: ${DENSE_BOTTLENECK_VARIANTS.join(", ")}`,
+  );
+}
+
+export function parseTdnnVariant(value: string | null): PackedBctConvVariant {
+  if (value === null) return DEFAULT_PACKED_BCT_CONV_VARIANT;
+  if (isPackedBctConvVariant(value)) return value;
+  throw new RangeError(
+    `Raw CAM++ TDNN variant must be one of: ${PACKED_BCT_CONV_VARIANTS.join(", ")}`,
   );
 }
 

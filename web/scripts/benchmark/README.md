@@ -71,26 +71,24 @@ appropriate before treating this single sample as a stable median.
 
 | Fixture | Worker wall | VAD | FBank | CAM++ | Clustering | Postprocess | Result |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| `test_audio_short.wav` | **2.094945 s** | 0.442270 s | 0.388905 s | 1.434480 s | 0.201285 s | 0.001445 s | 4 speakers, 49 segments |
-| `test_audio.wav` | **13.680845 s** | 2.885215 s | 3.067940 s | 9.091250 s | 1.683555 s | 0.003610 s | 9 speakers, 137 segments |
+| `test_audio_short.wav` | **1.973510 s** | 0.450380 s | 0.383775 s | 1.311960 s | 0.194610 s | 0.001340 s | 4 speakers, 49 segments |
+| `test_audio.wav` | **12.939250 s** | 2.890530 s | 3.000765 s | 8.242635 s | 1.766425 s | 0.004110 s | 9 speakers, 137 segments |
 
-The long checkpoint is 1.319 seconds below the 15-second stretch target and
-3.681 seconds above the aspirational 10-second target. The production CAM++
-graph now combines `tile4-fold` FCM, `direct-tile4-wg128` dense bottlenecks,
-and `chunk512` pointwise transits. Dense tile-4 shares each activation across
-four output channels without changing per-output FMA order. Chunked transits
-strip-mine 512 input channels at a time, cutting their workgroup cache from
-32 KiB to 16 KiB while preserving accumulation order.
+The long checkpoint is 2.061 seconds below the 15-second stretch target and
+2.939 seconds above the aspirational 10-second target. The production CAM++
+graph now combines `tile4-fold` FCM, `direct-tile8-wg96` initial TDNN,
+`direct-tile4-wg128` dense bottlenecks, and `chunk512` pointwise transits. The
+TDNN replaces cached tile-1 with a 96-lane workgroup that shares each input
+evaluation across eight adjacent output vec4 groups. Direct packed-weight
+reads remove its 12,800-byte workgroup cache and barrier while preserving the
+exact kernel/channel FMA order for every output.
 
-A current standalone graph invocation contained an exact 24.969216 ms GPU
-sample. Across the interleaved transit A/B, `chunk512` had a 25.100288 ms
-pooled graph median versus 27.590656 ms for `full-cache`; the preceding dense
-A/B measured 27.7217 ms for direct tile-4 versus 30.8019 ms for direct tile-2.
-All retained winners had identical output fingerprints and parity, with no
-increase in explicit GPU memory. FCM tile-8 was also tested and rejected: its
-representative graph time was approximately 26.782 ms versus 24.969216 ms, and
-its FCM group took approximately 8.389 ms versus 6.750 ms for tile-4. The
-experimental tile-8 code was not retained.
+The TDNN's cached baseline measured 3.080192 ms; `direct-tile8-wg96` measured
+0.655360-0.720896 ms and delivered a 22.806528 ms nine-run pooled full-graph
+GPU median. Its fingerprint was identical to baseline and explicit GPU buffers
+did not change. Tile-16 and tile-8/WG128 were measured and rejected without
+retaining their experimental code. The earlier dense, transit, and FCM A/B
+results remain documented in the raw runtime README and retained artifacts.
 
 A thermally contended raw-graph A/B measured B16 at 59.5317 ms per 16 items
 and B32 at 115.5783 ms per 32 items. B32 improved per-item throughput by only
@@ -266,7 +264,7 @@ the URL in an existing Chrome session:
 
 ```bash
 node web/scripts/benchmark/run-browser-diagnostic.mjs \
-  --url 'http://127.0.0.1:4173/?raw-campplus-graph-diagnostic=1&batch=16&fcm-variant=tile4-fold&dense-bottleneck-variant=direct-tile4-wg128&pointwise-transit-variant=chunk512' \
+  --url 'http://127.0.0.1:4173/?raw-campplus-graph-diagnostic=1&batch=16&fcm-variant=tile4-fold&tdnn-variant=direct-tile8-wg96&dense-bottleneck-variant=direct-tile4-wg128&pointwise-transit-variant=chunk512' \
   --remove-profile
 ```
 

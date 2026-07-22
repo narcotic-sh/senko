@@ -7,11 +7,113 @@ import type {
 } from "./metadata";
 import { CampPlusGpuPackage } from "./package";
 
-const WORKGROUP_SIZE = 128;
+const CACHED_WORKGROUP_SIZE = 128;
 const MAX_CACHED_WEIGHT_VECTORS = 1600;
 export const PACKED_BCT_REQUIRED_WORKGROUP_STORAGE_BYTES =
   MAX_CACHED_WEIGHT_VECTORS * 8;
 const UNIFORM_BYTES = 80;
+
+export const PACKED_BCT_CONV_VARIANTS = [
+  "cached-tile1-wg128",
+  "direct-tile2-wg96",
+  "direct-tile4-wg96",
+  "direct-tile8-wg96",
+  "direct-tile4-wg128",
+] as const;
+
+export type PackedBctConvVariant = (typeof PACKED_BCT_CONV_VARIANTS)[number];
+export type PackedBctConvOutputTile = 1 | 2 | 4 | 8;
+export type PackedBctConvWorkgroupSize = 96 | 128;
+export type PackedBctConvWeightSource = "workgroup-cache" | "direct";
+
+export interface PackedBctConvVariantConfiguration {
+  readonly outputTile: PackedBctConvOutputTile;
+  readonly workgroupSize: PackedBctConvWorkgroupSize;
+  readonly weightSource: PackedBctConvWeightSource;
+  readonly workgroupStorageBytes: number;
+}
+
+/** Retained byte-for-byte packed-convolution baseline for diagnostic A/Bs. */
+export const LEGACY_PACKED_BCT_CONV_VARIANT: PackedBctConvVariant =
+  "cached-tile1-wg128";
+
+/** Best pooled B16 graph variant measured on the target Apple M3. */
+export const DEFAULT_PACKED_BCT_CONV_VARIANT: PackedBctConvVariant =
+  "direct-tile8-wg96";
+
+const PACKED_BCT_CONV_VARIANT_CONFIGURATIONS: Readonly<
+  Record<PackedBctConvVariant, PackedBctConvVariantConfiguration>
+> = {
+  "cached-tile1-wg128": {
+    outputTile: 1,
+    workgroupSize: CACHED_WORKGROUP_SIZE,
+    weightSource: "workgroup-cache",
+    workgroupStorageBytes: PACKED_BCT_REQUIRED_WORKGROUP_STORAGE_BYTES,
+  },
+  "direct-tile2-wg96": {
+    outputTile: 2,
+    workgroupSize: 96,
+    weightSource: "direct",
+    workgroupStorageBytes: 0,
+  },
+  "direct-tile4-wg96": {
+    outputTile: 4,
+    workgroupSize: 96,
+    weightSource: "direct",
+    workgroupStorageBytes: 0,
+  },
+  "direct-tile8-wg96": {
+    outputTile: 8,
+    workgroupSize: 96,
+    weightSource: "direct",
+    workgroupStorageBytes: 0,
+  },
+  "direct-tile4-wg128": {
+    outputTile: 4,
+    workgroupSize: 128,
+    weightSource: "direct",
+    workgroupStorageBytes: 0,
+  },
+};
+
+export function isPackedBctConvVariant(value: string): value is PackedBctConvVariant {
+  return (PACKED_BCT_CONV_VARIANTS as readonly string[]).includes(value);
+}
+
+export function packedBctConvVariantConfiguration(
+  variant: PackedBctConvVariant,
+): PackedBctConvVariantConfiguration {
+  return PACKED_BCT_CONV_VARIANT_CONFIGURATIONS[variant];
+}
+
+export function packedBctConvDispatchWorkgroups(
+  variant: PackedBctConvVariant,
+  outputGroups: number,
+  batchSize: number,
+  outputFrames: number,
+): readonly [number, number, number] {
+  const configuration = packedBctConvVariantConfiguration(variant);
+  if (
+    !Number.isSafeInteger(outputGroups) ||
+    outputGroups <= 0 ||
+    outputGroups % configuration.outputTile !== 0
+  ) {
+    throw new RangeError(
+      `Packed convolution output groups must be a positive multiple of tile ${configuration.outputTile}`,
+    );
+  }
+  if (!Number.isSafeInteger(batchSize) || batchSize <= 0) {
+    throw new RangeError("Packed convolution batch size must be a positive integer");
+  }
+  if (!Number.isSafeInteger(outputFrames) || outputFrames <= 0) {
+    throw new RangeError("Packed convolution output frames must be a positive integer");
+  }
+  return [
+    outputGroups / configuration.outputTile,
+    batchSize,
+    ceilDiv(outputFrames, configuration.workgroupSize),
+  ];
+}
 
 export interface PackedBctConvDescriptor {
   readonly label: string;
@@ -76,6 +178,8 @@ export class PackedBctConvKernel {
     private readonly device: GPUDevice,
     private readonly gpuPackage: CampPlusGpuPackage,
     private readonly arena: CampPlusActivationArena,
+    readonly variant: PackedBctConvVariant,
+    private readonly configuration: PackedBctConvVariantConfiguration,
     private readonly pipeline: GPUComputePipeline,
     private readonly bindGroupLayout: GPUBindGroupLayout,
   ) {}
@@ -84,21 +188,35 @@ export class PackedBctConvKernel {
     device: GPUDevice,
     gpuPackage: CampPlusGpuPackage,
     arena: CampPlusActivationArena,
+    variant: PackedBctConvVariant = DEFAULT_PACKED_BCT_CONV_VARIANT,
   ): Promise<PackedBctConvKernel> {
-    if (device.limits.maxComputeInvocationsPerWorkgroup < WORKGROUP_SIZE) {
-      throw new Error(`Raw CAM++ requires ${WORKGROUP_SIZE} compute invocations per workgroup`);
+    const configuration = packedBctConvVariantConfiguration(variant);
+    if (
+      device.limits.maxComputeInvocationsPerWorkgroup < configuration.workgroupSize ||
+      device.limits.maxComputeWorkgroupSizeX < configuration.workgroupSize
+    ) {
+      throw new Error(
+        `Raw CAM++ ${variant} requires ${configuration.workgroupSize} compute invocations on workgroup X`,
+      );
     }
     if (
       device.limits.maxComputeWorkgroupStorageSize <
-      PACKED_BCT_REQUIRED_WORKGROUP_STORAGE_BYTES
+      configuration.workgroupStorageBytes
     ) {
       throw new Error(
-        `Raw CAM++ packed convolution requires ${PACKED_BCT_REQUIRED_WORKGROUP_STORAGE_BYTES} workgroup bytes`,
+        `Raw CAM++ ${variant} requires ${configuration.workgroupStorageBytes} workgroup bytes`,
       );
     }
+    const label = `senko-campplus-packed-bct-conv-${variant}`;
     const module = device.createShaderModule({
-      label: "senko-campplus-packed-bct-conv",
-      code: PACKED_BCT_CONV_WGSL,
+      label,
+      code:
+        configuration.weightSource === "workgroup-cache"
+          ? PACKED_BCT_CONV_WGSL
+          : packedBctDirectWgsl(
+              configuration.outputTile,
+              configuration.workgroupSize,
+            ),
     });
     const compilation = await module.getCompilationInfo();
     const errors = compilation.messages.filter((message) => message.type === "error");
@@ -108,7 +226,7 @@ export class PackedBctConvKernel {
       );
     }
     const bindGroupLayout = device.createBindGroupLayout({
-      label: "senko-campplus-packed-bct-conv-bindings",
+      label: `${label}-bindings`,
       entries: [
         {
           binding: 0,
@@ -138,11 +256,19 @@ export class PackedBctConvKernel {
       ],
     });
     const pipeline = await device.createComputePipelineAsync({
-      label: "senko-campplus-packed-bct-conv",
+      label,
       layout: device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] }),
       compute: { module, entryPoint: "main" },
     });
-    return new PackedBctConvKernel(device, gpuPackage, arena, pipeline, bindGroupLayout);
+    return new PackedBctConvKernel(
+      device,
+      gpuPackage,
+      arena,
+      variant,
+      configuration,
+      pipeline,
+      bindGroupLayout,
+    );
   }
 
   createDispatch(descriptor: PackedBctConvDescriptor): PackedBctConvDispatch {
@@ -162,9 +288,17 @@ export class PackedBctConvKernel {
     const kernelElements = product(weight.logicalShape.slice(2));
     const paddedInputChannels = inputGroups * 4;
     const cachedVectors = kernelElements * paddedInputChannels;
-    if (cachedVectors > MAX_CACHED_WEIGHT_VECTORS) {
+    if (
+      this.configuration.weightSource === "workgroup-cache" &&
+      cachedVectors > MAX_CACHED_WEIGHT_VECTORS
+    ) {
       throw new Error(
         `${descriptor.label} needs ${cachedVectors} cached vec4 weights; maximum is ${MAX_CACHED_WEIGHT_VECTORS}`,
+      );
+    }
+    if (outputGroups % this.configuration.outputTile !== 0) {
+      throw new Error(
+        `${descriptor.label} output groups are not divisible by tile ${this.configuration.outputTile}`,
       );
     }
 
@@ -245,7 +379,12 @@ export class PackedBctConvKernel {
         this.pipeline,
         bindGroup,
         uniformBuffer,
-        [outputGroups, descriptor.batchSize, ceilDiv(descriptor.outputFrames, WORKGROUP_SIZE)],
+        packedBctConvDispatchWorkgroups(
+          this.variant,
+          outputGroups,
+          descriptor.batchSize,
+          descriptor.outputFrames,
+        ),
       );
     } catch (error) {
       uniformBuffer.destroy();
@@ -379,6 +518,137 @@ function ceilDiv(value: number, divisor: number): number {
 
 function product(values: readonly number[]): number {
   return values.reduce((result, value) => result * value, 1);
+}
+
+/**
+ * Direct-weight convolution sharing each input/affine evaluation across an
+ * output tile. Each accumulator still observes kernel, channel, rounding, and
+ * store operations in exactly the same order as the cached tile-1 kernel.
+ */
+export function packedBctDirectWgsl(
+  outputTile: PackedBctConvOutputTile,
+  workgroupSize: PackedBctConvWorkgroupSize,
+): string {
+  if (![1, 2, 4, 8].includes(outputTile)) {
+    throw new RangeError(`Unsupported packed convolution output tile ${outputTile}`);
+  }
+  if (workgroupSize !== 96 && workgroupSize !== 128) {
+    throw new RangeError(`Unsupported packed convolution workgroup size ${workgroupSize}`);
+  }
+  const accumulatorDeclarations = Array.from(
+    { length: outputTile },
+    (_, tile) =>
+      `  var accumulator_${tile} = vec4<f32>(biases[first_output_group + ${tile}u]);`,
+  ).join("\n");
+  const inputLaneSteps = Array.from({ length: 4 }, (_, lane) => {
+    const accumulationSteps = Array.from({ length: outputTile }, (_, tile) => {
+      return `        let weight_index_${tile}_${lane} =
+          (((kernel_index * parameters.output_groups + first_output_group + ${tile}u) *
+            parameters.input_groups + input_group) * 4u + ${lane}u);
+        accumulator_${tile} = fma(
+          vec4<f32>(input_value),
+          vec4<f32>(weights[weight_index_${tile}_${lane}]),
+          accumulator_${tile},
+        );`;
+    }).join("\n");
+    return `      if (channel_base + ${lane}u < parameters.input_channels) {
+        let input_channel = channel_base + ${lane}u;
+        let input_index =
+          parameters.input_offset +
+          ((batch * parameters.input_storage_channels + parameters.input_channel_offset +
+            input_channel) * parameters.input_frames + u32(source_frame));
+        var input_value = f32(arena[input_index]);
+        if (parameters.has_affine != 0u) {
+          let scale = affine[input_group * 2u][${lane}];
+          let shift = affine[input_group * 2u + 1u][${lane}];
+          input_value = max(f32(f16(input_value * scale + shift)), 0.0);
+        }
+${accumulationSteps}
+      }`;
+  }).join("\n");
+  const roundedDeclarations = Array.from(
+    { length: outputTile },
+    (_, tile) => `  var rounded_${tile} = vec4<f16>(accumulator_${tile});
+  if (parameters.output_relu != 0u) {
+    rounded_${tile} = max(rounded_${tile}, vec4<f16>(f16(0.0)));
+  }`,
+  ).join("\n");
+  const outputStores = Array.from({ length: outputTile }, (_, tile) => {
+    return `  let output_channel_base_${tile} = (first_output_group + ${tile}u) * 4u;
+  for (var lane_${tile} = 0u; lane_${tile} < 4u; lane_${tile} += 1u) {
+    let output_channel = output_channel_base_${tile} + lane_${tile};
+    if (output_channel < parameters.output_channels) {
+      let output_index =
+        parameters.output_offset +
+        ((batch * parameters.output_storage_channels + parameters.output_channel_offset +
+          output_channel) * parameters.output_frames + output_frame);
+      arena[output_index] = rounded_${tile}[lane_${tile}];
+    }
+  }`;
+  }).join("\n");
+
+  return /* wgsl */ `
+enable f16;
+
+struct Parameters {
+  input_offset: u32,
+  output_offset: u32,
+  batch_size: u32,
+  input_channels: u32,
+  output_channels: u32,
+  input_frames: u32,
+  output_frames: u32,
+  kernel_elements: u32,
+  stride: u32,
+  dilation: u32,
+  pad_left: u32,
+  input_groups: u32,
+  output_groups: u32,
+  padded_input_channels: u32,
+  has_affine: u32,
+  output_relu: u32,
+  input_storage_channels: u32,
+  output_storage_channels: u32,
+  input_channel_offset: u32,
+  output_channel_offset: u32,
+}
+
+@group(0) @binding(0) var<storage, read_write> arena: array<f16>;
+@group(0) @binding(1) var<storage, read> weights: array<vec4<f16>>;
+@group(0) @binding(2) var<storage, read> biases: array<vec4<f16>>;
+@group(0) @binding(3) var<storage, read> affine: array<vec4<f32>>;
+@group(0) @binding(4) var<uniform> parameters: Parameters;
+
+@compute @workgroup_size(${workgroupSize})
+fn main(
+  @builtin(local_invocation_id) local_id: vec3<u32>,
+  @builtin(workgroup_id) workgroup_id: vec3<u32>,
+) {
+  let first_output_group = workgroup_id.x * ${outputTile}u;
+  let batch = workgroup_id.y;
+  let output_frame = workgroup_id.z * ${workgroupSize}u + local_id.x;
+  if (output_frame >= parameters.output_frames || batch >= parameters.batch_size) {
+    return;
+  }
+
+${accumulatorDeclarations}
+  for (var kernel_index = 0u; kernel_index < parameters.kernel_elements; kernel_index += 1u) {
+    let source_frame =
+      i32(output_frame * parameters.stride + kernel_index * parameters.dilation) -
+      i32(parameters.pad_left);
+    if (source_frame < 0 || source_frame >= i32(parameters.input_frames)) {
+      continue;
+    }
+    for (var input_group = 0u; input_group < parameters.input_groups; input_group += 1u) {
+      let channel_base = input_group * 4u;
+${inputLaneSteps}
+    }
+  }
+
+${roundedDeclarations}
+${outputStores}
+}
+`;
 }
 
 export const PACKED_BCT_CONV_WGSL = /* wgsl */ `

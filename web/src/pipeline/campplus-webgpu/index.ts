@@ -71,10 +71,22 @@ export {
   type PackedConvolutionRef,
 } from "./metadata";
 export {
+  DEFAULT_PACKED_BCT_CONV_VARIANT,
+  LEGACY_PACKED_BCT_CONV_VARIANT,
+  PACKED_BCT_CONV_VARIANTS,
   PACKED_BCT_REQUIRED_WORKGROUP_STORAGE_BYTES,
   PackedBctConvDispatch,
   PackedBctConvKernel,
+  isPackedBctConvVariant,
+  packedBctConvDispatchWorkgroups,
+  packedBctConvVariantConfiguration,
+  packedBctDirectWgsl,
   type PackedBctConvDescriptor,
+  type PackedBctConvOutputTile,
+  type PackedBctConvVariant,
+  type PackedBctConvVariantConfiguration,
+  type PackedBctConvWeightSource,
+  type PackedBctConvWorkgroupSize,
 } from "./packed-bct-conv";
 export {
   CampPlusGpuPackage,
