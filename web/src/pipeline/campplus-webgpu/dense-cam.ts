@@ -63,7 +63,7 @@ const DENSE_BOTTLENECK_VARIANT_CONFIGURATIONS: Readonly<
     weightSource: "direct",
   },
   "direct-tile4-wg128": {
-    accumulation: "float32",
+    accumulation: "float16",
     outputTile: 4,
     workgroupSize: 128,
     weightSource: "direct",
@@ -232,8 +232,12 @@ export class DenseCamKernels {
     if (workgroupSize === 96 && weightSource === "direct") {
       throw new Error("The 96-lane CAM++ diagnostic currently requires cached weights");
     }
-    if (weightSource === "direct" && accumulation !== "float32") {
-      throw new Error("Direct CAM++ weights require FP32 accumulation");
+    if (
+      weightSource === "direct" &&
+      accumulation !== "float32" &&
+      (outputTile !== 4 || accumulation !== "float16")
+    ) {
+      throw new Error("Direct CAM++ mixed precision requires tile-4 FP16 accumulation");
     }
     if (outputTile === 4 && weightSource !== "direct") {
       throw new Error("The tile-4 CAM++ bottleneck requires direct weights");
@@ -595,9 +599,8 @@ function denseBottleneckPipelineWgsl(
       : DENSE_BOTTLENECK_TILE1_WGSL;
   }
   if (weightSource !== "direct") return denseBottleneckWgsl(accumulation);
-  return outputTile === 2
-    ? DENSE_BOTTLENECK_TILE2_DIRECT_WGSL
-    : DENSE_BOTTLENECK_TILE4_DIRECT_WGSL;
+  if (outputTile === 2) return DENSE_BOTTLENECK_TILE2_DIRECT_WGSL;
+  return denseBottleneckTile4DirectWgsl(accumulation);
 }
 
 export const DENSE_BOTTLENECK_TILE1_WGSL = /* wgsl */ `
@@ -1055,6 +1058,61 @@ fn main(
   }
 }
 `;
+
+/** Materializes the production FP16 or retained FP32 tile-4 numeric path. */
+export function denseBottleneckTile4DirectWgsl(
+  accumulation: DenseBottleneckAccumulation,
+): string {
+  if (accumulation === "float32") return DENSE_BOTTLENECK_TILE4_DIRECT_WGSL;
+  if (accumulation !== "float16") {
+    throw new Error("Direct tile-4 supports only FP16 or FP32 accumulation");
+  }
+  const declarations = `    var first_accumulators = vec4<f32>(biases[first_output_group]);
+    var second_accumulators = vec4<f32>(biases[second_output_group]);
+    var third_accumulators = vec4<f32>(biases[third_output_group]);
+    var fourth_accumulators = vec4<f32>(biases[fourth_output_group]);`;
+  const accumulationSteps = `      first_accumulators = fma(vec4<f32>(f32(activated_0)), vec4<f32>(weights[first_weight_index]), first_accumulators);
+      first_accumulators = fma(vec4<f32>(f32(activated_1)), vec4<f32>(weights[first_weight_index + 1u]), first_accumulators);
+      first_accumulators = fma(vec4<f32>(f32(activated_2)), vec4<f32>(weights[first_weight_index + 2u]), first_accumulators);
+      first_accumulators = fma(vec4<f32>(f32(activated_3)), vec4<f32>(weights[first_weight_index + 3u]), first_accumulators);
+      second_accumulators = fma(vec4<f32>(f32(activated_0)), vec4<f32>(weights[second_weight_index]), second_accumulators);
+      second_accumulators = fma(vec4<f32>(f32(activated_1)), vec4<f32>(weights[second_weight_index + 1u]), second_accumulators);
+      second_accumulators = fma(vec4<f32>(f32(activated_2)), vec4<f32>(weights[second_weight_index + 2u]), second_accumulators);
+      second_accumulators = fma(vec4<f32>(f32(activated_3)), vec4<f32>(weights[second_weight_index + 3u]), second_accumulators);
+      third_accumulators = fma(vec4<f32>(f32(activated_0)), vec4<f32>(weights[third_weight_index]), third_accumulators);
+      third_accumulators = fma(vec4<f32>(f32(activated_1)), vec4<f32>(weights[third_weight_index + 1u]), third_accumulators);
+      third_accumulators = fma(vec4<f32>(f32(activated_2)), vec4<f32>(weights[third_weight_index + 2u]), third_accumulators);
+      third_accumulators = fma(vec4<f32>(f32(activated_3)), vec4<f32>(weights[third_weight_index + 3u]), third_accumulators);
+      fourth_accumulators = fma(vec4<f32>(f32(activated_0)), vec4<f32>(weights[fourth_weight_index]), fourth_accumulators);
+      fourth_accumulators = fma(vec4<f32>(f32(activated_1)), vec4<f32>(weights[fourth_weight_index + 1u]), fourth_accumulators);
+      fourth_accumulators = fma(vec4<f32>(f32(activated_2)), vec4<f32>(weights[fourth_weight_index + 2u]), fourth_accumulators);
+      fourth_accumulators = fma(vec4<f32>(f32(activated_3)), vec4<f32>(weights[fourth_weight_index + 3u]), fourth_accumulators);`;
+  const finalization = `    first_rounded = max(vec4<f16>(first_accumulators), vec4<f16>(f16(0.0)));
+    second_rounded = max(vec4<f16>(second_accumulators), vec4<f16>(f16(0.0)));
+    third_rounded = max(vec4<f16>(third_accumulators), vec4<f16>(f16(0.0)));
+    fourth_rounded = max(vec4<f16>(fourth_accumulators), vec4<f16>(f16(0.0)));`;
+  const fp16AccumulationSteps = accumulationSteps
+    .replaceAll(
+      /vec4<f32>\(f32\((activated_[0-3])\)\)/g,
+      "vec4<f16>($1)",
+    )
+    .replaceAll(/vec4<f32>\((weights\[[^\n]+?\])\)/g, "$1");
+  return DENSE_BOTTLENECK_TILE4_DIRECT_WGSL.replace(
+    declarations,
+    `    var first_accumulators = biases[first_output_group];
+    var second_accumulators = biases[second_output_group];
+    var third_accumulators = biases[third_output_group];
+    var fourth_accumulators = biases[fourth_output_group];`,
+  )
+    .replace(accumulationSteps, fp16AccumulationSteps)
+    .replace(
+      finalization,
+      `    first_rounded = max(first_accumulators, vec4<f16>(f16(0.0)));
+    second_rounded = max(second_accumulators, vec4<f16>(f16(0.0)));
+    third_rounded = max(third_accumulators, vec4<f16>(f16(0.0)));
+    fourth_rounded = max(fourth_accumulators, vec4<f16>(f16(0.0)));`,
+    );
+}
 
 const DENSE_BOTTLENECK_TEMPLATE = /* wgsl */ `
 enable f16;

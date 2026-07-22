@@ -27,6 +27,7 @@ export {
   type DenseLocalCamReferenceParameters,
 } from "./dense-cam-reference";
 export {
+  DEFAULT_FCM_ACCUMULATION,
   DEFAULT_FCM_VARIANT,
   LEGACY_FCM_VARIANT,
   FCM_DISPATCH_GPU_BUFFER_BYTES,
@@ -42,6 +43,7 @@ export {
   isFcmVariant,
   validateFcmDimensions,
   type FcmConvDescriptor,
+  type FcmAccumulation,
   type FcmFirstConvDescriptor,
   type FcmOutputTile,
   type FcmResidual,
@@ -55,13 +57,16 @@ export {
   type FinalStatsDenseDescriptor,
 } from "./final-stats-dense";
 export {
+  CAMPPLUS_RAW_NUMERIC_VARIANTS,
   CAMPPLUS_RAW_MAX_IN_FLIGHT_RUNS,
   CampPlusRawGraph,
   campPlusRawArenaPlan,
   campPlusRawGraphVariableGpuBytes,
   campPlusRawRequiredBufferBytes,
+  isCampPlusRawNumericVariant,
   type CampPlusRawArenaPlan,
   type CampPlusRawBatchSize,
+  type CampPlusRawNumericVariant,
   type CampPlusRawGraphGpuBytes,
   type CampPlusRawGraphOptions,
   type CampPlusRawGraphVariableGpuBytes,

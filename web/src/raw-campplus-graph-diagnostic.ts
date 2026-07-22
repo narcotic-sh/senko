@@ -1,9 +1,12 @@
 /// <reference types="@webgpu/types" />
 
 import {
+  CAMPPLUS_RAW_NUMERIC_VARIANTS,
   CampPlusRawGraph,
   campPlusRawRequiredBufferBytes,
+  isCampPlusRawNumericVariant,
   type CampPlusRawBatchSize,
+  type CampPlusRawNumericVariant,
 } from "./pipeline/campplus-webgpu/graph";
 import {
   DEFAULT_DENSE_BOTTLENECK_VARIANT,
@@ -62,12 +65,14 @@ export async function runRawCampPlusGraphDiagnostic(root: HTMLElement): Promise<
     const pointwiseTransitVariant = parsePointwiseTransitVariant(
       parameters.get("pointwise-transit-variant"),
     );
+    const numericVariant = parseNumericVariant(parameters.get("numeric-variant"));
     const result = await execute(
       batchSize,
       fcmVariant,
       denseBottleneckVariant,
       tdnnVariant,
       pointwiseTransitVariant,
+      numericVariant,
       (message) => {
         output.textContent = message;
       },
@@ -90,6 +95,7 @@ async function execute(
   denseBottleneckVariant: DenseBottleneckVariant,
   tdnnVariant: PackedBctConvVariant,
   pointwiseTransitVariant: PointwiseTransitVariant,
+  numericVariant: CampPlusRawNumericVariant,
   report: (message: string) => void,
 ): Promise<Record<string, unknown>> {
   if (navigator.gpu === undefined) throw new Error("WebGPU is unavailable");
@@ -112,7 +118,7 @@ async function execute(
   let graph: CampPlusRawGraph | undefined;
   try {
     report(
-      `Streaming weights and compiling the raw B${batchSize} graph (${fcmVariant}, ${tdnnVariant}, ${denseBottleneckVariant}, ${pointwiseTransitVariant})…`,
+      `Streaming weights and compiling the raw B${batchSize} graph (${numericVariant}, ${fcmVariant}, ${tdnnVariant}, ${denseBottleneckVariant}, ${pointwiseTransitVariant})…`,
     );
     const compileStart = performance.now();
     graph = await CampPlusRawGraph.create(device, METADATA_URL, {
@@ -121,6 +127,7 @@ async function execute(
       denseBottleneckVariant,
       tdnnVariant,
       pointwiseTransitVariant,
+      numericVariant,
     });
     const loadAndCompileMs = performance.now() - compileStart;
     const features = deterministicFeatures(batchSize);
@@ -152,6 +159,9 @@ async function execute(
       denseBottleneckVariant: graph.denseBottleneckVariant,
       tdnnVariant: graph.tdnnVariant,
       pointwiseTransitVariant: graph.pointwiseTransitVariant,
+      numericVariant: graph.numericVariant,
+      fcmAccumulation: graph.fcmAccumulation,
+      denseBottleneckAccumulation: graph.denseBottleneckAccumulation,
       dispatches: graph.dispatchCount,
       commandEncodersPerRun: 1,
       submissionsPerRun: 1,
@@ -214,6 +224,16 @@ export function parseBatchSize(value: string | null): CampPlusRawBatchSize {
     return parsed;
   }
   throw new RangeError("Raw CAM++ batch must be 4, 8, 16, 32, or 64");
+}
+
+export function parseNumericVariant(
+  value: string | null,
+): CampPlusRawNumericVariant {
+  if (value === null) return "production";
+  if (isCampPlusRawNumericVariant(value)) return value;
+  throw new RangeError(
+    `Raw CAM++ numeric variant must be one of: ${CAMPPLUS_RAW_NUMERIC_VARIANTS.join(", ")}`,
+  );
 }
 
 export function parseFcmVariant(value: string | null): FcmVariant {

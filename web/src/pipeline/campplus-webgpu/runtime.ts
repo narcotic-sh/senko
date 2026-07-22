@@ -6,8 +6,10 @@ import {
   DenseCamKernels,
 } from "./dense-cam";
 import {
+  DEFAULT_FCM_ACCUMULATION,
   DEFAULT_FCM_VARIANT,
   FcmKernels,
+  type FcmAccumulation,
   type FcmVariant,
 } from "./fcm";
 import { FinalStatsDenseKernel } from "./final-stats-dense";
@@ -42,6 +44,8 @@ export interface RawCampPlusFoundationOptions extends CampPlusPackageLoadOptions
   readonly activationArenaBytes?: number;
   /** Diagnostic FCM kernel selection; omission uses the measured production default. */
   readonly fcmVariant?: FcmVariant;
+  /** Diagnostic-only FCM accumulator selection; omission uses production FP16. */
+  readonly fcmAccumulation?: FcmAccumulation;
   /** Diagnostic packed TDNN selection; omission uses the production default. */
   readonly packedBctConvVariant?: PackedBctConvVariant;
   /** Diagnostic transit kernel selection; omission uses the production default. */
@@ -174,6 +178,7 @@ export class RawCampPlusFoundation {
           gpuPackage,
           arena,
           options.fcmVariant ?? DEFAULT_FCM_VARIANT,
+          options.fcmAccumulation ?? DEFAULT_FCM_ACCUMULATION,
         ),
         FinalStatsDenseKernel.create(device, gpuPackage, arena),
         PointwiseTransitKernels.create(

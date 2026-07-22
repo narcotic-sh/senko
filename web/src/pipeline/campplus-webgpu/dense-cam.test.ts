@@ -9,6 +9,7 @@ import {
   DENSE_BOTTLENECK_TILE1_WGSL,
   DENSE_BOTTLENECK_VARIANTS,
   DENSE_BOTTLENECK_WGSL,
+  denseBottleneckTile4DirectWgsl,
   denseBottleneckVariantConfiguration,
   isDenseBottleneckVariant,
 } from "./dense-cam";
@@ -68,6 +69,21 @@ describe("dense CAM++ WGSL variants", () => {
     expect(DENSE_BOTTLENECK_TILE4_DIRECT_WGSL).not.toContain("weight_cache");
   });
 
+  it("retains the FP32 baseline for the production FP16 tile-4 geometry", () => {
+    expect(denseBottleneckTile4DirectWgsl("float32")).toBe(
+      DENSE_BOTTLENECK_TILE4_DIRECT_WGSL,
+    );
+    const full = denseBottleneckTile4DirectWgsl("float16");
+    expect(full).toContain("var fourth_accumulators = biases[fourth_output_group]");
+    expect(full).toContain(
+      "fma(vec4<f16>(activated_3), weights[fourth_weight_index + 3u], fourth_accumulators)",
+    );
+    expect(full).toContain(
+      "fourth_rounded = max(fourth_accumulators, vec4<f16>(f16(0.0)))",
+    );
+    expect(full).not.toContain("fourth_partial");
+  });
+
   it("pins the measured direct tile-4 production kernel and smaller-tile oracles", () => {
     expect(DEFAULT_DENSE_BOTTLENECK_VARIANT).toBe("direct-tile4-wg128");
     expect(DENSE_BOTTLENECK_VARIANTS).toEqual([
@@ -82,7 +98,7 @@ describe("dense CAM++ WGSL variants", () => {
       weightSource: "direct",
     });
     expect(denseBottleneckVariantConfiguration("direct-tile4-wg128")).toEqual({
-      accumulation: "float32",
+      accumulation: "float16",
       outputTile: 4,
       workgroupSize: 128,
       weightSource: "direct",

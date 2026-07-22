@@ -4,11 +4,16 @@ import type { CampPlusArenaSlice } from "./arena";
 import {
   DEFAULT_DENSE_BOTTLENECK_VARIANT,
   denseBottleneckVariantConfiguration,
+  type DenseBottleneckAccumulation,
   type DenseBottleneckVariant,
   type DenseBottleneckVariantConfiguration,
   type DenseCamDispatch,
 } from "./dense-cam";
-import type { FcmDispatch, FcmVariant } from "./fcm";
+import type {
+  FcmAccumulation,
+  FcmDispatch,
+  FcmVariant,
+} from "./fcm";
 import type { FinalStatsDenseDispatch } from "./final-stats-dense";
 import {
   DEFAULT_PACKED_BCT_CONV_VARIANT,
@@ -35,6 +40,37 @@ export const CAMPPLUS_RAW_MAX_IN_FLIGHT_RUNS = 2;
 
 export type CampPlusRawBatchSize = 4 | 8 | 16 | 32 | 64;
 
+export const CAMPPLUS_RAW_NUMERIC_VARIANTS = [
+  "production",
+  "float32-baseline",
+] as const;
+export type CampPlusRawNumericVariant =
+  (typeof CAMPPLUS_RAW_NUMERIC_VARIANTS)[number];
+
+interface CampPlusRawNumericConfiguration {
+  readonly fcmAccumulation: FcmAccumulation;
+  readonly denseBottleneckAccumulation: DenseBottleneckAccumulation;
+}
+
+const NUMERIC_CONFIGURATIONS: Readonly<
+  Record<CampPlusRawNumericVariant, CampPlusRawNumericConfiguration>
+> = {
+  production: {
+    fcmAccumulation: "float16",
+    denseBottleneckAccumulation: "float16",
+  },
+  "float32-baseline": {
+    fcmAccumulation: "float32",
+    denseBottleneckAccumulation: "float32",
+  },
+};
+
+export function isCampPlusRawNumericVariant(
+  value: string,
+): value is CampPlusRawNumericVariant {
+  return (CAMPPLUS_RAW_NUMERIC_VARIANTS as readonly string[]).includes(value);
+}
+
 export interface CampPlusRawGraphOptions extends CampPlusPackageLoadOptionsOnly {
   readonly batchSize?: CampPlusRawBatchSize;
   /** Selects an FCM kernel variant; omission uses the measured production default. */
@@ -45,6 +81,8 @@ export interface CampPlusRawGraphOptions extends CampPlusPackageLoadOptionsOnly 
   readonly tdnnVariant?: PackedBctConvVariant;
   /** Selects a pointwise transit kernel; omission uses the production default. */
   readonly pointwiseTransitVariant?: PointwiseTransitVariant;
+  /** Selects production FP16 or the retained diagnostic FP32 baseline. */
+  readonly numericVariant?: CampPlusRawNumericVariant;
 }
 
 type CampPlusPackageLoadOptionsOnly = Pick<
@@ -220,6 +258,9 @@ export class CampPlusRawGraph {
   readonly denseBottleneckVariant: DenseBottleneckVariant;
   readonly tdnnVariant: PackedBctConvVariant;
   readonly pointwiseTransitVariant: PointwiseTransitVariant;
+  readonly numericVariant: CampPlusRawNumericVariant;
+  readonly fcmAccumulation: FcmAccumulation;
+  readonly denseBottleneckAccumulation: DenseBottleneckAccumulation;
 
   private readonly readbackSlots: readonly CampPlusRawReadbackSlot[];
   private destroyed = false;
@@ -233,6 +274,8 @@ export class CampPlusRawGraph {
     outputBuffer: GPUBuffer,
     readbackSlots: readonly CampPlusRawReadbackSlot[],
     denseBottleneckVariant: DenseBottleneckVariant,
+    numericVariant: CampPlusRawNumericVariant,
+    denseBottleneckAccumulation: DenseBottleneckAccumulation,
   ) {
     this.inputBuffer = inputBuffer;
     this.outputBuffer = outputBuffer;
@@ -247,6 +290,9 @@ export class CampPlusRawGraph {
     this.denseBottleneckVariant = denseBottleneckVariant;
     this.tdnnVariant = foundation.packedConvolution.variant;
     this.pointwiseTransitVariant = foundation.pointwiseTransit.variant;
+    this.numericVariant = numericVariant;
+    this.fcmAccumulation = foundation.fcm.accumulation;
+    this.denseBottleneckAccumulation = denseBottleneckAccumulation;
     const variableBytes = campPlusRawGraphVariableGpuBytes(batchSize);
     const timestampBuffers = readbackSlots.reduce(
       (sum, slot) =>
@@ -284,10 +330,14 @@ export class CampPlusRawGraph {
   ): Promise<CampPlusRawGraph> {
     const batchSize = options.batchSize ?? 32;
     const arenaPlan = campPlusRawArenaPlan(batchSize);
+    const numericVariant = options.numericVariant ?? "production";
+    const numericConfiguration = NUMERIC_CONFIGURATIONS[numericVariant];
     const denseBottleneckVariant =
       options.denseBottleneckVariant ?? DEFAULT_DENSE_BOTTLENECK_VARIANT;
-    const denseBottleneckConfiguration =
-      denseBottleneckVariantConfiguration(denseBottleneckVariant);
+    const denseBottleneckConfiguration: DenseBottleneckVariantConfiguration = {
+      ...denseBottleneckVariantConfiguration(denseBottleneckVariant),
+      accumulation: numericConfiguration.denseBottleneckAccumulation,
+    };
     const tdnnVariant = options.tdnnVariant ?? DEFAULT_PACKED_BCT_CONV_VARIANT;
     const loadOptions: RawCampPlusFoundationOptions = {
       activationArenaBytes: arenaPlan.activationArenaBytes,
@@ -296,6 +346,7 @@ export class CampPlusRawGraph {
       ...(options.fcmVariant === undefined
         ? {}
         : { fcmVariant: options.fcmVariant }),
+      fcmAccumulation: numericConfiguration.fcmAccumulation,
       packedBctConvVariant: tdnnVariant,
       ...(options.pointwiseTransitVariant === undefined
         ? {}
@@ -377,6 +428,8 @@ export class CampPlusRawGraph {
         outputBuffer,
         readbackSlots,
         denseBottleneckVariant,
+        numericVariant,
+        denseBottleneckConfiguration.accumulation,
       );
     } catch (error) {
       schedule?.all.forEach((dispatch) => dispatch.destroy());

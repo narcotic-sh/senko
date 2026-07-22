@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import type { CampPlusArenaSlice } from "./arena";
 import {
   DEFAULT_FCM_VARIANT,
+  DEFAULT_FCM_ACCUMULATION,
   FCM_CONV_WGSL,
   FCM_DISPATCH_GPU_BUFFER_BYTES,
   FCM_FIRST_WGSL,
@@ -33,11 +34,15 @@ const OUTPUT: CampPlusArenaSlice = {
 describe("FCM WebGPU variants", () => {
   it("selects the measured tile4 kernel as the production default", () => {
     expect(DEFAULT_FCM_VARIANT).toBe("tile4-fold");
+    expect(DEFAULT_FCM_ACCUMULATION).toBe("float16");
     expect(fcmDispatchWorkgroups(DEFAULT_FCM_VARIANT, 16, 80)).toEqual([
       2, 1280, 1,
     ]);
     expect(fcmFirstWgsl(DEFAULT_FCM_VARIANT)).toContain(
       "let first_output_group = group.x * 4u",
+    );
+    expect(fcmFirstWgsl(DEFAULT_FCM_VARIANT)).toContain(
+      "var accumulator_3 = biases[",
     );
     expect(fcmConvWgsl(DEFAULT_FCM_VARIANT)).toContain(
       "array<vec4<f16>, 1280>",
@@ -46,8 +51,8 @@ describe("FCM WebGPU variants", () => {
 
   it("retains the original shader and split-tail geometry as a diagnostic baseline", () => {
     expect(LEGACY_FCM_VARIANT).toBe("tile1-split");
-    expect(fcmFirstWgsl(LEGACY_FCM_VARIANT)).toBe(FCM_FIRST_WGSL);
-    expect(fcmConvWgsl(LEGACY_FCM_VARIANT)).toBe(FCM_CONV_WGSL);
+    expect(fcmFirstWgsl(LEGACY_FCM_VARIANT, "float32")).toBe(FCM_FIRST_WGSL);
+    expect(fcmConvWgsl(LEGACY_FCM_VARIANT, "float32")).toBe(FCM_CONV_WGSL);
     expect(fcmDispatchWorkgroups(LEGACY_FCM_VARIANT, 16, 80)).toEqual([
       8, 1280, 2,
     ]);
@@ -120,8 +125,8 @@ describe("FCM WebGPU variants", () => {
   });
 
   it("materializes explicit tile accumulators and one folded time loop", () => {
-    const first = fcmFirstWgsl("tile4-fold");
-    const conv = fcmConvWgsl("tile4-fold");
+    const first = fcmFirstWgsl("tile4-fold", "float32");
+    const conv = fcmConvWgsl("tile4-fold", "float32");
     expect(first).toContain("array<vec4<f16>, 36>");
     expect(first).toContain("let first_output_group = group.x * 4u");
     expect(first).toContain("var accumulator_3 = vec4<f32>");
@@ -142,9 +147,31 @@ describe("FCM WebGPU variants", () => {
     expect(conv).not.toContain("group.z * 128u");
   });
 
+  it("retains an FP32 baseline for the production FP16 geometry", () => {
+    const baselineFirst = fcmFirstWgsl("tile4-fold", "float32");
+    const baselineConv = fcmConvWgsl("tile4-fold", "float32");
+    const fullFirst = fcmFirstWgsl("tile4-fold", "float16");
+    const fullConv = fcmConvWgsl("tile4-fold", "float16");
+
+    expect(baselineFirst).toContain("var accumulator_3 = vec4<f32>");
+    expect(baselineConv).toContain("var main_3 = vec4<f32>");
+    expect(baselineConv).toContain("var shortcut_3 = vec4<f32>");
+
+    expect(fullFirst).toContain("var accumulator_3 = biases[");
+    expect(fullFirst).toContain("vec4<f16>(f16(value))");
+    expect(fullConv).toContain("var main_3 = biases[");
+    expect(fullConv).toContain("var shortcut_3 = shortcut_biases[");
+    expect(fullConv).not.toContain("main_3_partial");
+
+    for (const code of [baselineFirst, baselineConv, fullFirst, fullConv]) {
+      expect(code).toContain("let first_output_group = group.x * 4u");
+      expect(code).toContain("@workgroup_size(128)");
+    }
+  });
+
   it("preserves main stride, identity residual, and learned shortcut paths", () => {
     for (const variant of ["tile1-fold", "tile2-fold", "tile4-fold"] as const) {
-      const code = fcmConvWgsl(variant);
+      const code = fcmConvWgsl(variant, "float32");
       expect(code).toContain(
         "output_freq * parameters.stride_freq + kernel_freq",
       );

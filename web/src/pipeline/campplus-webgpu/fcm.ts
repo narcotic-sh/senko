@@ -19,12 +19,14 @@ export const FCM_VARIANTS = [
 
 export type FcmVariant = (typeof FCM_VARIANTS)[number];
 export type FcmOutputTile = 1 | 2 | 4;
+export type FcmAccumulation = "float32" | "float16";
 
 /** Retained byte-for-byte baseline used by the diagnostic A/B. */
 export const LEGACY_FCM_VARIANT: FcmVariant = "tile1-split";
 
 /** Best pooled whole-graph B16 variant measured on the target Apple M3. */
 export const DEFAULT_FCM_VARIANT: FcmVariant = "tile4-fold";
+export const DEFAULT_FCM_ACCUMULATION: FcmAccumulation = "float16";
 
 export interface FcmVariantConfiguration {
   readonly outputTile: FcmOutputTile;
@@ -155,6 +157,7 @@ export class FcmKernels {
     private readonly convPipeline: GPUComputePipeline,
     private readonly convLayout: GPUBindGroupLayout,
     readonly variant: FcmVariant,
+    readonly accumulation: FcmAccumulation,
   ) {}
 
   static async create(
@@ -162,6 +165,7 @@ export class FcmKernels {
     gpuPackage: CampPlusGpuPackage,
     arena: CampPlusActivationArena,
     variant: FcmVariant = DEFAULT_FCM_VARIANT,
+    accumulation: FcmAccumulation = DEFAULT_FCM_ACCUMULATION,
   ): Promise<FcmKernels> {
     const configuration = fcmVariantConfiguration(variant);
     if (
@@ -193,18 +197,21 @@ export class FcmKernels {
         uniformEntry(5),
       ],
     });
-    const labelSuffix = variant === DEFAULT_FCM_VARIANT ? "" : `-${variant}`;
+    const labelSuffix =
+      variant === DEFAULT_FCM_VARIANT && accumulation === DEFAULT_FCM_ACCUMULATION
+        ? ""
+        : `-${variant}-${accumulation}`;
     const [firstPipeline, convPipeline] = await Promise.all([
       checkedPipeline(
         device,
         `senko-campplus-fcm-first${labelSuffix}`,
-        fcmFirstWgsl(variant),
+        fcmFirstWgsl(variant, accumulation),
         firstLayout,
       ),
       checkedPipeline(
         device,
         `senko-campplus-fcm-conv${labelSuffix}`,
-        fcmConvWgsl(variant),
+        fcmConvWgsl(variant, accumulation),
         convLayout,
       ),
     ]);
@@ -217,6 +224,7 @@ export class FcmKernels {
       convPipeline,
       convLayout,
       variant,
+      accumulation,
     );
   }
 
@@ -679,36 +687,60 @@ fn main(@builtin(local_invocation_id) local_id: vec3<u32>, @builtin(workgroup_id
 `;
 
 /** Materializes the selected FCM first-convolution kernel. */
-export function fcmFirstWgsl(variant: FcmVariant): string {
-  if (variant === LEGACY_FCM_VARIANT) return FCM_FIRST_WGSL;
+export function fcmFirstWgsl(
+  variant: FcmVariant,
+  accumulation: FcmAccumulation = DEFAULT_FCM_ACCUMULATION,
+): string {
+  if (variant === LEGACY_FCM_VARIANT) {
+    if (accumulation !== "float32") {
+      throw new Error("The split-tail FCM diagnostic supports FP32 accumulation only");
+    }
+    return FCM_FIRST_WGSL;
+  }
   const { outputTile, foldTimeTail } = fcmVariantConfiguration(variant);
   if (!foldTimeTail) {
     throw new Error(`FCM ${variant} must use the retained baseline shader`);
   }
   const accumulatorDeclarations = Array.from(
     { length: outputTile },
-    (_, tile) =>
-      `    var accumulator_${tile} = vec4<f32>(biases[first_output_group + ${tile}u]);`,
+    (_, tile) => {
+      if (accumulation === "float16") {
+        return `    var accumulator_${tile} = biases[first_output_group + ${tile}u];`;
+      }
+      return `    var accumulator_${tile} = vec4<f32>(biases[first_output_group + ${tile}u]);`;
+    },
   ).join("\n");
   const accumulationSteps = Array.from(
     { length: outputTile },
-    (_, tile) =>
-      `        accumulator_${tile} = fma(
+    (_, tile) => {
+      if (accumulation === "float32") {
+        return `        accumulator_${tile} = fma(
           vec4<f32>(value),
           vec4<f32>(weight_cache[${tile * 9}u + kernel]),
           accumulator_${tile},
-        );`,
+        );`;
+      }
+      return `        accumulator_${tile} = fma(
+          vec4<f16>(f16(value)),
+          weight_cache[${tile * 9}u + kernel],
+          accumulator_${tile},
+        );`;
+    },
   ).join("\n");
   const stores = Array.from(
     { length: outputTile },
-    (_, tile) =>
-      `    store_output(
+    (_, tile) => {
+      const value = accumulation === "float16"
+        ? `accumulator_${tile}`
+        : `vec4<f16>(accumulator_${tile})`;
+      return `    store_output(
       first_output_group + ${tile}u,
       batch,
       output_freq,
       output_time,
-      max(vec4<f16>(accumulator_${tile}), vec4<f16>(f16(0.0))),
-    );`,
+      max(${value}, vec4<f16>(f16(0.0))),
+    );`;
+    },
   ).join("\n");
   return /* wgsl */ `
 enable f16;
@@ -794,19 +826,37 @@ ${stores}
 }
 
 /** Materializes the selected FCM convolution kernel. */
-export function fcmConvWgsl(variant: FcmVariant): string {
-  if (variant === LEGACY_FCM_VARIANT) return FCM_CONV_WGSL;
+export function fcmConvWgsl(
+  variant: FcmVariant,
+  accumulation: FcmAccumulation = DEFAULT_FCM_ACCUMULATION,
+): string {
+  if (variant === LEGACY_FCM_VARIANT) {
+    if (accumulation !== "float32") {
+      throw new Error("The split-tail FCM diagnostic supports FP32 accumulation only");
+    }
+    return FCM_CONV_WGSL;
+  }
   const { outputTile, foldTimeTail } = fcmVariantConfiguration(variant);
   if (!foldTimeTail) {
     throw new Error(`FCM ${variant} must use the retained baseline shader`);
   }
   const mainDeclarations = Array.from(
     { length: outputTile },
-    (_, tile) =>
-      `    var main_${tile} = vec4<f32>(biases[first_output_group + ${tile}u]);`,
+    (_, tile) => {
+      if (accumulation === "float16") {
+        return `    var main_${tile} = biases[first_output_group + ${tile}u];`;
+      }
+      return `    var main_${tile} = vec4<f32>(biases[first_output_group + ${tile}u]);`;
+    },
   ).join("\n");
   const mainAccumulations = Array.from({ length: outputTile }, (_, tile) => {
     const base = tile * 320;
+    if (accumulation !== "float32") {
+      return `        main_${tile} = fma(vec4<f16>(f16(input_0)), weight_cache[${base}u + weight_index], main_${tile});
+        main_${tile} = fma(vec4<f16>(f16(input_1)), weight_cache[${base + 1}u + weight_index], main_${tile});
+        main_${tile} = fma(vec4<f16>(f16(input_2)), weight_cache[${base + 2}u + weight_index], main_${tile});
+        main_${tile} = fma(vec4<f16>(f16(input_3)), weight_cache[${base + 3}u + weight_index], main_${tile});`;
+    }
     return `        main_${tile} = fma(vec4<f32>(input_0), vec4<f32>(weight_cache[${base}u + weight_index]), main_${tile});
         main_${tile} = fma(vec4<f32>(input_1), vec4<f32>(weight_cache[${base + 1}u + weight_index]), main_${tile});
         main_${tile} = fma(vec4<f32>(input_2), vec4<f32>(weight_cache[${base + 2}u + weight_index]), main_${tile});
@@ -814,9 +864,13 @@ export function fcmConvWgsl(variant: FcmVariant): string {
   }).join("\n");
   const resultDeclarations = Array.from(
     { length: outputTile },
-    (_, tile) =>
-      `    let main_rounded_${tile} = vec4<f16>(main_${tile});
-    var result_${tile} = main_rounded_${tile};`,
+    (_, tile) => {
+      const rounded = accumulation === "float16"
+        ? `main_${tile}`
+        : `vec4<f16>(main_${tile})`;
+      return `    let main_rounded_${tile} = ${rounded};
+    var result_${tile} = main_rounded_${tile};`;
+    },
   ).join("\n");
   const identitySteps = Array.from(
     { length: outputTile },
@@ -832,11 +886,21 @@ export function fcmConvWgsl(variant: FcmVariant): string {
   ).join("\n");
   const shortcutDeclarations = Array.from(
     { length: outputTile },
-    (_, tile) =>
-      `    var shortcut_${tile} = vec4<f32>(shortcut_biases[first_output_group + ${tile}u]);`,
+    (_, tile) => {
+      if (accumulation === "float16") {
+        return `    var shortcut_${tile} = shortcut_biases[first_output_group + ${tile}u];`;
+      }
+      return `    var shortcut_${tile} = vec4<f32>(shortcut_biases[first_output_group + ${tile}u]);`;
+    },
   ).join("\n");
   const shortcutAccumulations = Array.from({ length: outputTile }, (_, tile) => {
     const base = tile * 320 + 288;
+    if (accumulation !== "float32") {
+      return `      shortcut_${tile} = fma(vec4<f16>(f16(input_0)), weight_cache[${base}u + input_channel], shortcut_${tile});
+      shortcut_${tile} = fma(vec4<f16>(f16(input_1)), weight_cache[${base + 1}u + input_channel], shortcut_${tile});
+      shortcut_${tile} = fma(vec4<f16>(f16(input_2)), weight_cache[${base + 2}u + input_channel], shortcut_${tile});
+      shortcut_${tile} = fma(vec4<f16>(f16(input_3)), weight_cache[${base + 3}u + input_channel], shortcut_${tile});`;
+    }
     return `      shortcut_${tile} = fma(vec4<f32>(input_0), vec4<f32>(weight_cache[${base}u + input_channel]), shortcut_${tile});
       shortcut_${tile} = fma(vec4<f32>(input_1), vec4<f32>(weight_cache[${base + 1}u + input_channel]), shortcut_${tile});
       shortcut_${tile} = fma(vec4<f32>(input_2), vec4<f32>(weight_cache[${base + 2}u + input_channel]), shortcut_${tile});
@@ -844,8 +908,12 @@ export function fcmConvWgsl(variant: FcmVariant): string {
   }).join("\n");
   const shortcutResults = Array.from(
     { length: outputTile },
-    (_, tile) =>
-      `    result_${tile} = vec4<f16>(main_rounded_${tile} + vec4<f16>(shortcut_${tile}));`,
+    (_, tile) => {
+      const shortcut = accumulation === "float16"
+        ? `shortcut_${tile}`
+        : `vec4<f16>(shortcut_${tile})`;
+      return `    result_${tile} = vec4<f16>(main_rounded_${tile} + ${shortcut});`;
+    },
   ).join("\n");
   const relus = Array.from(
     { length: outputTile },

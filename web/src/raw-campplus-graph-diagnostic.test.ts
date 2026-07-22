@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import { DENSE_BOTTLENECK_VARIANTS } from "./pipeline/campplus-webgpu/dense-cam";
 import { FCM_VARIANTS } from "./pipeline/campplus-webgpu/fcm";
+import { CAMPPLUS_RAW_NUMERIC_VARIANTS } from "./pipeline/campplus-webgpu/graph";
 import { PACKED_BCT_CONV_VARIANTS } from "./pipeline/campplus-webgpu/packed-bct-conv";
 import { POINTWISE_TRANSIT_VARIANTS } from "./pipeline/campplus-webgpu/pointwise-transit";
 import {
@@ -9,6 +10,7 @@ import {
   parseBatchSize,
   parseDenseBottleneckVariant,
   parseFcmVariant,
+  parseNumericVariant,
   parsePointwiseTransitVariant,
   parseTdnnVariant,
   repeatReferenceRows,
@@ -38,6 +40,20 @@ describe("raw CAM++ graph diagnostic FCM selection", () => {
 
   it("defaults to the measured production variant", () => {
     expect(parseFcmVariant(null)).toBe("tile4-fold");
+  });
+
+  it("defaults to FP16 production and retains one explicit FP32 baseline", () => {
+    expect(parseNumericVariant(null)).toBe("production");
+    expect(CAMPPLUS_RAW_NUMERIC_VARIANTS).toEqual([
+      "production",
+      "float32-baseline",
+    ]);
+    for (const variant of CAMPPLUS_RAW_NUMERIC_VARIANTS) {
+      expect(parseNumericVariant(variant)).toBe(variant);
+    }
+    expect(() => parseNumericVariant("fp16")).toThrow(
+      CAMPPLUS_RAW_NUMERIC_VARIANTS.join(", "),
+    );
   });
 
   it.each(FCM_VARIANTS)("accepts %s", (variant) => {

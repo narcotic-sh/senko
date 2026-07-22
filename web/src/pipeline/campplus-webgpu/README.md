@@ -19,22 +19,24 @@ buffer and submitted once per batch; dependent kernels use compute-pass
 boundaries as WebGPU storage hazards. Dense-block concatenations are logical
 views into one append-only slab rather than copied tensors.
 
-The production FCM kernels use the measured `tile4-fold` geometry: each
-workgroup computes four adjacent output channels and folds the final time tap
-into the same shader invocation. The original `tile1-split` geometry remains
-available only through the raw-graph diagnostic for direct parity and
-performance comparisons. Across the ten FCM dispatches this reduces aggregate
-workgroups from 84,480 to 10,560 at B16; maximum workgroup storage is 10,240
-bytes and explicit GPU-buffer residency is unchanged.
+The production FCM kernels use the measured `tile4-fold` geometry with FP16
+FMA accumulation: each workgroup computes four adjacent output channels and
+folds the final time tap into the same shader invocation. The original
+`tile1-split` geometry remains available only through the raw-graph diagnostic
+for direct parity and performance comparisons. Across the ten FCM dispatches
+this reduces aggregate workgroups from 84,480 to 10,560 at B16; maximum
+workgroup storage is 10,240 bytes and explicit GPU-buffer residency is
+unchanged.
 
-Dense bottlenecks use `direct-tile4-wg128`. One 128-lane workgroup shares each
-activation load across four adjacent output channels while reading packed
-weights directly, so no extra activation or weight-cache buffer is needed.
-The FP32 FMA/reduction order for each output remains identical to the tile-1
-oracle. The three pointwise transit layers use `chunk512`: their tile-4 shaders
-strip-mine input channels in 512-channel chunks, reducing workgroup storage
-from 32 KiB to 16 KiB while preserving accumulation order. Production compiles
-only these selected dense and transit pipelines.
+Dense bottlenecks use `direct-tile4-wg128` with FP16 FMA accumulation. One
+128-lane workgroup shares each activation load across four adjacent output
+channels while reading packed weights directly, so no extra activation or
+weight-cache buffer is needed. The three pointwise transit layers use
+`chunk512`: their tile-4 shaders strip-mine input channels in 512-channel
+chunks, reducing workgroup storage from 32 KiB to 16 KiB while preserving
+accumulation order. Production compiles only these selected dense and transit
+pipelines. The raw-graph diagnostic retains a combined `float32-baseline`
+numeric selection for controlled A/B checks; it is not used by production.
 
 The initial TDNN uses `direct-tile8-wg96`. It replaces the cached tile-1
 geometry with a 96-lane workgroup that evaluates each input once for eight
@@ -99,8 +101,10 @@ timing; its conservative serial-transition peak is 3,268,608 bytes. A
 hypothetical two-in-flight B64 caller would stage 6,242,304 host bytes across
 two inputs and two returned embeddings.
 
-A same-session isolated-Chrome diagnostic measured the production kernels as
-follows (persistent bytes include the diagnostic's 64 timestamp bytes):
+A same-session isolated-Chrome diagnostic measured the pre-FP16 FP32 kernels
+as follows (persistent bytes include the diagnostic's 64 timestamp bytes).
+These rows remain the controlled batch-scaling evidence; current B16 FP16
+timing is reported below.
 
 | Batch | Settled wall | Settled GPU | GPU / embedding | Explicit GPU bytes |
 | ---: | ---: | ---: | ---: | ---: |
@@ -115,7 +119,24 @@ in this run while remaining below the current 200 MB explicit-memory budget.
 
 ## Current validation
 
-On the target M3 Mac, the production combination (`tile4-fold`,
+A same-session B16 numeric A/B was repeated twice in isolated Chrome, for six
+settled submissions per path. Full FP16 accumulation is now production; the
+old combined FP32 path remains available as `numeric-variant=float32-baseline`.
+
+| Numeric path | Median graph GPU | Median wall | Mean FCM profile | Mean dense-block profile | Max / mean error vs oracle | Cosine vs oracle |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| FP32 diagnostic baseline | 22.675456 ms | 23.600 ms | 6.750208 ms | 12.255232 ms | 0.0029297 / 0.0003676 | 0.99999941 |
+| FP16 production | 21.430272 ms | 22.215 ms | 6.062080 ms | 12.025856 ms | 0.0136719 / 0.0016981 | 0.99998891 |
+
+FP16 reduced median whole-graph GPU time by 5.49% and wall time by 5.87%; its
+FCM profile improved by 10.19% and the three dense blocks together by 1.87%.
+Both paths owned exactly 39,855,424 explicit GPU bytes with diagnostic
+timestamp buffers, so the speedup has no production residency cost. A bounded
+32-term FP16-partial experiment retained cosine 0.99999836 but improved median
+GPU time by only 2.02%; it and its code were removed in favor of the faster
+full-FP16 path.
+
+Before the FP16 promotion, the target M3 geometry combination (`tile4-fold`,
 `direct-tile8-wg96` TDNN, `direct-tile4-wg128` dense bottlenecks, and
 `chunk512` transits) measured a 22.806528 ms nine-run pooled B16 whole-graph GPU
 median. The TDNN itself fell from 3.080192 ms for cached tile-1 to
@@ -146,17 +167,21 @@ second B16 CAM++ device improved isolated CAM throughput by about 11%, but its
 39,855,360 additional GPU bytes projected to at most about 7% end-to-end, so it
 failed the memory trade gate. No code from these rejected paths remains.
 
-The latest cooled production acceptance median for the one-hour fixture is
-10.573895 seconds across 10.558180, 10.573895, and 10.581985-second runs. In the
-median run, VAD attributed 2.629995 seconds, CAM++ 9.276500 seconds,
-clustering 1.224510 seconds, postprocessing 0.004015 seconds, and FBank
-3.055250 seconds. These attributed intervals overlap and must not be summed.
-The short fixture completed in 1.575650 seconds with the exact expected
-4-speaker/49-segment result. The long result passed the offline-Senko timeline
-gates with 9 speakers and 137 segments.
-Exact-boundary windows compared with native Core ML had mean embedding cosine
-0.99983 and median 0.99987; the standalone FCM variant check reported cosine
-0.99999941 against the retained baseline.
+The first cooled FP16 production acceptance completed the one-hour fixture in
+10.170115 seconds, 403.780 ms (3.82%) below the preceding 10.573895-second FP32
+median. VAD attributed 2.602775 seconds, CAM++ 8.943840 seconds, clustering
+1.134000 seconds, postprocessing 0.003590 seconds, and FBank 2.916610 seconds.
+These attributed intervals overlap and must not be summed. The run passed the
+offline-Senko gates with 9 speakers and 137 segments: 10/50 ms speech IoU was
+0.998676/0.998744 and mapped-speaker agreement was 0.988583/0.988518. Because
+this is the first long FP16 run, it is an acceptance result rather than a new
+multi-run median.
+
+The short fixture completed in 1.540515 seconds with the exact expected
+4-speaker/49-segment result, perfect mapped-speaker agreement, and unchanged
+0.999960/1.000000 speech IoU. Its CAM++ attribution fell from the preceding
+1.304150 seconds to 1.261525 seconds. The full-FP16 raw graph's cosine against
+the compact oracle is 0.99998891.
 
 The retained browser diagnostics are intentionally separate from production:
 
@@ -169,7 +194,11 @@ The retained browser diagnostics are intentionally separate from production:
   production `direct-tile8-wg96`; transits accept
   `&pointwise-transit-variant=full-cache` or `chunk512`. Use `&batch=64` for
   the diagnostic-only high-throughput graph; its inputs and expected outputs
-  repeat the independent B32 oracle rows;
+  repeat the independent B32 oracle rows. Add
+  `&numeric-variant=float32-baseline` to compare the retained combined FP32
+  accumulator path against FP16 production; this FP32 selection is also
+  required for the non-production `tile1-split` FCM and direct tile-1/tile-2
+  dense geometry comparisons;
 - `?raw-campplus-file-parity=1` compares real FBank windows with the retained
   ORT reference;
 - `?raw-campplus-dense-diagnostic=1` profiles the earlier B32 kernel geometry;
