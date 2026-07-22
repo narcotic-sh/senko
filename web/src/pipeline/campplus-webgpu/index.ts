@@ -1,13 +1,21 @@
 export { CampPlusActivationArena, type CampPlusArenaSlice } from "./arena";
 export {
+  DEFAULT_DENSE_BOTTLENECK_VARIANT,
+  DENSE_BOTTLENECK_TILE2_DIRECT_WGSL,
+  DENSE_BOTTLENECK_TILE4_DIRECT_WGSL,
+  DENSE_BOTTLENECK_VARIANTS,
   DENSE_CAM_REQUIRED_WORKGROUP_STORAGE_BYTES,
   DENSE_CAM_TILE2_WORKGROUP_STORAGE_BYTES,
   DenseCamDispatch,
   DenseCamKernels,
+  denseBottleneckVariantConfiguration,
+  isDenseBottleneckVariant,
   type DenseBottleneckAccumulation,
   type DenseBottleneckOutputTile,
   type DenseBottleneckWorkgroupSize,
   type DenseBottleneckWeightSource,
+  type DenseBottleneckVariant,
+  type DenseBottleneckVariantConfiguration,
   type DenseBottleneckDescriptor,
   type DenseLocalCamDescriptor,
 } from "./dense-cam";
@@ -75,12 +83,17 @@ export {
   type CampPlusPackageLoadOptions,
 } from "./package";
 export {
+  DEFAULT_POINTWISE_TRANSIT_VARIANT,
   POINTWISE_TRANSIT_REQUIRED_WORKGROUP_STORAGE_BYTES,
   POINTWISE_TRANSIT_TILE4_WORKGROUP_STORAGE_BYTES,
+  POINTWISE_TRANSIT_VARIANTS,
   PointwiseTransitDispatch,
   PointwiseTransitKernels,
+  isPointwiseTransitVariant,
+  pointwiseTransitChunk512Wgsl,
   pointwiseTransitWgsl,
   type PointwiseTransitDescriptor,
+  type PointwiseTransitVariant,
 } from "./pointwise-transit";
 export {
   RAW_CAMPPLUS_REQUIRED_LIMITS,

@@ -21,6 +21,7 @@ import {
   POINTWISE_TRANSIT_REQUIRED_WORKGROUP_STORAGE_BYTES,
   POINTWISE_TRANSIT_TILE4_WORKGROUP_STORAGE_BYTES,
   PointwiseTransitKernels,
+  type PointwiseTransitVariant,
   type PointwiseTransitDispatch,
 } from "./pointwise-transit";
 import {
@@ -39,6 +40,8 @@ export interface RawCampPlusFoundationOptions extends CampPlusPackageLoadOptions
   readonly activationArenaBytes?: number;
   /** Diagnostic FCM kernel selection; omission uses the measured production default. */
   readonly fcmVariant?: FcmVariant;
+  /** Diagnostic transit kernel selection; omission uses the production default. */
+  readonly pointwiseTransitVariant?: PointwiseTransitVariant;
 }
 
 export const RAW_CAMPPLUS_REQUIRED_LIMITS = {
@@ -139,7 +142,12 @@ export class RawCampPlusFoundation {
           options.fcmVariant ?? DEFAULT_FCM_VARIANT,
         ),
         FinalStatsDenseKernel.create(device, gpuPackage, arena),
-        PointwiseTransitKernels.create(device, gpuPackage, arena),
+        PointwiseTransitKernels.create(
+          device,
+          gpuPackage,
+          arena,
+          options.pointwiseTransitVariant,
+        ),
       ]);
       return new RawCampPlusFoundation(
         gpuPackage,

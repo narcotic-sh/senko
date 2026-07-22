@@ -25,9 +25,60 @@ export type DenseBottleneckAccumulation =
   | "float32"
   | "float16-chunk32"
   | "float16";
-export type DenseBottleneckOutputTile = 1 | 2;
+export type DenseBottleneckOutputTile = 1 | 2 | 4;
 export type DenseBottleneckWorkgroupSize = 96 | 128;
 export type DenseBottleneckWeightSource = "workgroup-cache" | "direct";
+
+export const DENSE_BOTTLENECK_VARIANTS = [
+  "direct-tile1-wg128",
+  "direct-tile2-wg128",
+  "direct-tile4-wg128",
+] as const;
+
+export type DenseBottleneckVariant = (typeof DENSE_BOTTLENECK_VARIANTS)[number];
+
+export const DEFAULT_DENSE_BOTTLENECK_VARIANT: DenseBottleneckVariant =
+  "direct-tile4-wg128";
+
+export interface DenseBottleneckVariantConfiguration {
+  readonly accumulation: DenseBottleneckAccumulation;
+  readonly outputTile: DenseBottleneckOutputTile;
+  readonly workgroupSize: DenseBottleneckWorkgroupSize;
+  readonly weightSource: DenseBottleneckWeightSource;
+}
+
+const DENSE_BOTTLENECK_VARIANT_CONFIGURATIONS: Readonly<
+  Record<DenseBottleneckVariant, DenseBottleneckVariantConfiguration>
+> = {
+  "direct-tile1-wg128": {
+    accumulation: "float32",
+    outputTile: 1,
+    workgroupSize: 128,
+    weightSource: "direct",
+  },
+  "direct-tile2-wg128": {
+    accumulation: "float32",
+    outputTile: 2,
+    workgroupSize: 128,
+    weightSource: "direct",
+  },
+  "direct-tile4-wg128": {
+    accumulation: "float32",
+    outputTile: 4,
+    workgroupSize: 128,
+    weightSource: "direct",
+  },
+};
+
+export function isDenseBottleneckVariant(value: string): value is DenseBottleneckVariant {
+  return (DENSE_BOTTLENECK_VARIANTS as readonly string[]).includes(value);
+}
+
+export function denseBottleneckVariantConfiguration(
+  variant: DenseBottleneckVariant,
+): DenseBottleneckVariantConfiguration {
+  return DENSE_BOTTLENECK_VARIANT_CONFIGURATIONS[variant];
+}
 
 export interface DenseBottleneckDescriptor {
   readonly label: string;
@@ -128,11 +179,14 @@ export class DenseCamKernels {
       label: "senko-campplus-dense-local-cam-bindings",
       entries: storageEntries(7),
     });
+    const defaultConfiguration = denseBottleneckVariantConfiguration(
+      DEFAULT_DENSE_BOTTLENECK_VARIANT,
+    );
     const [bottleneckPipeline, localCamPipeline] = await Promise.all([
       createCheckedPipeline(
         device,
-        "senko-campplus-dense-bottleneck-direct",
-        DENSE_BOTTLENECK_TILE1_DIRECT_WGSL,
+        `senko-campplus-dense-bottleneck-${DEFAULT_DENSE_BOTTLENECK_VARIANT}`,
+        denseBottleneckPipelineWgsl(defaultConfiguration),
         bottleneckLayout,
       ),
       createCheckedPipeline(
@@ -146,7 +200,17 @@ export class DenseCamKernels {
       device,
       gpuPackage,
       arena,
-      new Map([[bottleneckPipelineKey("float32", 1, 128, "direct"), bottleneckPipeline]]),
+      new Map([
+        [
+          bottleneckPipelineKey(
+            defaultConfiguration.accumulation,
+            defaultConfiguration.outputTile,
+            defaultConfiguration.workgroupSize,
+            defaultConfiguration.weightSource,
+          ),
+          bottleneckPipeline,
+        ],
+      ]),
       bottleneckLayout,
       localCamPipeline,
       localCamLayout,
@@ -165,11 +229,18 @@ export class DenseCamKernels {
     if (workgroupSize === 96 && (outputTile !== 1 || accumulation !== "float32")) {
       throw new Error("The 96-lane CAM++ diagnostic supports tile-1 FP32 only");
     }
-    if (weightSource === "direct" && (outputTile !== 1 || accumulation !== "float32")) {
-      throw new Error("Direct CAM++ weights currently support tile-1 FP32 only");
+    if (workgroupSize === 96 && weightSource === "direct") {
+      throw new Error("The 96-lane CAM++ diagnostic currently requires cached weights");
+    }
+    if (weightSource === "direct" && accumulation !== "float32") {
+      throw new Error("Direct CAM++ weights require FP32 accumulation");
+    }
+    if (outputTile === 4 && weightSource !== "direct") {
+      throw new Error("The tile-4 CAM++ bottleneck requires direct weights");
     }
     if (
       outputTile === 2 &&
+      weightSource === "workgroup-cache" &&
       this.device.limits.maxComputeWorkgroupStorageSize <
         DENSE_CAM_TILE2_WORKGROUP_STORAGE_BYTES
     ) {
@@ -187,13 +258,12 @@ export class DenseCamKernels {
     const pipeline = await createCheckedPipeline(
       this.device,
       `senko-campplus-dense-bottleneck-tile${outputTile}-wg${workgroupSize}-${weightSource}-${accumulation}`,
-      outputTile === 1
-        ? weightSource === "direct"
-          ? DENSE_BOTTLENECK_TILE1_DIRECT_WGSL
-          : workgroupSize === 96
-            ? DENSE_BOTTLENECK_TILE1_WG96_WGSL
-            : DENSE_BOTTLENECK_TILE1_WGSL
-        : denseBottleneckWgsl(accumulation),
+      denseBottleneckPipelineWgsl({
+        accumulation,
+        outputTile,
+        workgroupSize,
+        weightSource,
+      }),
       this.bottleneckLayout,
     );
     this.bottleneckPipelines.set(key, pipeline);
@@ -514,6 +584,22 @@ function bottleneckPipelineKey(
   return `${outputTile}:${workgroupSize}:${weightSource}:${accumulation}`;
 }
 
+function denseBottleneckPipelineWgsl(
+  configuration: DenseBottleneckVariantConfiguration,
+): string {
+  const { accumulation, outputTile, workgroupSize, weightSource } = configuration;
+  if (outputTile === 1) {
+    if (weightSource === "direct") return DENSE_BOTTLENECK_TILE1_DIRECT_WGSL;
+    return workgroupSize === 96
+      ? DENSE_BOTTLENECK_TILE1_WG96_WGSL
+      : DENSE_BOTTLENECK_TILE1_WGSL;
+  }
+  if (weightSource !== "direct") return denseBottleneckWgsl(accumulation);
+  return outputTile === 2
+    ? DENSE_BOTTLENECK_TILE2_DIRECT_WGSL
+    : DENSE_BOTTLENECK_TILE4_DIRECT_WGSL;
+}
+
 export const DENSE_BOTTLENECK_TILE1_WGSL = /* wgsl */ `
 enable f16;
 
@@ -676,6 +762,299 @@ export const DENSE_BOTTLENECK_TILE1_DIRECT_WGSL =
       "weight_cache[channel_base]",
       "weights[(output_group * parameters.input_groups + input_group) * 4u]",
     );
+
+/**
+ * Direct-weight FP32 bottleneck that shares each BN/ReLU activation across two
+ * adjacent output vec4s. Per-output FMA and reduction order matches tile 1.
+ */
+export const DENSE_BOTTLENECK_TILE2_DIRECT_WGSL = /* wgsl */ `
+enable f16;
+
+struct Parameters {
+  slab_offset: u32,
+  scratch_offset: u32,
+  doubled_mean_offset: u32,
+  batch_size: u32,
+  input_channels: u32,
+  slab_channels: u32,
+  frames: u32,
+  input_groups: u32,
+  output_groups: u32,
+  reserved_0: u32,
+  reserved_1: u32,
+  reserved_2: u32,
+  reserved_3: u32,
+  reserved_4: u32,
+  reserved_5: u32,
+  reserved_6: u32,
+}
+
+@group(0) @binding(0) var<storage, read_write> arena: array<f16>;
+@group(0) @binding(1) var<storage, read> weights: array<vec4<f16>>;
+@group(0) @binding(2) var<storage, read> biases: array<vec4<f16>>;
+@group(0) @binding(3) var<storage, read> affine: array<vec4<f32>>;
+@group(0) @binding(4) var<uniform> parameters: Parameters;
+
+struct OutputPair {
+  first: vec4<f32>,
+  second: vec4<f32>,
+}
+
+var<workgroup> mean_reduction: array<OutputPair, 128>;
+
+@compute @workgroup_size(128)
+fn main(
+  @builtin(local_invocation_id) local_id: vec3<u32>,
+  @builtin(workgroup_id) workgroup_id: vec3<u32>,
+) {
+  let first_output_group = workgroup_id.x * 2u;
+  let second_output_group = first_output_group + 1u;
+  let batch = workgroup_id.y;
+  let frame = local_id.x;
+  var first_rounded = vec4<f16>(f16(0.0));
+  var second_rounded = vec4<f16>(f16(0.0));
+  if (frame < parameters.frames && batch < parameters.batch_size) {
+    var first_accumulators = vec4<f32>(biases[first_output_group]);
+    var second_accumulators = vec4<f32>(biases[second_output_group]);
+    let batch_channel_base = batch * parameters.slab_channels;
+    for (var input_group = 0u; input_group < parameters.input_groups; input_group += 1u) {
+      let channel_base = input_group * 4u;
+      let slab_index =
+        parameters.slab_offset +
+        ((batch_channel_base + channel_base) * parameters.frames + frame);
+      let scale = affine[input_group * 2u];
+      let shift = affine[input_group * 2u + 1u];
+      let activated_0 = max(f16(f32(arena[slab_index]) * scale[0] + shift[0]), f16(0.0));
+      let activated_1 = max(f16(f32(arena[slab_index + parameters.frames]) * scale[1] + shift[1]), f16(0.0));
+      let activated_2 = max(f16(f32(arena[slab_index + 2u * parameters.frames]) * scale[2] + shift[2]), f16(0.0));
+      let activated_3 = max(f16(f32(arena[slab_index + 3u * parameters.frames]) * scale[3] + shift[3]), f16(0.0));
+      let first_weight_index =
+        (first_output_group * parameters.input_groups + input_group) * 4u;
+      let second_weight_index =
+        (second_output_group * parameters.input_groups + input_group) * 4u;
+      first_accumulators = fma(vec4<f32>(f32(activated_0)), vec4<f32>(weights[first_weight_index]), first_accumulators);
+      first_accumulators = fma(vec4<f32>(f32(activated_1)), vec4<f32>(weights[first_weight_index + 1u]), first_accumulators);
+      first_accumulators = fma(vec4<f32>(f32(activated_2)), vec4<f32>(weights[first_weight_index + 2u]), first_accumulators);
+      first_accumulators = fma(vec4<f32>(f32(activated_3)), vec4<f32>(weights[first_weight_index + 3u]), first_accumulators);
+      second_accumulators = fma(vec4<f32>(f32(activated_0)), vec4<f32>(weights[second_weight_index]), second_accumulators);
+      second_accumulators = fma(vec4<f32>(f32(activated_1)), vec4<f32>(weights[second_weight_index + 1u]), second_accumulators);
+      second_accumulators = fma(vec4<f32>(f32(activated_2)), vec4<f32>(weights[second_weight_index + 2u]), second_accumulators);
+      second_accumulators = fma(vec4<f32>(f32(activated_3)), vec4<f32>(weights[second_weight_index + 3u]), second_accumulators);
+    }
+    first_rounded = max(vec4<f16>(first_accumulators), vec4<f16>(f16(0.0)));
+    second_rounded = max(vec4<f16>(second_accumulators), vec4<f16>(f16(0.0)));
+    let first_output_channel = first_output_group * 4u;
+    let second_output_channel = second_output_group * 4u;
+    for (var lane = 0u; lane < 4u; lane += 1u) {
+      let first_scratch_index =
+        parameters.scratch_offset +
+        ((batch * 128u + first_output_channel + lane) * parameters.frames + frame);
+      let second_scratch_index =
+        parameters.scratch_offset +
+        ((batch * 128u + second_output_channel + lane) * parameters.frames + frame);
+      arena[first_scratch_index] = first_rounded[lane];
+      arena[second_scratch_index] = second_rounded[lane];
+    }
+  }
+  mean_reduction[local_id.x].first = vec4<f32>(first_rounded);
+  mean_reduction[local_id.x].second = vec4<f32>(second_rounded);
+  workgroupBarrier();
+
+  var stride = 64u;
+  loop {
+    if (local_id.x < stride) {
+      mean_reduction[local_id.x].first += mean_reduction[local_id.x + stride].first;
+      mean_reduction[local_id.x].second += mean_reduction[local_id.x + stride].second;
+    }
+    workgroupBarrier();
+    if (stride == 1u) { break; }
+    stride /= 2u;
+  }
+  if (local_id.x == 0u) {
+    let first_mean = vec4<f16>(mean_reduction[0].first / f32(parameters.frames));
+    let second_mean = vec4<f16>(mean_reduction[0].second / f32(parameters.frames));
+    let first_doubled = vec4<f16>(first_mean * vec4<f16>(f16(2.0)));
+    let second_doubled = vec4<f16>(second_mean * vec4<f16>(f16(2.0)));
+    let first_output_channel = first_output_group * 4u;
+    let second_output_channel = second_output_group * 4u;
+    for (var lane = 0u; lane < 4u; lane += 1u) {
+      let first_mean_index =
+        parameters.doubled_mean_offset + batch * 128u + first_output_channel + lane;
+      let second_mean_index =
+        parameters.doubled_mean_offset + batch * 128u + second_output_channel + lane;
+      arena[first_mean_index] = first_doubled[lane];
+      arena[second_mean_index] = second_doubled[lane];
+    }
+  }
+}
+`;
+
+/** Direct-weight FP32 bottleneck sharing each activation across four vec4 outputs. */
+export const DENSE_BOTTLENECK_TILE4_DIRECT_WGSL = /* wgsl */ `
+enable f16;
+
+struct Parameters {
+  slab_offset: u32,
+  scratch_offset: u32,
+  doubled_mean_offset: u32,
+  batch_size: u32,
+  input_channels: u32,
+  slab_channels: u32,
+  frames: u32,
+  input_groups: u32,
+  output_groups: u32,
+  reserved_0: u32,
+  reserved_1: u32,
+  reserved_2: u32,
+  reserved_3: u32,
+  reserved_4: u32,
+  reserved_5: u32,
+  reserved_6: u32,
+}
+
+@group(0) @binding(0) var<storage, read_write> arena: array<f16>;
+@group(0) @binding(1) var<storage, read> weights: array<vec4<f16>>;
+@group(0) @binding(2) var<storage, read> biases: array<vec4<f16>>;
+@group(0) @binding(3) var<storage, read> affine: array<vec4<f32>>;
+@group(0) @binding(4) var<uniform> parameters: Parameters;
+
+struct OutputQuad {
+  first: vec4<f32>,
+  second: vec4<f32>,
+  third: vec4<f32>,
+  fourth: vec4<f32>,
+}
+
+var<workgroup> mean_reduction: array<OutputQuad, 128>;
+
+@compute @workgroup_size(128)
+fn main(
+  @builtin(local_invocation_id) local_id: vec3<u32>,
+  @builtin(workgroup_id) workgroup_id: vec3<u32>,
+) {
+  let first_output_group = workgroup_id.x * 4u;
+  let second_output_group = first_output_group + 1u;
+  let third_output_group = first_output_group + 2u;
+  let fourth_output_group = first_output_group + 3u;
+  let batch = workgroup_id.y;
+  let frame = local_id.x;
+  var first_rounded = vec4<f16>(f16(0.0));
+  var second_rounded = vec4<f16>(f16(0.0));
+  var third_rounded = vec4<f16>(f16(0.0));
+  var fourth_rounded = vec4<f16>(f16(0.0));
+  if (frame < parameters.frames && batch < parameters.batch_size) {
+    var first_accumulators = vec4<f32>(biases[first_output_group]);
+    var second_accumulators = vec4<f32>(biases[second_output_group]);
+    var third_accumulators = vec4<f32>(biases[third_output_group]);
+    var fourth_accumulators = vec4<f32>(biases[fourth_output_group]);
+    let batch_channel_base = batch * parameters.slab_channels;
+    for (var input_group = 0u; input_group < parameters.input_groups; input_group += 1u) {
+      let channel_base = input_group * 4u;
+      let slab_index =
+        parameters.slab_offset +
+        ((batch_channel_base + channel_base) * parameters.frames + frame);
+      let scale = affine[input_group * 2u];
+      let shift = affine[input_group * 2u + 1u];
+      let activated_0 = max(f16(f32(arena[slab_index]) * scale[0] + shift[0]), f16(0.0));
+      let activated_1 = max(f16(f32(arena[slab_index + parameters.frames]) * scale[1] + shift[1]), f16(0.0));
+      let activated_2 = max(f16(f32(arena[slab_index + 2u * parameters.frames]) * scale[2] + shift[2]), f16(0.0));
+      let activated_3 = max(f16(f32(arena[slab_index + 3u * parameters.frames]) * scale[3] + shift[3]), f16(0.0));
+      let first_weight_index =
+        (first_output_group * parameters.input_groups + input_group) * 4u;
+      let second_weight_index =
+        (second_output_group * parameters.input_groups + input_group) * 4u;
+      let third_weight_index =
+        (third_output_group * parameters.input_groups + input_group) * 4u;
+      let fourth_weight_index =
+        (fourth_output_group * parameters.input_groups + input_group) * 4u;
+      first_accumulators = fma(vec4<f32>(f32(activated_0)), vec4<f32>(weights[first_weight_index]), first_accumulators);
+      first_accumulators = fma(vec4<f32>(f32(activated_1)), vec4<f32>(weights[first_weight_index + 1u]), first_accumulators);
+      first_accumulators = fma(vec4<f32>(f32(activated_2)), vec4<f32>(weights[first_weight_index + 2u]), first_accumulators);
+      first_accumulators = fma(vec4<f32>(f32(activated_3)), vec4<f32>(weights[first_weight_index + 3u]), first_accumulators);
+      second_accumulators = fma(vec4<f32>(f32(activated_0)), vec4<f32>(weights[second_weight_index]), second_accumulators);
+      second_accumulators = fma(vec4<f32>(f32(activated_1)), vec4<f32>(weights[second_weight_index + 1u]), second_accumulators);
+      second_accumulators = fma(vec4<f32>(f32(activated_2)), vec4<f32>(weights[second_weight_index + 2u]), second_accumulators);
+      second_accumulators = fma(vec4<f32>(f32(activated_3)), vec4<f32>(weights[second_weight_index + 3u]), second_accumulators);
+      third_accumulators = fma(vec4<f32>(f32(activated_0)), vec4<f32>(weights[third_weight_index]), third_accumulators);
+      third_accumulators = fma(vec4<f32>(f32(activated_1)), vec4<f32>(weights[third_weight_index + 1u]), third_accumulators);
+      third_accumulators = fma(vec4<f32>(f32(activated_2)), vec4<f32>(weights[third_weight_index + 2u]), third_accumulators);
+      third_accumulators = fma(vec4<f32>(f32(activated_3)), vec4<f32>(weights[third_weight_index + 3u]), third_accumulators);
+      fourth_accumulators = fma(vec4<f32>(f32(activated_0)), vec4<f32>(weights[fourth_weight_index]), fourth_accumulators);
+      fourth_accumulators = fma(vec4<f32>(f32(activated_1)), vec4<f32>(weights[fourth_weight_index + 1u]), fourth_accumulators);
+      fourth_accumulators = fma(vec4<f32>(f32(activated_2)), vec4<f32>(weights[fourth_weight_index + 2u]), fourth_accumulators);
+      fourth_accumulators = fma(vec4<f32>(f32(activated_3)), vec4<f32>(weights[fourth_weight_index + 3u]), fourth_accumulators);
+    }
+    first_rounded = max(vec4<f16>(first_accumulators), vec4<f16>(f16(0.0)));
+    second_rounded = max(vec4<f16>(second_accumulators), vec4<f16>(f16(0.0)));
+    third_rounded = max(vec4<f16>(third_accumulators), vec4<f16>(f16(0.0)));
+    fourth_rounded = max(vec4<f16>(fourth_accumulators), vec4<f16>(f16(0.0)));
+    let first_output_channel = first_output_group * 4u;
+    let second_output_channel = second_output_group * 4u;
+    let third_output_channel = third_output_group * 4u;
+    let fourth_output_channel = fourth_output_group * 4u;
+    for (var lane = 0u; lane < 4u; lane += 1u) {
+      let first_scratch_index =
+        parameters.scratch_offset +
+        ((batch * 128u + first_output_channel + lane) * parameters.frames + frame);
+      let second_scratch_index =
+        parameters.scratch_offset +
+        ((batch * 128u + second_output_channel + lane) * parameters.frames + frame);
+      let third_scratch_index =
+        parameters.scratch_offset +
+        ((batch * 128u + third_output_channel + lane) * parameters.frames + frame);
+      let fourth_scratch_index =
+        parameters.scratch_offset +
+        ((batch * 128u + fourth_output_channel + lane) * parameters.frames + frame);
+      arena[first_scratch_index] = first_rounded[lane];
+      arena[second_scratch_index] = second_rounded[lane];
+      arena[third_scratch_index] = third_rounded[lane];
+      arena[fourth_scratch_index] = fourth_rounded[lane];
+    }
+  }
+  mean_reduction[local_id.x].first = vec4<f32>(first_rounded);
+  mean_reduction[local_id.x].second = vec4<f32>(second_rounded);
+  mean_reduction[local_id.x].third = vec4<f32>(third_rounded);
+  mean_reduction[local_id.x].fourth = vec4<f32>(fourth_rounded);
+  workgroupBarrier();
+
+  var stride = 64u;
+  loop {
+    if (local_id.x < stride) {
+      mean_reduction[local_id.x].first += mean_reduction[local_id.x + stride].first;
+      mean_reduction[local_id.x].second += mean_reduction[local_id.x + stride].second;
+      mean_reduction[local_id.x].third += mean_reduction[local_id.x + stride].third;
+      mean_reduction[local_id.x].fourth += mean_reduction[local_id.x + stride].fourth;
+    }
+    workgroupBarrier();
+    if (stride == 1u) { break; }
+    stride /= 2u;
+  }
+  if (local_id.x == 0u) {
+    let first_mean = vec4<f16>(mean_reduction[0].first / f32(parameters.frames));
+    let second_mean = vec4<f16>(mean_reduction[0].second / f32(parameters.frames));
+    let third_mean = vec4<f16>(mean_reduction[0].third / f32(parameters.frames));
+    let fourth_mean = vec4<f16>(mean_reduction[0].fourth / f32(parameters.frames));
+    let first_doubled = vec4<f16>(first_mean * vec4<f16>(f16(2.0)));
+    let second_doubled = vec4<f16>(second_mean * vec4<f16>(f16(2.0)));
+    let third_doubled = vec4<f16>(third_mean * vec4<f16>(f16(2.0)));
+    let fourth_doubled = vec4<f16>(fourth_mean * vec4<f16>(f16(2.0)));
+    let first_output_channel = first_output_group * 4u;
+    let second_output_channel = second_output_group * 4u;
+    let third_output_channel = third_output_group * 4u;
+    let fourth_output_channel = fourth_output_group * 4u;
+    for (var lane = 0u; lane < 4u; lane += 1u) {
+      let first_mean_index = parameters.doubled_mean_offset + batch * 128u + first_output_channel + lane;
+      let second_mean_index = parameters.doubled_mean_offset + batch * 128u + second_output_channel + lane;
+      let third_mean_index = parameters.doubled_mean_offset + batch * 128u + third_output_channel + lane;
+      let fourth_mean_index = parameters.doubled_mean_offset + batch * 128u + fourth_output_channel + lane;
+      arena[first_mean_index] = first_doubled[lane];
+      arena[second_mean_index] = second_doubled[lane];
+      arena[third_mean_index] = third_doubled[lane];
+      arena[fourth_mean_index] = fourth_doubled[lane];
+    }
+  }
+}
+`;
 
 const DENSE_BOTTLENECK_TEMPLATE = /* wgsl */ `
 enable f16;

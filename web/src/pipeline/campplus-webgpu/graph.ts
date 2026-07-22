@@ -1,11 +1,20 @@
 /// <reference types="@webgpu/types" />
 
 import type { CampPlusArenaSlice } from "./arena";
-import type { DenseCamDispatch } from "./dense-cam";
+import {
+  DEFAULT_DENSE_BOTTLENECK_VARIANT,
+  denseBottleneckVariantConfiguration,
+  type DenseBottleneckVariant,
+  type DenseBottleneckVariantConfiguration,
+  type DenseCamDispatch,
+} from "./dense-cam";
 import type { FcmDispatch, FcmVariant } from "./fcm";
 import type { FinalStatsDenseDispatch } from "./final-stats-dense";
 import type { PackedBctConvDispatch } from "./packed-bct-conv";
-import type { PointwiseTransitDispatch } from "./pointwise-transit";
+import type {
+  PointwiseTransitDispatch,
+  PointwiseTransitVariant,
+} from "./pointwise-transit";
 import {
   RawCampPlusFoundation,
   type RawCampPlusFoundationOptions,
@@ -26,6 +35,10 @@ export interface CampPlusRawGraphOptions extends CampPlusPackageLoadOptionsOnly 
   readonly batchSize?: CampPlusRawBatchSize;
   /** Selects an FCM kernel variant; omission uses the measured production default. */
   readonly fcmVariant?: FcmVariant;
+  /** Selects a dense bottleneck kernel; omission uses the production baseline. */
+  readonly denseBottleneckVariant?: DenseBottleneckVariant;
+  /** Selects a pointwise transit kernel; omission uses the production default. */
+  readonly pointwiseTransitVariant?: PointwiseTransitVariant;
 }
 
 type CampPlusPackageLoadOptionsOnly = Pick<
@@ -115,6 +128,8 @@ export class CampPlusRawGraph {
   readonly gpuBytes: CampPlusRawGraphGpuBytes;
   readonly dispatchCount: number;
   readonly fcmVariant: FcmVariant;
+  readonly denseBottleneckVariant: DenseBottleneckVariant;
+  readonly pointwiseTransitVariant: PointwiseTransitVariant;
 
   private readonly readbackSlots: readonly CampPlusRawReadbackSlot[];
   private destroyed = false;
@@ -127,6 +142,7 @@ export class CampPlusRawGraph {
     inputBuffer: GPUBuffer,
     outputBuffer: GPUBuffer,
     readbackSlots: readonly CampPlusRawReadbackSlot[],
+    denseBottleneckVariant: DenseBottleneckVariant,
   ) {
     this.inputBuffer = inputBuffer;
     this.outputBuffer = outputBuffer;
@@ -138,6 +154,8 @@ export class CampPlusRawGraph {
     this.readbackSlots = readbackSlots;
     this.dispatchCount = schedule.all.length;
     this.fcmVariant = foundation.fcm.variant;
+    this.denseBottleneckVariant = denseBottleneckVariant;
+    this.pointwiseTransitVariant = foundation.pointwiseTransit.variant;
     const input = batchSize * FRAMES * FEATURES * 4;
     const output = batchSize * EMBEDDING_CHANNELS * 4;
     const readback = output * CAMPPLUS_RAW_MAX_IN_FLIGHT_RUNS;
@@ -176,6 +194,10 @@ export class CampPlusRawGraph {
     options: CampPlusRawGraphOptions = {},
   ): Promise<CampPlusRawGraph> {
     const batchSize = options.batchSize ?? 32;
+    const denseBottleneckVariant =
+      options.denseBottleneckVariant ?? DEFAULT_DENSE_BOTTLENECK_VARIANT;
+    const denseBottleneckConfiguration =
+      denseBottleneckVariantConfiguration(denseBottleneckVariant);
     const loadOptions: RawCampPlusFoundationOptions = {
       activationArenaBytes: ARENA_BYTES[batchSize],
       ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
@@ -183,6 +205,9 @@ export class CampPlusRawGraph {
       ...(options.fcmVariant === undefined
         ? {}
         : { fcmVariant: options.fcmVariant }),
+      ...(options.pointwiseTransitVariant === undefined
+        ? {}
+        : { pointwiseTransitVariant: options.pointwiseTransitVariant }),
     };
     const foundation = await RawCampPlusFoundation.create(
       device,
@@ -223,11 +248,18 @@ export class CampPlusRawGraph {
           ),
         );
       }
+      await foundation.denseCam.prepareBottleneckVariant(
+        denseBottleneckConfiguration.accumulation,
+        denseBottleneckConfiguration.outputTile,
+        denseBottleneckConfiguration.workgroupSize,
+        denseBottleneckConfiguration.weightSource,
+      );
       schedule = createSchedule(
         foundation,
         batchSize,
         inputBuffer,
         outputBuffer,
+        denseBottleneckConfiguration,
       );
       if (schedule.all.length !== 119) {
         throw new Error(`CAM++ static schedule has ${schedule.all.length} dispatches, expected 119`);
@@ -240,6 +272,7 @@ export class CampPlusRawGraph {
         inputBuffer,
         outputBuffer,
         readbackSlots,
+        denseBottleneckVariant,
       );
     } catch (error) {
       schedule?.all.forEach((dispatch) => dispatch.destroy());
@@ -504,6 +537,7 @@ function createSchedule(
   batchSize: CampPlusRawBatchSize,
   inputBuffer: GPUBuffer,
   outputBuffer: GPUBuffer,
+  denseBottleneckConfiguration: DenseBottleneckVariantConfiguration,
 ): GraphSchedule {
   const arena = foundation.arena;
   const head = foundation.gpuPackage.metadata.fusedProgram.headConvolutions;
@@ -697,6 +731,7 @@ function createSchedule(
           scratch,
           doubledMean,
           batchSize,
+          ...denseBottleneckConfiguration,
         }),
         foundation.denseCam.createLocalCamDispatch({
           label: `senko-campplus-${layer.id}-local-cam`,

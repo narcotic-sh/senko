@@ -5,11 +5,23 @@ import {
   type CampPlusRawBatchSize,
 } from "./pipeline/campplus-webgpu/graph";
 import {
+  DEFAULT_DENSE_BOTTLENECK_VARIANT,
+  DENSE_BOTTLENECK_VARIANTS,
+  isDenseBottleneckVariant,
+  type DenseBottleneckVariant,
+} from "./pipeline/campplus-webgpu/dense-cam";
+import {
   DEFAULT_FCM_VARIANT,
   FCM_VARIANTS,
   isFcmVariant,
   type FcmVariant,
 } from "./pipeline/campplus-webgpu/fcm";
+import {
+  DEFAULT_POINTWISE_TRANSIT_VARIANT,
+  POINTWISE_TRANSIT_VARIANTS,
+  isPointwiseTransitVariant,
+  type PointwiseTransitVariant,
+} from "./pipeline/campplus-webgpu/pointwise-transit";
 import {
   preferredRawCampPlusDeviceLimits,
   requireRawCampPlusAdapterLimits,
@@ -35,9 +47,21 @@ export async function runRawCampPlusGraphDiagnostic(root: HTMLElement): Promise<
     const parameters = new URLSearchParams(location.search);
     const batchSize = parseBatchSize(parameters.get("batch"));
     const fcmVariant = parseFcmVariant(parameters.get("fcm-variant"));
-    const result = await execute(batchSize, fcmVariant, (message) => {
-      output.textContent = message;
-    });
+    const denseBottleneckVariant = parseDenseBottleneckVariant(
+      parameters.get("dense-bottleneck-variant"),
+    );
+    const pointwiseTransitVariant = parsePointwiseTransitVariant(
+      parameters.get("pointwise-transit-variant"),
+    );
+    const result = await execute(
+      batchSize,
+      fcmVariant,
+      denseBottleneckVariant,
+      pointwiseTransitVariant,
+      (message) => {
+        output.textContent = message;
+      },
+    );
     output.textContent = JSON.stringify(result, null, 2);
     output.dataset.status = result.ok ? "passed" : "failed";
     globalThis.dispatchEvent(
@@ -53,6 +77,8 @@ export async function runRawCampPlusGraphDiagnostic(root: HTMLElement): Promise<
 async function execute(
   batchSize: CampPlusRawBatchSize,
   fcmVariant: FcmVariant,
+  denseBottleneckVariant: DenseBottleneckVariant,
+  pointwiseTransitVariant: PointwiseTransitVariant,
   report: (message: string) => void,
 ): Promise<Record<string, unknown>> {
   if (navigator.gpu === undefined) throw new Error("WebGPU is unavailable");
@@ -71,12 +97,14 @@ async function execute(
   let graph: CampPlusRawGraph | undefined;
   try {
     report(
-      `Streaming weights and compiling the raw B${batchSize} graph (${fcmVariant})…`,
+      `Streaming weights and compiling the raw B${batchSize} graph (${fcmVariant}, ${denseBottleneckVariant}, ${pointwiseTransitVariant})…`,
     );
     const compileStart = performance.now();
     graph = await CampPlusRawGraph.create(device, METADATA_URL, {
       batchSize,
       fcmVariant,
+      denseBottleneckVariant,
+      pointwiseTransitVariant,
     });
     const loadAndCompileMs = performance.now() - compileStart;
     const features = deterministicFeatures(batchSize);
@@ -105,6 +133,8 @@ async function execute(
       ok,
       batchSize,
       fcmVariant: graph.fcmVariant,
+      denseBottleneckVariant: graph.denseBottleneckVariant,
+      pointwiseTransitVariant: graph.pointwiseTransitVariant,
       dispatches: graph.dispatchCount,
       commandEncodersPerRun: 1,
       submissionsPerRun: 1,
@@ -149,6 +179,26 @@ export function parseFcmVariant(value: string | null): FcmVariant {
   if (isFcmVariant(value)) return value;
   throw new RangeError(
     `Raw CAM++ FCM variant must be one of: ${FCM_VARIANTS.join(", ")}`,
+  );
+}
+
+export function parseDenseBottleneckVariant(
+  value: string | null,
+): DenseBottleneckVariant {
+  if (value === null) return DEFAULT_DENSE_BOTTLENECK_VARIANT;
+  if (isDenseBottleneckVariant(value)) return value;
+  throw new RangeError(
+    `Raw CAM++ dense bottleneck variant must be one of: ${DENSE_BOTTLENECK_VARIANTS.join(", ")}`,
+  );
+}
+
+export function parsePointwiseTransitVariant(
+  value: string | null,
+): PointwiseTransitVariant {
+  if (value === null) return DEFAULT_POINTWISE_TRANSIT_VARIANT;
+  if (isPointwiseTransitVariant(value)) return value;
+  throw new RangeError(
+    `Raw CAM++ pointwise transit variant must be one of: ${POINTWISE_TRANSIT_VARIANTS.join(", ")}`,
   );
 }
 

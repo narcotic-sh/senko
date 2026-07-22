@@ -9,6 +9,16 @@ const MAX_INPUT_CHANNELS = 1024;
 const UNIFORM_BYTES = 80;
 export const POINTWISE_TRANSIT_REQUIRED_WORKGROUP_STORAGE_BYTES = 16_384;
 export const POINTWISE_TRANSIT_TILE4_WORKGROUP_STORAGE_BYTES = 32_768;
+export const POINTWISE_TRANSIT_VARIANTS = [
+  "full-cache",
+  "chunk512",
+] as const;
+export type PointwiseTransitVariant = (typeof POINTWISE_TRANSIT_VARIANTS)[number];
+export const DEFAULT_POINTWISE_TRANSIT_VARIANT: PointwiseTransitVariant = "chunk512";
+
+export function isPointwiseTransitVariant(value: string): value is PointwiseTransitVariant {
+  return (POINTWISE_TRANSIT_VARIANTS as readonly string[]).includes(value);
+}
 
 export interface PointwiseTransitDescriptor {
   readonly label: string;
@@ -67,8 +77,9 @@ export class PointwiseTransitKernels {
     private readonly device: GPUDevice,
     private readonly gpuPackage: CampPlusGpuPackage,
     private readonly arena: CampPlusActivationArena,
-    private readonly tile2: GPUComputePipeline,
-    private readonly tile4: GPUComputePipeline | undefined,
+    readonly variant: PointwiseTransitVariant,
+    private readonly outputTile: 2 | 4,
+    private readonly pipeline: GPUComputePipeline,
     private readonly layout: GPUBindGroupLayout,
   ) {}
 
@@ -76,6 +87,7 @@ export class PointwiseTransitKernels {
     device: GPUDevice,
     gpuPackage: CampPlusGpuPackage,
     arena: CampPlusActivationArena,
+    variant: PointwiseTransitVariant = DEFAULT_POINTWISE_TRANSIT_VARIANT,
   ): Promise<PointwiseTransitKernels> {
     if (
       device.limits.maxComputeWorkgroupStorageSize <
@@ -99,19 +111,20 @@ export class PointwiseTransitKernels {
         },
       ],
     });
-    const tile2Promise = createPipeline(device, layout, 2);
-    const tile4Promise =
+    const outputTile: 2 | 4 =
+      variant === "chunk512" ||
       device.limits.maxComputeWorkgroupStorageSize >=
-      POINTWISE_TRANSIT_TILE4_WORKGROUP_STORAGE_BYTES
-        ? createPipeline(device, layout, 4)
-        : Promise.resolve(undefined);
-    const [tile2, tile4] = await Promise.all([tile2Promise, tile4Promise]);
+        POINTWISE_TRANSIT_TILE4_WORKGROUP_STORAGE_BYTES
+        ? 4
+        : 2;
+    const pipeline = await createPipeline(device, layout, outputTile, variant);
     return new PointwiseTransitKernels(
       device,
       gpuPackage,
       arena,
-      tile2,
-      tile4,
+      variant,
+      outputTile,
+      pipeline,
       layout,
     );
   }
@@ -123,8 +136,7 @@ export class PointwiseTransitKernels {
     const affine = this.gpuPackage.section(descriptor.preactivationAffine);
     validateSections(descriptor, weight, bias, affine);
     const outputGroups = descriptor.outputChannels / 4;
-    const outputTile: 2 | 4 = this.tile4 === undefined ? 2 : 4;
-    const pipeline = outputTile === 4 ? this.tile4! : this.tile2;
+    const outputTile = this.outputTile;
     if (outputGroups % outputTile !== 0) {
       throw new Error(`${descriptor.label} output groups are not divisible by tile ${outputTile}`);
     }
@@ -174,7 +186,7 @@ export class PointwiseTransitKernels {
       return new PointwiseTransitDispatch(
         descriptor.label,
         outputTile,
-        pipeline,
+        this.pipeline,
         bindGroup,
         uniform,
         [outputGroups / outputTile, descriptor.batchSize, 1],
@@ -283,11 +295,15 @@ async function createPipeline(
   device: GPUDevice,
   layout: GPUBindGroupLayout,
   outputTile: 2 | 4,
+  variant: PointwiseTransitVariant,
 ): Promise<GPUComputePipeline> {
-  const label = `senko-campplus-pointwise-transit-tile${outputTile}`;
+  const label = `senko-campplus-pointwise-transit-tile${outputTile}-${variant}`;
   const module = device.createShaderModule({
     label,
-    code: pointwiseTransitWgsl(outputTile),
+    code:
+      variant === "chunk512"
+        ? pointwiseTransitChunk512Wgsl(outputTile)
+        : pointwiseTransitWgsl(outputTile),
   });
   const compilation = await module.getCompilationInfo();
   const errors = compilation.messages.filter((message) => message.type === "error");
@@ -402,6 +418,134 @@ ${accumulatorDeclarations}
       let activated_3 = max(f16(f32(arena[input_index + 3u * parameters.frames]) * scale[3] + shift[3]), f16(0.0));
 ${accumulationSteps}
     }
+${stores}
+  }
+}
+`;
+}
+
+/**
+ * Tile-4 transit with a 512-channel strip-mined weight cache. This cuts
+ * workgroup storage from 32 KiB to 16 KiB while preserving input/FMA order.
+ */
+export function pointwiseTransitChunk512Wgsl(outputTile: 2 | 4): string {
+  const cacheChannels = 512;
+  const accumulatorDeclarations = Array.from(
+    { length: outputTile },
+    (_, tile) => `  var accumulator_${tile} = vec4<f32>(biases[first_output_group + ${tile}u]);`,
+  ).join("\n");
+  const accumulationSteps = Array.from({ length: outputTile }, (_, tile) => {
+    const cacheBase = `${tile}u * ${cacheChannels}u + cache_channel_base`;
+    return `      accumulator_${tile} = fma(vec4<f32>(f32(activated_0)), vec4<f32>(weight_cache[${cacheBase}]), accumulator_${tile});
+      accumulator_${tile} = fma(vec4<f32>(f32(activated_1)), vec4<f32>(weight_cache[${cacheBase} + 1u]), accumulator_${tile});
+      accumulator_${tile} = fma(vec4<f32>(f32(activated_2)), vec4<f32>(weight_cache[${cacheBase} + 2u]), accumulator_${tile});
+      accumulator_${tile} = fma(vec4<f32>(f32(activated_3)), vec4<f32>(weight_cache[${cacheBase} + 3u]), accumulator_${tile});`;
+  }).join("\n");
+  const stores = Array.from(
+    { length: outputTile },
+    (_, tile) =>
+      `    store_output(first_output_group + ${tile}u, batch, frame, finish_output(accumulator_${tile}));`,
+  ).join("\n");
+  return /* wgsl */ `
+enable f16;
+
+struct Parameters {
+  input_offset: u32,
+  output_offset: u32,
+  batch_size: u32,
+  input_channels: u32,
+  output_channels: u32,
+  frames: u32,
+  input_groups: u32,
+  output_groups: u32,
+  input_storage_channels: u32,
+  output_storage_channels: u32,
+  output_relu: u32,
+  r0: u32, r1: u32, r2: u32, r3: u32, r4: u32,
+  r5: u32, r6: u32, r7: u32, r8: u32,
+}
+
+@group(0) @binding(0) var<storage, read_write> arena: array<f16>;
+@group(0) @binding(1) var<storage, read> weights: array<vec4<f16>>;
+@group(0) @binding(2) var<storage, read> biases: array<vec4<f16>>;
+@group(0) @binding(3) var<storage, read> affine: array<vec4<f32>>;
+@group(0) @binding(4) var<uniform> parameters: Parameters;
+var<workgroup> weight_cache: array<vec4<f16>, ${cacheChannels * outputTile}>;
+
+fn finish_output(accumulator: vec4<f32>) -> vec4<f16> {
+  var rounded = vec4<f16>(accumulator);
+  if (parameters.output_relu != 0u) {
+    rounded = max(rounded, vec4<f16>(f16(0.0)));
+  }
+  return rounded;
+}
+
+fn store_output(output_group: u32, batch: u32, frame: u32, value: vec4<f16>) {
+  let output_channel = output_group * 4u;
+  let base =
+    parameters.output_offset +
+    ((batch * parameters.output_storage_channels + output_channel) * parameters.frames + frame);
+  arena[base] = value[0];
+  arena[base + parameters.frames] = value[1];
+  arena[base + 2u * parameters.frames] = value[2];
+  arena[base + 3u * parameters.frames] = value[3];
+}
+
+@compute @workgroup_size(128)
+fn main(
+  @builtin(local_invocation_id) local_id: vec3<u32>,
+  @builtin(workgroup_id) group: vec3<u32>,
+) {
+  let first_output_group = group.x * ${outputTile}u;
+  let batch = group.y;
+  let frame = local_id.x;
+  let frame_active = frame < parameters.frames && batch < parameters.batch_size;
+${accumulatorDeclarations}
+  let batch_channel_base = batch * parameters.input_storage_channels;
+  var chunk_start = 0u;
+  loop {
+    let chunk_end = min(chunk_start + ${cacheChannels}u, parameters.input_channels);
+    let chunk_channels = chunk_end - chunk_start;
+    var cache_index = local_id.x;
+    while (cache_index < ${cacheChannels * outputTile}u) {
+      let tile = cache_index / ${cacheChannels}u;
+      let chunk_channel = cache_index - tile * ${cacheChannels}u;
+      if (chunk_channel < chunk_channels) {
+        let input_channel = chunk_start + chunk_channel;
+        let input_group = input_channel / 4u;
+        let input_lane = input_channel & 3u;
+        let output_group = first_output_group + tile;
+        let packed_index =
+          (output_group * parameters.input_groups + input_group) * 4u + input_lane;
+        weight_cache[cache_index] = weights[packed_index];
+      }
+      cache_index += 128u;
+    }
+    workgroupBarrier();
+
+    if (frame_active) {
+      let first_input_group = chunk_start / 4u;
+      let end_input_group = chunk_end / 4u;
+      for (var input_group = first_input_group; input_group < end_input_group; input_group += 1u) {
+        let channel_base = input_group * 4u;
+        let cache_channel_base = channel_base - chunk_start;
+        let input_index =
+          parameters.input_offset +
+          ((batch_channel_base + channel_base) * parameters.frames + frame);
+        let scale = affine[input_group * 2u];
+        let shift = affine[input_group * 2u + 1u];
+        let activated_0 = max(f16(f32(arena[input_index]) * scale[0] + shift[0]), f16(0.0));
+        let activated_1 = max(f16(f32(arena[input_index + parameters.frames]) * scale[1] + shift[1]), f16(0.0));
+        let activated_2 = max(f16(f32(arena[input_index + 2u * parameters.frames]) * scale[2] + shift[2]), f16(0.0));
+        let activated_3 = max(f16(f32(arena[input_index + 3u * parameters.frames]) * scale[3] + shift[3]), f16(0.0));
+${accumulationSteps}
+      }
+    }
+    if (chunk_end == parameters.input_channels) { break; }
+    workgroupBarrier();
+    chunk_start = chunk_end;
+  }
+  if (frame_active) {
 ${stores}
   }
 }

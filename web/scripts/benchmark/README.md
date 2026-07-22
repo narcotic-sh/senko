@@ -62,35 +62,35 @@ though it cannot enter Senko's memory accounting.
 
 ## Current measured snapshot (2026-07-21)
 
-These numbers are a development snapshot on the target M3 Mac, not a promise
-that every run will reproduce the same wall time. FBank and CAM++ overlap, so
-stage times must not be summed to derive the end-to-end time. The long-file
-row reports the median of three independent timing-acceptance invocations of
-the production bundle; each invocation used a new isolated Chrome profile and
-passed the offline-correctness gate.
+These numbers are the latest cooled checkpoint on the target M3 Mac, not a
+promise that every run will reproduce the same wall time. FBank and CAM++
+overlap, so stage times must not be summed to derive the end-to-end time. Each
+row is one fresh isolated-Chrome validation of the production bundle. The long
+run passed the offline-correctness gate; repeated final acceptance runs remain
+appropriate before treating this single sample as a stable median.
 
 | Fixture | Worker wall | VAD | FBank | CAM++ | Clustering | Postprocess | Result |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| `test_audio_short.wav` | 2.702 s | 0.444 s | 0.327 s | 2.050 s | 0.191 s | 0.002 s | 4 speakers, 49 segments |
-| `test_audio.wav`, 3-run median | **17.363 s** | 2.888 s | 3.015 s | 12.763 s | 1.692 s | 0.004 s | 9 speakers, 137 segments |
+| `test_audio_short.wav` | **2.094945 s** | 0.442270 s | 0.388905 s | 1.434480 s | 0.201285 s | 0.001445 s | 4 speakers, 49 segments |
+| `test_audio.wav` | **13.680845 s** | 2.885215 s | 3.067940 s | 9.091250 s | 1.683555 s | 0.003610 s | 9 speakers, 137 segments |
 
-The three long-file wall times were 17.363220 s, 17.362080 s, and 17.382200 s:
-a 17.363220-second median and only a 20.120 ms min-to-max spread. This
-comfortably establishes the sub-30-second requirement on the target machine
-and is 2.363 seconds above the 15-second stretch target. Earlier 23.912-second,
-36.371-second, and 39.267-second snapshots are retained in the research
-artifacts. The latter two were collected during substantial system and thermal
-contention; the cooled three-run result confirms that they were not a code
-regression.
+The long checkpoint is 1.319 seconds below the 15-second stretch target and
+3.681 seconds above the aspirational 10-second target. The production CAM++
+graph now combines `tile4-fold` FCM, `direct-tile4-wg128` dense bottlenecks,
+and `chunk512` pointwise transits. Dense tile-4 shares each activation across
+four output channels without changing per-output FMA order. Chunked transits
+strip-mine 512 input channels at a time, cutting their workgroup cache from
+32 KiB to 16 KiB while preserving accumulation order.
 
-The selected `tile4-fold` FCM kernel had a 37.748736 ms pooled whole-graph GPU
-median in the standalone A/B, versus 45.842432 ms for the retained
-`tile1-split` baseline. Its FCM profile median was 8.060928 ms, versus
-11.993088 ms. Parity and output fingerprints were identical and explicit GPU
-memory did not change. A direct final `tile2-fold`/`tile4-fold` pair was
-effectively tied, but `tile4-fold` won the pooled graph and FCM medians; the
-end-to-end correctness and timing gates above then passed with it as the
-production default.
+A current standalone graph invocation contained an exact 24.969216 ms GPU
+sample. Across the interleaved transit A/B, `chunk512` had a 25.100288 ms
+pooled graph median versus 27.590656 ms for `full-cache`; the preceding dense
+A/B measured 27.7217 ms for direct tile-4 versus 30.8019 ms for direct tile-2.
+All retained winners had identical output fingerprints and parity, with no
+increase in explicit GPU memory. FCM tile-8 was also tested and rejected: its
+representative graph time was approximately 26.782 ms versus 24.969216 ms, and
+its FCM group took approximately 8.389 ms versus 6.750 ms for tile-4. The
+experimental tile-8 code was not retained.
 
 A thermally contended raw-graph A/B measured B16 at 59.5317 ms per 16 items
 and B32 at 115.5783 ms per 32 items. B32 improved per-item throughput by only
@@ -129,7 +129,8 @@ and its native labels scatter. The evidence therefore favors eight meaningful
 speakers. Senko does not add fixture-specific label or count forcing to obtain
 that result; the browser retains the native postprocessing semantics.
 
-The current exact/lower-bound memory accounting is:
+The current exact/lower-bound memory accounting is unchanged by the dense and
+transit kernel optimizations:
 
 | Fixture | Known CPU peak | Explicit GPU-buffer peak | Fixed WASM heaps | Isolated page + worker diagnostic |
 | --- | ---: | ---: | ---: | ---: |
@@ -144,6 +145,10 @@ Chrome windows and tabs. The 118,273,444-byte long-file `Blob` is externally
 held and streamed without making a file-sized copy; it is therefore reported
 separately from `knownCpuPeakBytes`. The long run's largest named CPU working
 allocation is 7,544,032 bytes for clustering.
+
+Production's fixed ownership remains 12,250,848 bytes at the known long-file
+CPU peak, 39,855,360 bytes of explicit GPU buffers, and 9,961,472 bytes across
+the fixed WASM heaps. The external zero-copy audio `Blob` is 118,273,444 bytes.
 
 The ring adds the named `camOutputBatchBytes = 24,576` host allocation for two
 returned B16 output arrays. That lifetime is below the existing VAD peak on the
@@ -253,6 +258,24 @@ Run the small runner/helper tests without loading models or processing audio:
 ```bash
 node --test web/scripts/benchmark/*.test.mjs
 ```
+
+## Isolated raw-graph diagnostics
+
+Use the dedicated diagnostic launcher for kernel A/B work rather than opening
+the URL in an existing Chrome session:
+
+```bash
+node web/scripts/benchmark/run-browser-diagnostic.mjs \
+  --url 'http://127.0.0.1:4173/?raw-campplus-graph-diagnostic=1&batch=16&fcm-variant=tile4-fold&dense-bottleneck-variant=direct-tile4-wg128&pointwise-transit-variant=chunk512' \
+  --remove-profile
+```
+
+The runner installs the diagnostic event listener before navigation, launches
+one tab in a fresh extension-free profile, and falls back to the terminal DOM
+result if a diagnostic does not dispatch its event. Standard output is only
+the parsed result JSON, making it safe to redirect directly into a retained A/B
+artifact. The isolated Chrome process and profile are removed in `finally`
+unless `--keep-profile` is requested.
 
 ## Standalone RSS monitors
 

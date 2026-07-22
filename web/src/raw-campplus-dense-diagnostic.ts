@@ -2,6 +2,8 @@
 
 import {
   type DenseBottleneckAccumulation,
+  type DenseBottleneckOutputTile,
+  type DenseBottleneckWorkgroupSize,
   type DenseBottleneckWeightSource,
   type DenseCamDispatch,
 } from "./pipeline/campplus-webgpu/dense-cam";
@@ -125,14 +127,28 @@ async function execute(report: (message: string) => void): Promise<Record<string
         workgroupSize: 128,
         weightSource: "direct",
       },
+      {
+        id: "tile2-wg128-direct-float32",
+        accumulation: "float32",
+        outputTile: 2,
+        workgroupSize: 128,
+        weightSource: "direct",
+      },
+      {
+        id: "tile4-wg128-direct-float32",
+        accumulation: "float32",
+        outputTile: 4,
+        workgroupSize: 128,
+        weightSource: "direct",
+      },
     ] as const satisfies readonly {
       readonly id: string;
       readonly accumulation: DenseBottleneckAccumulation;
-      readonly outputTile: 1;
-      readonly workgroupSize: 128;
+      readonly outputTile: DenseBottleneckOutputTile;
+      readonly workgroupSize: DenseBottleneckWorkgroupSize;
       readonly weightSource: DenseBottleneckWeightSource;
     }[];
-    report("Compiling matched cached-weight and direct-weight FP32 variants…");
+    report("Compiling cached tile-1 and direct tile-1/tile-2/tile-4 FP32 variants…");
     await Promise.all(
       variants.map((variant) =>
         foundation!.denseCam.prepareBottleneckVariant(
@@ -284,13 +300,14 @@ async function execute(report: (message: string) => void): Promise<Record<string
         doubledMeanParity,
       };
     });
-    const scratchParity = denseVariants[0]!.parity;
-    const meanParity = denseVariants[0]!.doubledMeanParity;
     const appendParity = compareHalf(actualAppend, expectedAppend);
     const ok =
-      scratchParity.maxAbsoluteError <= 0.02 &&
-      scratchParity.cosineSimilarity >= 0.999_999 &&
-      meanParity.maxAbsoluteError <= 0.005 &&
+      denseVariants.every(
+        (variant) =>
+          variant.parity.maxAbsoluteError <= 0.02 &&
+          variant.parity.cosineSimilarity >= 0.999_999 &&
+          variant.doubledMeanParity.maxAbsoluteError <= 0.005,
+      ) &&
       appendParity.maxAbsoluteError <= 0.02 &&
       appendParity.cosineSimilarity >= 0.999_999;
     return {
