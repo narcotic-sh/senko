@@ -1,5 +1,7 @@
 import type { Subsegment, TimeSegment } from "./types";
 
+export const DEFAULT_SUBSEGMENT_DURATION_SECONDS = 1.5;
+
 export interface SubsegmentOptions {
   durationSeconds?: number;
   shiftSeconds?: number;
@@ -10,7 +12,8 @@ export function createSubsegments(
   vad: readonly TimeSegment[],
   options: SubsegmentOptions = {},
 ): Subsegment[] {
-  const duration = options.durationSeconds ?? 1.5;
+  const duration =
+    options.durationSeconds ?? DEFAULT_SUBSEGMENT_DURATION_SECONDS;
   const shift = options.shiftSeconds ?? duration / 2.5;
   if (!(duration > 0) || !(shift > 0)) {
     throw new RangeError("Subsegment duration and shift must be positive");

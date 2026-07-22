@@ -1,7 +1,7 @@
 /// <reference types="@webgpu/types" />
 
 import { clusterEmbeddings, WasmClusteringKernels } from "./clustering";
-import { BrowserModelSet, requestMaximumPerformanceAdapter } from "./pipeline/browser-models";
+import { BrowserModelSet } from "./pipeline/browser-models";
 import { runBrowserPipeline, type BrowserPipelineModels } from "./pipeline/browser-pipeline";
 import { configureOrt, OrtEmbeddingBackend } from "./pipeline/ort-backends";
 import { postprocessClustering } from "./pipeline/postprocess";
@@ -89,9 +89,8 @@ export async function runRawCampPlusFileParityDiagnostic(
 
   try {
     if (navigator.gpu === undefined) throw new Error("WebGPU is unavailable");
-    const adapter = await requestMaximumPerformanceAdapter(navigator.gpu);
     [models, kernels] = await Promise.all([
-      BrowserModelSet.load(new URL(MANIFEST_URL, location.href).href, adapter, {
+      BrowserModelSet.load(new URL(MANIFEST_URL, location.href).href, navigator.gpu, {
         vadBatchSize: 8,
         embeddingBatchSize: RAW_BATCH,
         warmupRuns: 1,
@@ -147,28 +146,25 @@ async function execute(
     get knownGpuBufferBytes() {
       return models.knownGpuBufferBytes;
     },
-    prepareVadStage: () => models.prepareVadStage(),
-    prepareEmbeddingStage: async (hasWork) => {
-      await models.prepareEmbeddingStage(hasWork);
-      if (hasWork) await comparator.prepare();
-    },
-    finishEmbeddingStage: async () => {
-      await comparator.finish();
-      await models.finishEmbeddingStage();
-    },
   };
+  await comparator.prepare();
   let browserSubsegments: readonly Subsegment[] = [];
-  const pipeline = await runBrowserPipeline(
-    audio,
-    facade,
-    DEFAULT_PIPELINE_OPTIONS,
-    {
-      clusteringKernels: kernels,
-      onSubsegmentsCreated: (subsegments) => {
-        browserSubsegments = subsegments.map((item) => ({ ...item }));
+  let pipeline: PipelineResult;
+  try {
+    pipeline = await runBrowserPipeline(
+      audio,
+      facade,
+      DEFAULT_PIPELINE_OPTIONS,
+      {
+        clusteringKernels: kernels,
+        onSubsegmentsCreated: (subsegments) => {
+          browserSubsegments = subsegments.map((item) => ({ ...item }));
+        },
       },
-    },
-  );
+    );
+  } finally {
+    await comparator.finish();
+  }
   const embeddingStage = pipeline.stages.find((stage) => stage.stage === "embedding");
   if (embeddingStage?.stage !== "embedding") {
     throw new Error("Embedding stage metrics are missing");
@@ -621,9 +617,9 @@ class ComparingEmbeddingBackend implements EmbeddingBatchBackend {
       throw new Error("Pinned ORT-fp16 CAM++ B32 reference is missing");
     }
     const runtime = configureOrt({
-      // Dawn consumes this adapter when BrowserModelSet requests its device.
-      // Give ORT that exact device so both graphs also share one ordered queue.
-      device: this.models.device,
+      // Give ORT the CAM++ device so both embedding graphs share one ordered
+      // queue without contending with the separately resident VAD device.
+      device: this.models.embeddingDevice,
       graphCapture: false,
       graphOptimizationLevel:
         precision.ort_web?.required_graph_optimization_level ?? "basic",

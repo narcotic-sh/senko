@@ -133,6 +133,37 @@ class DeferredFirstEmbedding extends ConstantEmbedding {
   }
 }
 
+class DeferredSecondVad extends AllSpeechVad {
+  readonly secondRunStarted: Promise<void>;
+  private markSecondRunStarted: (() => void) | undefined;
+  private releaseSecond: (() => void) | undefined;
+
+  constructor() {
+    super();
+    this.secondRunStarted = new Promise<void>((resolve) => {
+      this.markSecondRunStarted = resolve;
+    });
+  }
+
+  override async run(input: Float32Array): Promise<Float32Array> {
+    const output = await super.run(input);
+    if (this.runs !== 2) return output;
+    this.markSecondRunStarted?.();
+    this.markSecondRunStarted = undefined;
+    await new Promise<void>((resolve) => {
+      this.releaseSecond = resolve;
+    });
+    return output;
+  }
+
+  releaseSecondRun(): void {
+    const release = this.releaseSecond;
+    if (release === undefined) throw new Error("Second VAD run is not pending");
+    this.releaseSecond = undefined;
+    release();
+  }
+}
+
 class DeferredTwoEmbeddings extends ConstantEmbedding {
   readonly maxInFlightRuns = 2;
   readonly secondRunStarted: Promise<void>;
@@ -338,28 +369,15 @@ describe("runBrowserPipeline", () => {
       );
     const embedding = new ConstantEmbedding();
     const fbank = new DisposableTestFbank();
-    let requestedEmbeddingWork: boolean | undefined;
-    let finishCalls = 0;
 
     const result = await runBrowserPipeline(
       wavBlob(1),
-      {
-        vad,
-        embedding,
-        prepareEmbeddingStage: async (hasEmbeddingWork) => {
-          requestedEmbeddingWork = hasEmbeddingWork;
-        },
-        finishEmbeddingStage: async () => {
-          finishCalls += 1;
-        },
-      },
+      { vad, embedding },
       DEFAULT_PIPELINE_OPTIONS,
       { createFbank: async () => fbank },
     );
 
     expect(embedding.runs).toBe(0);
-    expect(requestedEmbeddingWork).toBe(false);
-    expect(finishCalls).toBe(0);
     expect(result.segments).toEqual([]);
     expect(result.speakerCount).toBe(0);
     expect(stage(result, "fbank").metrics.windowCount).toBe(0);
@@ -368,57 +386,14 @@ describe("runBrowserPipeline", () => {
     expect(fbank.disposeCalls).toBe(1);
   });
 
-  it("honors stage-scoped model residency and records the largest GPU stage", async () => {
-    const base = modelsWithSpeech();
-    const events: string[] = [];
-    let knownGpuBufferBytes = 10_000;
-    const originalVadRun = base.vad.run.bind(base.vad);
-    base.vad.run = async (input) => {
-      events.push("vad-run");
-      return await originalVadRun(input);
-    };
-    const originalEmbeddingRun = base.embedding.run.bind(base.embedding);
-    base.embedding.run = async (features) => {
-      events.push("embedding-run");
-      return await originalEmbeddingRun(features);
-    };
-    const models: BrowserPipelineModels = {
-      vad: base.vad,
-      embedding: base.embedding,
-      get knownGpuBufferBytes() {
-        return knownGpuBufferBytes;
-      },
-      async prepareVadStage() {
-        events.push("prepare-vad");
-        knownGpuBufferBytes = 20_000;
-      },
-      async prepareEmbeddingStage() {
-        events.push("prepare-embedding");
-        expect(base.vad.runs).toBe(1);
-        knownGpuBufferBytes = 30_000;
-      },
-      async finishEmbeddingStage() {
-        events.push("finish-embedding");
-        expect(base.embedding.runs).toBe(1);
-        knownGpuBufferBytes = 0;
-      },
-    };
-
+  it("records the concurrently resident model buffers", async () => {
     const result = await runBrowserPipeline(
       wavBlob(2),
-      models,
+      { ...modelsWithSpeech(), knownGpuBufferBytes: 64_700_672 },
       DEFAULT_PIPELINE_OPTIONS,
       { createFbank: async () => new DisposableTestFbank() },
     );
-
-    expect(events).toEqual([
-      "prepare-vad",
-      "vad-run",
-      "prepare-embedding",
-      "embedding-run",
-      "finish-embedding",
-    ]);
-    expect(result.memory.knownGpuBufferBytes).toBe(30_000);
+    expect(result.memory.knownGpuBufferBytes).toBe(64_700_672);
   });
 
   it("extracts the next FBank batch while CAM++ is in flight using distinct bounded buffers", async () => {
@@ -456,6 +431,79 @@ describe("runBrowserPipeline", () => {
     expect(fbank.disposeCalls).toBe(1);
   });
 
+  it("submits two CAM++ batches while the next VAD batch is in flight", async () => {
+    const vad = new DeferredSecondVad();
+    const embedding = new DeferredFirstEmbedding();
+    let capturedSubsegments: readonly { readonly index: number; readonly end: number }[] = [];
+    const pipeline = runBrowserPipeline(
+      wavBlob(25),
+      { vad, embedding },
+      DEFAULT_PIPELINE_OPTIONS,
+      {
+        createFbank: async () => new DisposableTestFbank(),
+        onSubsegmentsCreated: (subsegments) => {
+          capturedSubsegments = subsegments;
+        },
+      },
+    );
+
+    await vad.secondRunStarted;
+    await embedding.secondRunStarted;
+    expect(vad.runs).toBe(2);
+    expect(embedding.runs).toBe(2);
+
+    embedding.releaseFirstRun();
+    vad.releaseSecondRun();
+    const result = await pipeline;
+    expect(stage(result, "vad").metrics.modelRuns).toBe(2);
+    expect(stage(result, "embedding").metrics.batchCount).toBe(
+      Math.ceil(capturedSubsegments.length / embedding.batchSize),
+    );
+    expect(capturedSubsegments.map((item) => item.index)).toEqual(
+      capturedSubsegments.map((_, index) => index),
+    );
+    expect(capturedSubsegments.at(-1)!.end).toBeGreaterThan(25);
+  });
+
+  it("drains prefetched VAD and CAM++ work before completing cancellation", async () => {
+    const vad = new DeferredSecondVad();
+    const embedding = new DeferredFirstEmbedding();
+    const controller = new AbortController();
+    const fbank = new DisposableTestFbank();
+    const pipeline = runBrowserPipeline(
+      wavBlob(25),
+      { vad, embedding },
+      DEFAULT_PIPELINE_OPTIONS,
+      {
+        signal: controller.signal,
+        createFbank: async () => fbank,
+      },
+    );
+    let settled = false;
+    void pipeline.then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      },
+    );
+
+    await vad.secondRunStarted;
+    await embedding.secondRunStarted;
+    controller.abort();
+    vad.releaseSecondRun();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    embedding.releaseFirstRun();
+    await expect(pipeline).rejects.toBeInstanceOf(
+      BrowserPipelineCancelledError,
+    );
+    expect(fbank.disposeCalls).toBe(1);
+  });
+
   it("caps CAM++ at two submissions and settles readbacks in FIFO order", async () => {
     const embedding = new DeferredTwoEmbeddings();
     const pipeline = runBrowserPipeline(
@@ -481,24 +529,16 @@ describe("runBrowserPipeline", () => {
     expect(result.memory.allocations.camOutputBatchBytes).toBe(64);
   });
 
-  it("releases a prepared embedding stage after inference fails", async () => {
+  it("annotates an embedding inference failure", async () => {
     const base = modelsWithSpeech();
-    let finishCalls = 0;
     base.embedding.run = async () => {
       throw new Error("CAM failed");
-    };
-    const models: BrowserPipelineModels = {
-      ...base,
-      prepareEmbeddingStage: async () => {},
-      finishEmbeddingStage: async () => {
-        finishCalls += 1;
-      },
     };
 
     await expect(
       runBrowserPipeline(
         wavBlob(2),
-        models,
+        base,
         DEFAULT_PIPELINE_OPTIONS,
         { createFbank: async () => new DisposableTestFbank() },
       ),
@@ -507,7 +547,6 @@ describe("runBrowserPipeline", () => {
       stage: "embedding",
       message: "CAM failed",
     });
-    expect(finishCalls).toBe(1);
   });
 
   it("honors cancellation and annotates model failures with their stage", async () => {

@@ -5,11 +5,26 @@ export const VAD_CHUNK_SAMPLES = 160_000;
 export const VAD_OUTPUT_FRAMES = 589;
 export const VAD_OUTPUT_CLASSES = 7;
 export const VAD_FRAME_STEP_SECONDS = 0.016875;
+export const DEFAULT_VAD_MIN_SPEECH_SECONDS = 0.25;
+export const DEFAULT_VAD_MERGE_GAP_SECONDS = 0.1;
 
 export interface VadDecodeOptions {
   frameStepSeconds?: number;
   minSpeechSeconds?: number;
   mergeGapSeconds?: number;
+}
+
+export interface VadBatchResult {
+  /** Unfiltered, zero-gap regions decoded from only this model batch. */
+  readonly rawSegments: readonly TimeSegment[];
+  /**
+   * Nominal start of the next 10-second chunk. For the final batch this is the
+   * synthetic boundary after the last real chunk, which lets an incremental
+   * reducer apply the ordinary merge watermark before its explicit EOF flush.
+   */
+  readonly nextUnprocessedChunkTime: number;
+  readonly completedChunks: number;
+  readonly totalChunks: number;
 }
 
 export function createVadChunks(sampleCount: number): VadChunk[] {
@@ -92,8 +107,10 @@ export function mergeVadSegments(
 ): TimeSegment[] {
   if (segments.length === 0) return [];
 
-  const mergeGap = options.mergeGapSeconds ?? 0.1;
-  const minSpeech = options.minSpeechSeconds ?? 0.25;
+  const mergeGap =
+    options.mergeGapSeconds ?? DEFAULT_VAD_MERGE_GAP_SECONDS;
+  const minSpeech =
+    options.minSpeechSeconds ?? DEFAULT_VAD_MIN_SPEECH_SECONDS;
   const sorted = [...segments].sort((left, right) => left.start - right.start);
   const merged: TimeSegment[] = [];
   let current = { ...sorted[0]! };
@@ -122,6 +139,23 @@ export async function runVad(
   backend: VadBatchBackend,
   onProgress?: (completed: number, total: number) => void,
 ): Promise<TimeSegment[]> {
+  const rawSegments: TimeSegment[] = [];
+  for await (const batch of runVadBatches(source, backend)) {
+    rawSegments.push(...batch.rawSegments);
+    onProgress?.(batch.completedChunks, batch.totalChunks);
+  }
+  return mergeVadSegments(rawSegments);
+}
+
+/**
+ * Run fixed-size VAD batches while retaining only one reusable input tensor.
+ * Consumers can feed each chronological result into an incremental merge and
+ * subsegment reducer without duplicating runVad's audio and padding policy.
+ */
+export async function* runVadBatches(
+  source: MonoPcmSource | Float32Array,
+  backend: VadBatchBackend,
+): AsyncGenerator<VadBatchResult, void, void> {
   if (backend.chunkSamples !== VAD_CHUNK_SAMPLES) {
     throw new Error(`Unsupported VAD chunk size: ${backend.chunkSamples}`);
   }
@@ -152,7 +186,6 @@ export async function runVad(
   }
 
   const chunks = createVadChunks(pcm.sampleCount);
-  const rawSegments: TimeSegment[] = [];
   // Reuse one fixed batch for the entire recording. Allocating 5.12 MiB for
   // every B8 call made hour-long files accumulate tens of MiB of dead V8
   // backing stores between garbage collections even though only one batch is
@@ -179,14 +212,23 @@ export async function runVad(
     const logits = await backend.run(input);
     const actualValueCount =
       actualChunks.length * VAD_OUTPUT_FRAMES * VAD_OUTPUT_CLASSES;
-    rawSegments.push(
-      ...decodeVadLogits(logits.subarray(0, actualValueCount), actualChunks, {
-        minSpeechSeconds: 0,
-        mergeGapSeconds: 0,
-      }),
-    );
-    onProgress?.(Math.min(start + actualChunks.length, chunks.length), chunks.length);
+    const last = actualChunks.at(-1)!;
+    yield {
+      rawSegments: decodeVadLogits(
+        logits.subarray(0, actualValueCount),
+        actualChunks,
+        {
+          minSpeechSeconds: 0,
+          mergeGapSeconds: 0,
+        },
+      ),
+      nextUnprocessedChunkTime:
+        (last.sampleOffset + VAD_CHUNK_SAMPLES) / VAD_SAMPLE_RATE,
+      completedChunks: Math.min(
+        start + actualChunks.length,
+        chunks.length,
+      ),
+      totalChunks: chunks.length,
+    };
   }
-
-  return mergeVadSegments(rawSegments);
 }

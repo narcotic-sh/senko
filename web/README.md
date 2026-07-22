@@ -29,9 +29,9 @@ the API and incur no measurement overhead.
 
 The user-agent total is an approximate browser estimate and does not guarantee
 coverage of GPU allocations. `knownGpuBufferBytes` remains separate: it is the
-exact maximum of WebGPU buffers explicitly owned by Senko's active backend;
-opaque browser/driver and ONNX Runtime GPU allocations are not part of that
-owned-buffer counter.
+exact WebGPU-buffer ownership of Senko's two resident inference backends,
+currently 64,700,672 bytes. Opaque browser/driver and ONNX Runtime GPU
+allocations are not part of that owned-buffer counter.
 
 The benchmark runner launches a separate Chrome profile with exactly one
 Senko tab. Its page-memory result therefore covers that page plus the dedicated
@@ -72,10 +72,11 @@ hour-long file creates 47 short-lived Blob streams rather than 370 and never
 allocates file-sized or per-window PCM byte buffers. The scratch capacity is
 included as `wavReadBufferBytes` in exact logical CPU memory accounting.
 
-Model residency is stage-scoped. Worker initialization loads and warms only
-the direct-WebGPU pyannote frontend, persistent LSTM, and dense tail. After VAD
-completes, its explicit GPU buffers are released before CAM++ is loaded and
-warmed; CAM++ is then released before the CPU-only clustering stage. A later
-run reconstructs VAD. This avoids retaining both large model residency sets at
-once, and the reported known-GPU figure is the maximum explicit buffer
-ownership of either stage rather than their sum.
+Worker initialization requests two high-performance WebGPU devices and loads
+and warms both production model sets concurrently. The B8 pyannote VAD owns
+24,845,312 GPU-buffer bytes on one device; B16 CAM++ owns 39,855,360 bytes on
+the other, for exact summed ownership of 64,700,672 bytes. Streaming scheduling
+submits VAD first, then overlaps up to two B16 CAM++ batches on the second
+device as stable speech windows become available. Both models remain resident
+during clustering and across subsequent recordings. Their buffers and devices
+are released only when the model set or its worker is disposed.

@@ -54,34 +54,43 @@ metrics for diagnosis.
 
 For a final performance claim, use multiple independent timing invocations and
 report every `wallMs` plus the median. Each invocation creates a clean profile;
-pyannote VAD is loaded and warmed before the run, while CAM++ asset loading,
-validation, pipeline compilation, and warmup deliberately occur inside the
-measured embedding stage after VAD is released. Avoid other GPU-heavy work
-during acceptance because another app can still contend for the M3 GPU even
-though it cannot enter Senko's memory accounting.
+pyannote VAD and CAM++ are loaded and warmed concurrently on separate WebGPU
+devices before the run. Both remain resident across runs. Avoid other GPU-heavy
+work during acceptance because another app can still contend for the M3 GPU
+even though it cannot enter Senko's memory accounting.
 
 ## Current measured snapshot (2026-07-21)
 
 These numbers are the latest cooled checkpoint on the target M3 Mac, not a
-promise that every run will reproduce the same wall time. FBank and CAM++
-overlap, so stage times must not be summed to derive the end-to-end time. Each
-row is one fresh isolated-Chrome validation of the production bundle. The long
-run passed the offline-correctness gate; repeated final acceptance runs remain
-appropriate before treating this single sample as a stable median.
+promise that every run will reproduce the same wall time. VAD, FBank, and
+CAM++ overlap, so stage times must not be summed to derive the end-to-end time.
+The long row is the median-wall run from three fresh isolated-Chrome timing
+acceptances: **11.046020, 11.061990, and 11.186395 seconds**. Every run passed
+the offline-correctness gate.
 
 | Fixture | Worker wall | VAD | FBank | CAM++ | Clustering | Postprocess | Result |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| `test_audio_short.wav` | **1.956935 s** | 0.437705 s | 0.382130 s | 1.312075 s | 0.191095 s | 0.001545 s | 4 speakers, 49 segments |
-| `test_audio.wav` | **12.687805 s** | 2.889695 s | 2.959555 s | 8.261905 s | 1.497055 s | 0.003820 s | 9 speakers, 137 segments |
+| `test_audio_short.wav` | **1.624155 s** | 0.437610 s | 0.366570 s | 1.342250 s | 0.199665 s | 0.002160 s | 4 speakers, 49 segments |
+| `test_audio.wav` | **11.061990 s** | 2.990445 s | 3.005755 s | 9.594440 s | 1.354415 s | 0.003830 s | 9 speakers, 137 segments |
 
-The long checkpoint is 2.312 seconds below the 15-second stretch target and
-2.688 seconds above the aspirational 10-second target. The production CAM++
+The long median is 3.938 seconds below the 15-second stretch target and
+1.062 seconds above the aspirational 10-second target. The production CAM++
 graph now combines `tile4-fold` FCM, `direct-tile8-wg96` initial TDNN,
 `direct-tile4-wg128` dense bottlenecks, and `chunk512` pointwise transits. The
 TDNN replaces cached tile-1 with a 96-lane workgroup that shares each input
 evaluation across eight adjacent output vec4 groups. Direct packed-weight
 reads remove its 12,800-byte workgroup cache and barrier while preserving the
 exact kernel/channel FMA order for every output.
+
+The latest gain comes from exact incremental VAD reduction and dual-device
+streaming. The first B8 VAD batch establishes an immutable speech-window
+prefix. For every later VAD dispatch, the worker submits VAD first and then up
+to two full B16 CAM++ batches on the second device. Partial CAM batches remain
+staged until EOF, so inference count and output ordering stay identical to the
+sequential pipeline. Against the immediately preceding cooled 12.05-12.21
+second checkpoint, the 11.062-second median is roughly 9% faster. This retains
+24,845,312 additional explicit GPU-buffer bytes for VAD; the measured long-file
+logical CPU peak remains 9.82 MB.
 
 The TDNN's cached baseline measured 3.080192 ms; `direct-tile8-wg96` measured
 0.655360-0.720896 ms and delivered a 22.806528 ms nine-run pooled full-graph
@@ -112,7 +121,7 @@ Correctness against the pinned offline result is:
 | Fixture | Speech IoU (10 ms / 50 ms) | Mapped agreement (10 ms / 50 ms) | Segment delta | Speaker delta |
 | --- | ---: | ---: | ---: | ---: |
 | `test_audio_short.wav` | 0.999960 / 1.000000 | 1.000000 / 1.000000 | 0 | 0 |
-| `test_audio.wav` | 0.998676 / 0.998744 | 0.988583 / 0.988518 | +5 | +2 |
+| `test_audio.wav` | 0.998676 / 0.998744 | 0.988359 / 0.988295 | +5 | +2 |
 
 The short result matches the offline partition and all 49 merged segments. On
 the long file, the pinned offline run reports seven speakers and 132 segments,
@@ -140,8 +149,8 @@ fixed WASM heap and explicit GPU-buffer ceiling unchanged:
 
 | Fixture | Known CPU peak | Explicit GPU-buffer peak | Fixed WASM heaps | Isolated page + worker diagnostic |
 | --- | ---: | ---: | ---: | ---: |
-| `test_audio_short.wav` | 5,571,936 B | 39,855,360 B | 9,961,472 B | 11,899,769 B post-run-1 baseline |
-| `test_audio.wav` | 9,824,152 B | 39,855,360 B | 9,961,472 B | 18,950,563 B sampled peak; 12,015,761 B post-run baseline |
+| `test_audio_short.wav` | 7,351,392 B | 64,700,672 B | 9,961,472 B | not re-sampled at this checkpoint |
+| `test_audio.wav` | 9,824,264 B | 64,700,672 B | 9,961,472 B | 12,270,537 B post-run-1 baseline |
 
 These columns are complementary measurements and must not be added together.
 The page value is Chrome's coarse `measureUserAgentSpecificMemory()` result for
@@ -152,14 +161,13 @@ held and streamed without making a file-sized copy; it is therefore reported
 separately from `knownCpuPeakBytes`. The long run's largest named CPU working
 allocation is 5,117,336 bytes for clustering.
 
-Production's fixed ownership is 9,824,152 bytes at the known long-file
-CPU peak, 39,855,360 bytes of explicit GPU buffers, and 9,961,472 bytes across
-the fixed WASM heaps. The external zero-copy audio `Blob` is 118,273,444 bytes.
-The one-shot page-memory sampler observed 18,950,563 bytes at completion before
-collection of transient clustering arrays. The retained-memory protocol below
-measured the comparable post-GC baseline near 12 MB and is the stronger leak
-signal; Chrome's coarse page samples and the exact logical allocation ledger
-answer different questions.
+Production's fixed ownership is 9,824,264 bytes at the known long-file CPU
+peak, 64,700,672 bytes of explicit GPU buffers, and 9,961,472 bytes across the
+fixed WASM heaps. The GPU total is exactly 24,845,312 bytes for B8 VAD plus
+39,855,360 bytes for B16 CAM++. The external zero-copy audio `Blob` is
+118,273,444 bytes. The retained-memory protocol below measured the comparable
+post-GC page-agent baseline near 12.27 MB; Chrome's coarse page samples and the
+exact logical allocation ledger answer different questions.
 
 The ring adds the named `camOutputBatchBytes = 24,576` host allocation for two
 returned B16 output arrays. That lifetime is below the existing VAD peak on the
@@ -167,25 +175,14 @@ short file and clustering peak on the long file, so the known CPU peaks in the
 table do not increase. The explicit GPU peak does increase by 12,288 bytes for
 the second readback slot.
 
-The current post-ring short-file retained-memory diagnostic processed the same
-input twice in one isolated page and worker. Its 4,018.825 ms and 4,079.590 ms
-runs were thermally throttled and are non-acceptance timings. With both stage
-models released after each run, Chrome measured 11,899,769 bytes after run 1
-and 11,999,323 bytes after run 2: a +99,554-byte retained delta. This supersedes
-the pre-ring lifecycle result for current code and shows no material retained
-growth; the small difference is consistent with garbage-collection timing and
-Chrome's coarse measurement. For historical comparison, the pre-ring
-diagnostic measured 11,893,545 and 12,037,500 bytes, a +143,955-byte delta,
-across 2,933.05 ms and 3,221.89 ms non-acceptance runs.
-
-The current long-file retained-memory diagnostic measured 12,015,761 bytes
-after run 1 and 12,108,155 bytes after run 2, a +92,394-byte delta (0.77%).
-Both passes completed with neither model resident, so this is the comparable
-per-run growth signal rather than the larger one-time transition from the
-initial VAD-resident state. The difference is small enough to be consistent
-with Chrome measurement and garbage-collection noise and shows no material
-per-run accumulation. The page-memory and retained-memory modes are diagnostic
-only; their timings are not used in the three-run acceptance median.
+The current long-file retained-memory diagnostic processed the same input twice
+in one isolated page and worker while both WebGPU models remained resident.
+Chrome measured 12,270,537 bytes after run 1 and 12,275,926 bytes after run 2:
+a **+5,389-byte delta (0.044%)**. The two non-acceptance runs were 11.061215 and
+11.080795 seconds. This is small enough to be Chrome measurement/collection
+noise and shows no material per-run accumulation. Page-memory and
+retained-memory modes are diagnostic only; their timings are not used in the
+three-run acceptance median.
 
 Do not use `pnpm dev` for acceptance. HMR, source transforms, development module
 loading, and concurrent code edits make its timings non-reproducible. The dev
@@ -249,14 +246,12 @@ node web/scripts/benchmark/run-browser-pipeline.mjs \
   --remove-profile
 ```
 
-Senko deliberately keeps VAD and CAM++ mutually exclusive: VAD is resident at
-`WebGPU models ready.`, then each run releases VAD, constructs and warms CAM++,
-and releases CAM++ before completion. The mode records that initial VAD-resident
-state only as lifecycle context. It treats post-run 1 (neither model resident)
-as the comparable baseline and reports post-run 2 minus post-run 1 as the
-retained-growth signal. Both runs use the same page, worker, GPU device, and
-model metadata, but their stage backends are reconstructed by design. The app's
-`?memory=1` sampler is disabled in this mode, so only one
+Senko keeps VAD and CAM++ resident on separate devices from initialization until
+the worker/model set is disposed. Retained-memory mode records the initial
+dual-resident state as context, treats the post-run-1 dual-resident measurement
+as the comparable baseline, and reports post-run 2 minus post-run 1 as the
+retained-growth signal. Both runs use the same page, worker, devices, and model
+instances. The app's `?memory=1` sampler is disabled in this mode, so only one
 `measureUserAgentSpecificMemory()` request is in flight at a time. Chrome's
 measurement is coarse and garbage-collection timing can add noise; the
 second-run delta is a leak signal, not proof by itself. This mode processes the
@@ -288,10 +283,11 @@ the parsed result JSON, making it safe to redirect directly into a retained A/B
 artifact. The isolated Chrome process and profile are removed in `finally`
 unless `--keep-profile` is requested.
 
-The retained dual-device diagnostic is query-gated and does not change the
-production model lifecycle. It runs production B8 VAD and B16 CAM++ backends on
-two devices reporting the same Apple Metal adapter. `cam-runs=1..4` selects the
-work ratio and `cam-inflight=1..2` selects CAM++ submission depth:
+The retained dual-device diagnostic is query-gated; its measurements selected
+the production dual-resident scheduler. It runs production B8 VAD and B16
+CAM++ backends on two devices reporting the same Apple Metal adapter.
+`cam-runs=1..4` selects the work ratio and `cam-inflight=1..2` selects CAM++
+submission depth:
 
 ```bash
 node web/scripts/benchmark/run-browser-diagnostic.mjs \
@@ -313,9 +309,9 @@ and three sequential CAM++ calls per VAD call. The concurrent three-call trace
 placed CAM++ call 3 fully after VAD completion, so two calls maximize hidden
 work. Queueing both calls immediately into the production graph's two readback
 slots saved 17.08 ms (1.212x), only 0.16 ms above sequential CAM submission.
-The streaming projection should therefore use about 17 ms per overlapping VAD
-batch: roughly 46 opportunities × 17 ms = 0.78 seconds on the one-hour file,
-not idealized full VAD hiding.
+The resulting production scheduler has 46 overlap opportunities on the
+one-hour file and lowered the cooled end-to-end checkpoint from 12.05-12.21
+seconds to an 11.062-second median.
 
 ## Standalone RSS monitors
 

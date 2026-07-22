@@ -7,10 +7,7 @@ import type {
   PipelineWorkerResponse,
 } from "./protocol";
 import { isPipelineWorkerRequest } from "./protocol";
-import {
-  BrowserModelSet,
-  requestMaximumPerformanceAdapter,
-} from "../pipeline/browser-models";
+import { BrowserModelSet } from "../pipeline/browser-models";
 import {
   BrowserPipelineCancelledError,
   BrowserPipelineStageError,
@@ -25,7 +22,6 @@ const workerScope = self as unknown as DedicatedWorkerGlobalScope;
 let initialized = false;
 let initializing = false;
 let modelSet: BrowserModelSet | undefined;
-let gpuDevice: GPUDevice | undefined;
 let clusteringKernels: WasmClusteringKernels | undefined;
 let pipelineOptions: PipelineOptions | undefined;
 let activeJob:
@@ -79,18 +75,17 @@ async function initialize(
 
   initializing = true;
   try {
-    const adapter = await requestMaximumPerformanceAdapter(workerScope.navigator.gpu);
     const manifestUrl = new URL(manifestAsset.url, workerScope.location.href).toString();
     const loaded = await loadWorkerResources(
-      () => BrowserModelSet.load(manifestUrl, adapter, {
+      () => BrowserModelSet.load(manifestUrl, workerScope.navigator.gpu!, {
         manifestIntegrity: {
           byteLength: manifestAsset.byteLength,
           sha256: manifestAsset.sha256,
         },
         warmupRuns: 1,
         vadBatchSize: 8,
-        // Direct WebGPU B16 is the measured throughput/memory sweet spot on M3:
-        // 39.8 MB of explicit buffers and ~6.6% better throughput than B8.
+        // Direct WebGPU B16 is the measured CAM++ throughput/memory sweet spot.
+        // Together with B8 VAD, both resident devices own 64.7 MB explicitly.
         embeddingBatchSize: 16,
         onProgress: ({ message }) => {
           console.info(`[senko] ${message}`);
@@ -105,24 +100,12 @@ async function initialize(
     );
     modelSet = loaded.models;
     clusteringKernels = loaded.clustering;
-    gpuDevice = modelSet.device;
-    const initializedDevice = gpuDevice;
-    initializedDevice.lost.then((info) => {
-      if (gpuDevice !== initializedDevice) return;
-      console.error(`[senko] WebGPU device lost: ${info.reason}: ${info.message}`);
-      initialized = false;
-      modelSet = undefined;
-      gpuDevice = undefined;
-      pipelineOptions = undefined;
-      clusteringKernels?.dispose();
-      clusteringKernels = undefined;
-    });
     pipelineOptions = request.options;
     initialized = true;
+    observeDeviceLoss(modelSet);
   } catch (error) {
     const failedModels = modelSet;
     modelSet = undefined;
-    gpuDevice = undefined;
     pipelineOptions = undefined;
     initialized = false;
     clusteringKernels?.dispose();
@@ -149,6 +132,46 @@ async function initialize(
       webgpu: true,
     },
   });
+}
+
+function observeDeviceLoss(models: BrowserModelSet): void {
+  const devices = [
+    ["VAD", models.vadDevice],
+    ["CAM++", models.embeddingDevice],
+  ] as const;
+  for (const [role, device] of devices) {
+    void device.lost
+      .then((info) => handleDeviceLoss(models, role, info))
+      .catch((error: unknown) => {
+        console.error(
+          `[senko] Failed to clean up after ${role} device loss: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      });
+  }
+}
+
+async function handleDeviceLoss(
+  models: BrowserModelSet,
+  role: "VAD" | "CAM++",
+  info: GPUDeviceLostInfo,
+): Promise<void> {
+  if (modelSet !== models) return;
+  console.error(
+    `[senko] ${role} WebGPU device lost: ${info.reason}: ${info.message}`,
+  );
+  initialized = false;
+  modelSet = undefined;
+  pipelineOptions = undefined;
+  activeJob?.controller.abort();
+  const kernels = clusteringKernels;
+  clusteringKernels = undefined;
+  try {
+    kernels?.dispose();
+  } finally {
+    await Promise.allSettled([models.release()]);
+  }
 }
 
 async function diarize(

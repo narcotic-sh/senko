@@ -1,7 +1,7 @@
 /// <reference types="@webgpu/types" />
 
 import { Pcm16WavReader } from "./audio/wav";
-import { BrowserModelSet, requestMaximumPerformanceAdapter } from "./pipeline/browser-models";
+import { BrowserModelSet } from "./pipeline/browser-models";
 import type { MonoPcmSource } from "./pipeline/types";
 import { createVadChunks, runVad } from "./pipeline/vad";
 import type { PageMemoryPerformanceSource } from "./runtime/page-memory";
@@ -53,18 +53,17 @@ async function run(file: File): Promise<void> {
     `WAV file=${file.name}, bytes=${file.size}, duration=${reader.info.durationSeconds.toFixed(3)} s, chunks=${chunks.length}`,
   );
 
-  const adapter = await requestMaximumPerformanceAdapter(navigator.gpu);
   const manifestUrl = new URL("/models/manifest.json", location.href).toString();
   const loadStarted = performance.now();
-  const models = await BrowserModelSet.load(manifestUrl, adapter, {
+  const models = await BrowserModelSet.load(manifestUrl, navigator.gpu, {
     vadBatchSize: 8,
     warmupRuns: 1,
     onProgress: ({ message }) => report(message),
   });
   const loadMs = performance.now() - loadStarted;
-  const exactGpuBytes = models.vad.gpuBufferBytes.totalOwned;
+  const exactGpuBytes = models.knownGpuBufferBytes;
   report(
-    `raw model ready in ${loadMs.toFixed(3)} ms, exact GPU=${exactGpuBytes}`,
+    `dual-resident raw models ready in ${loadMs.toFixed(3)} ms, exact GPU=${exactGpuBytes}`,
   );
 
   const source: MonoPcmSource = {
@@ -99,7 +98,6 @@ async function run(file: File): Promise<void> {
   const inferenceMs = performance.now() - inferenceStarted;
   const immediateEndingHeap = heap();
   await models.release();
-  await models.device.queue.onSubmittedWorkDone();
   await new Promise<void>((resolve) => setTimeout(resolve, 5_000));
   const settledHeap = heap();
   const pageMemorySource = performance as Performance & PageMemoryPerformanceSource;

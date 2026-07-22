@@ -24,29 +24,26 @@ import {
   readExposedWasmHeapBytes,
   type MemoryPerformanceSource,
 } from "../runtime/memory";
+import { IncrementalVadSubsegmentReducer } from "./incremental-vad-subsegments";
 import { postprocessClustering } from "./postprocess";
-import { createSubsegments } from "./subsegments";
 import type {
   EmbeddingBatchBackend,
   MonoPcmSource,
   Subsegment,
   VadBatchBackend,
 } from "./types";
-import { createVadChunks, runVad, VAD_SAMPLE_RATE } from "./vad";
+import {
+  createVadChunks,
+  runVadBatches,
+  type VadBatchResult,
+  VAD_SAMPLE_RATE,
+} from "./vad";
 
 export interface BrowserPipelineModels {
   readonly vad: VadBatchBackend;
   readonly embedding: EmbeddingBatchBackend;
   /** Explicit GPU buffers owned by the model set; opaque ORT arenas excluded. */
   readonly knownGpuBufferBytes?: number;
-  /** Load and warm VAD after a previous pipeline run released its models. */
-  readonly prepareVadStage?: () => Promise<void>;
-  /** Release VAD, then load and warm CAM++ only when embeddings are needed. */
-  readonly prepareEmbeddingStage?: (
-    hasEmbeddingWork: boolean,
-  ) => Promise<void>;
-  /** Release the embedding model before CPU-only clustering begins. */
-  readonly finishEmbeddingStage?: () => Promise<void>;
 }
 
 export interface BrowserPipelineHooks {
@@ -112,6 +109,25 @@ interface PendingEmbeddingRun {
 interface SettledEmbeddingRun {
   readonly attributedElapsedMs: number;
   readonly coveredUntilMs: number;
+  readonly chunk?: SettledEmbeddingChunk;
+}
+
+interface SettledEmbeddingChunk {
+  readonly batchStart: number;
+  readonly values: Float32Array;
+}
+
+type VadBatchOutcome =
+  | {
+      readonly ok: true;
+      readonly result: IteratorResult<VadBatchResult, void>;
+      readonly completedAtMs: number;
+    }
+  | { readonly ok: false; readonly error: unknown; readonly completedAtMs: number };
+
+interface PendingVadBatch {
+  readonly outcome: Promise<VadBatchOutcome>;
+  readonly startedAtMs: number;
 }
 
 /**
@@ -134,21 +150,13 @@ export async function runBrowserPipeline(
   const totalStart = now();
   let fbank: FbankComputer | undefined;
   let extractor: StreamingFbankExtractor | undefined;
-  let embeddingStageNeedsFinish = false;
   const clusteringWasmHeapBytes = readExposedWasmHeapBytes(
     hooks.clusteringKernels,
   );
 
   try {
-    try {
-      await models.prepareVadStage?.();
-      throwIfCancelled(hooks.signal);
-    } catch (error) {
-      rethrowForStage("vad", error, hooks.signal);
-    }
     const vad = models.vad;
     const embedding = models.embedding;
-    memory.setKnownGpuBufferBytes(models.knownGpuBufferBytes);
     validateModelOptions(vad, embedding, options);
 
     try {
@@ -210,229 +218,337 @@ export async function runBrowserPipeline(
     );
     memory.checkpoint("vad", "start");
     hooks.onStageStarted?.("vad");
-    const vadStart = now();
-    const pcmSource = wavReaderAsMonoSource(reader);
-    let vadSegments;
-    try {
-      vadSegments = await runVad(pcmSource, vad, () => {
-        throwIfCancelled(hooks.signal);
-      });
-      throwIfCancelled(hooks.signal);
-    } catch (error) {
-      rethrowForStage("vad", error, hooks.signal);
-    }
-    const vadResult: StageResult<"vad"> = {
-      stage: "vad",
-      elapsedMs: elapsedSince(now, vadStart),
-      metrics: {
-        modelRuns: Math.ceil(vadChunkCount / vad.batchSize),
-        regionCount: vadSegments.length,
-        speechSeconds: sumDurations(vadSegments),
-      },
-    };
-    completeStage(vadResult, stages, hooks);
-    // runVad retains only decoded time segments after its final batch.
-    memory.setCurrentKnownCpuBytes(wavReadBufferBytes);
-    memory.checkpoint("vad", "complete");
-
-    const subsegments = createSubsegments(vadSegments, {
-      durationSeconds: options.embeddingWindowSeconds,
-      shiftSeconds: options.embeddingShiftSeconds,
-    });
-    hooks.onSubsegmentsCreated?.(subsegments);
-
-    // Feature extraction and embedding inference are deliberately interleaved.
-    // Their elapsed values measure only work attributable to each stage, while
-    // totalElapsedMs remains the end-to-end wall-clock measurement.
-    let fbankElapsedMs = 0;
-    let embeddingElapsedMs = 0;
-    let totalFrameCount = 0;
-    let embeddingBatchCount = 0;
-    const embeddings = new Float32Array(
-      subsegments.length * embedding.embeddingDim,
-    );
-    const retainedEmbeddingsBytes = embeddings.byteLength;
-    const embeddingBatchTotal = Math.ceil(
-      subsegments.length / embedding.batchSize,
-    );
-    const embeddingRunLimit = embeddingRunConcurrency(embedding);
-    const camInputBatchBytes =
-      Math.min(2, embeddingBatchTotal) *
-      embedding.batchSize *
-      embedding.frames *
-      embedding.featureDim *
-      Float32Array.BYTES_PER_ELEMENT;
-    const camOutputBatchBytes =
-      Math.min(embeddingRunLimit, embeddingBatchTotal) *
-      embedding.batchSize *
-      embedding.embeddingDim *
-      Float32Array.BYTES_PER_ELEMENT;
-    memory.recordAllocation("retainedEmbeddingsBytes", retainedEmbeddingsBytes);
-    memory.recordAllocation("camInputBatchBytes", camInputBatchBytes);
-    memory.recordAllocation("camOutputBatchBytes", camOutputBatchBytes);
-    memory.setCurrentKnownCpuBytes(
-      wavReadBufferBytes +
-        retainedEmbeddingsBytes +
-        camInputBatchBytes +
-        camOutputBatchBytes,
-    );
     memory.checkpoint("fbank", "start");
     memory.checkpoint("embedding", "start");
     hooks.onStageStarted?.("fbank");
     hooks.onStageStarted?.("embedding");
 
-    if (models.prepareEmbeddingStage !== undefined) {
-      const prepareStart = now();
-      try {
-        throwIfCancelled(hooks.signal);
-        await models.prepareEmbeddingStage(subsegments.length > 0);
-        embeddingStageNeedsFinish =
-          subsegments.length > 0 && models.finishEmbeddingStage !== undefined;
-        memory.setKnownGpuBufferBytes(models.knownGpuBufferBytes);
-        throwIfCancelled(hooks.signal);
-      } catch (error) {
-        rethrowForStage("embedding", error, hooks.signal);
-      } finally {
-        embeddingElapsedMs += elapsedSince(now, prepareStart);
-      }
-    }
+    // VAD, feature extraction, and embedding inference are streamed together.
+    // The first VAD batch establishes a safe subsegment prefix. Each subsequent
+    // VAD dispatch then overlaps with at most two already-known CAM++ batches.
+    // Elapsed stage values remain attributable intervals; totalElapsedMs is the
+    // authoritative end-to-end wall-clock measurement.
+    let vadElapsedMs = 0;
+    let vadModelRuns = 0;
+    let fbankElapsedMs = 0;
+    let embeddingElapsedMs = 0;
+    let totalFrameCount = 0;
+    let embeddingBatchCount = 0;
+    const embeddingRunLimit = embeddingRunConcurrency(embedding);
+    const featureValueCount =
+      embedding.batchSize * embedding.frames * embedding.featureDim;
+    const featureBatchBytes =
+      featureValueCount * Float32Array.BYTES_PER_ELEMENT;
+    const outputBatchBytes =
+      embedding.batchSize *
+      embedding.embeddingDim *
+      Float32Array.BYTES_PER_ELEMENT;
+    const reducer = new IncrementalVadSubsegmentReducer({
+      durationSeconds: options.embeddingWindowSeconds,
+      shiftSeconds: options.embeddingShiftSeconds,
+    });
+    const streamedSubsegments: Subsegment[] = [];
+    let availableSubsegments: readonly Subsegment[] = streamedSubsegments;
+    const vadIterator = runVadBatches(
+      wavReaderAsMonoSource(reader),
+      vad,
+    )[Symbol.asyncIterator]();
+    let activeVad: PendingVadBatch | undefined;
+    let batchFeatures: Float32Array[] = [];
+    const pendingEmbeddings: PendingEmbeddingRun[] = [];
+    const bufferedEmbeddingChunks: SettledEmbeddingChunk[] = [];
+    let bufferedEmbeddingBytes = 0;
+    let peakRetainedEmbeddingBytes = 0;
+    let peakPendingEmbeddingRuns = 0;
+    let coveredEmbeddingRunUntilMs: number | undefined;
+    let nextEmbeddingStart = 0;
+    let embeddingBatchIndex = 0;
+    let embeddings: Float32Array | undefined;
 
-    if (subsegments.length > 0) {
+    const observeStreamingCpu = (includeVadBuffers: boolean): void => {
+      const pcmCacheBytes =
+        (extractor?.stats.peakCachedSamples ?? 0) *
+        Float32Array.BYTES_PER_ELEMENT;
+      const featureBytes = batchFeatures.length * featureBatchBytes;
+      const pendingOutputBytes = pendingEmbeddings.length * outputBatchBytes;
+      const retainedBytes =
+        bufferedEmbeddingBytes + (embeddings?.byteLength ?? 0);
+      memory.observeKnownCpuPeakBytes(
+        wavReadBufferBytes +
+          (includeVadBuffers ? vadInputBatchBytes + vadLogitsBatchBytes : 0) +
+          pcmCacheBytes +
+          featureBytes +
+          pendingOutputBytes +
+          retainedBytes,
+      );
+    };
+
+    const ensureEmbeddingBuffers = (slotCount: number): void => {
+      if (batchFeatures.length > 0) return;
+      if (slotCount <= 0 || slotCount > 2) {
+        throw new RangeError(`Invalid CAM++ host slot count: ${slotCount}`);
+      }
       extractor = new StreamingFbankExtractor(reader, fbank);
-      const featureValueCount =
-        embedding.batchSize * embedding.frames * embedding.featureDim;
-      const batchFeatures = Array.from(
-        { length: Math.min(2, embeddingBatchTotal) },
+      batchFeatures = Array.from(
+        { length: slotCount },
         () => new Float32Array(featureValueCount),
       );
-      const pendingEmbeddings: PendingEmbeddingRun[] = [];
-      let coveredEmbeddingRunUntilMs: number | undefined;
-      let batchIndex = 0;
+      observeStreamingCpu(activeVad !== undefined);
+    };
 
-      const settleOldestEmbedding = async (): Promise<void> => {
-        const pending = pendingEmbeddings.shift();
-        if (pending === undefined) {
-          throw new Error("CAM++ pending-run queue is unexpectedly empty");
-        }
-        const settled = await settleEmbeddingRun(
-          pending,
-          embedding,
-          embeddings,
-          hooks.signal,
-          coveredEmbeddingRunUntilMs,
+    const settleOldestEmbedding = async (): Promise<void> => {
+      const pending = pendingEmbeddings.shift();
+      if (pending === undefined) {
+        throw new Error("CAM++ pending-run queue is unexpectedly empty");
+      }
+      const settled = await settleEmbeddingRun(
+        pending,
+        embedding,
+        embeddings,
+        hooks.signal,
+        coveredEmbeddingRunUntilMs,
+      );
+      embeddingElapsedMs += settled.attributedElapsedMs;
+      coveredEmbeddingRunUntilMs = settled.coveredUntilMs;
+      embeddingBatchCount += 1;
+      if (settled.chunk !== undefined) {
+        bufferedEmbeddingChunks.push(settled.chunk);
+        bufferedEmbeddingBytes += settled.chunk.values.byteLength;
+        peakRetainedEmbeddingBytes = Math.max(
+          peakRetainedEmbeddingBytes,
+          bufferedEmbeddingBytes,
         );
-        embeddingElapsedMs += settled.attributedElapsedMs;
-        coveredEmbeddingRunUntilMs = settled.coveredUntilMs;
-        embeddingBatchCount += 1;
-      };
+      }
+      observeStreamingCpu(activeVad !== undefined);
+    };
 
-      try {
-        for (
-          let batchStart = 0;
-          batchStart < subsegments.length;
-          batchStart += embedding.batchSize
-        ) {
-          throwIfCancelled(hooks.signal);
-          const actualBatchSize = Math.min(
-            embedding.batchSize,
-            subsegments.length - batchStart,
+    const pumpEmbeddingBatches = async (
+      maxNewBatches: number,
+      allowPartialBatch: boolean,
+    ): Promise<void> => {
+      let submitted = 0;
+      while (
+        nextEmbeddingStart < availableSubsegments.length &&
+        submitted < maxNewBatches
+      ) {
+        const remaining = availableSubsegments.length - nextEmbeddingStart;
+        if (!allowPartialBatch && remaining < embedding.batchSize) break;
+        const actualBatchSize = Math.min(embedding.batchSize, remaining);
+        if (batchFeatures.length === 0) {
+          const remainingBatches = Math.ceil(remaining / embedding.batchSize);
+          ensureEmbeddingBuffers(
+            allowPartialBatch ? Math.min(2, remainingBatches) : 2,
           );
-          const featureSlot = batchIndex % batchFeatures.length;
-          const features = batchFeatures[featureSlot]!;
-          const occupyingRun = pendingEmbeddings.findIndex(
-            (pending) => pending.featureSlot === featureSlot,
+        }
+        const featureSlot = embeddingBatchIndex % batchFeatures.length;
+        const features = batchFeatures[featureSlot]!;
+        const occupyingRun = pendingEmbeddings.findIndex(
+          (pending) => pending.featureSlot === featureSlot,
+        );
+        if (occupyingRun > 0) {
+          throw new Error("CAM++ host feature slots lost FIFO ordering");
+        }
+        if (occupyingRun === 0) await settleOldestEmbedding();
+        features.fill(0);
+
+        const requests = availableSubsegments
+          .slice(nextEmbeddingStart, nextEmbeddingStart + actualBatchSize)
+          .map((subsegment) =>
+            secondsToFbankWindow(
+              subsegment.start,
+              subsegment.end,
+              subsegment.index,
+            )
           );
-          if (occupyingRun > 0) {
-            throw new Error("CAM++ host feature slots lost FIFO ordering");
-          }
-          if (occupyingRun === 0) await settleOldestEmbedding();
-          features.fill(0);
-
-          const requests = subsegments
-            .slice(batchStart, batchStart + actualBatchSize)
-            .map((subsegment) =>
-              secondsToFbankWindow(
-                subsegment.start,
-                subsegment.end,
-                subsegment.index,
-              )
-            );
-          const iterator = extractor.extract(requests)[Symbol.asyncIterator]();
-
-          for (let row = 0; row < actualBatchSize; row += 1) {
-            const fbankStart = now();
-            try {
-              throwIfCancelled(hooks.signal);
-              const next = await iterator.next();
-              if (next.done) {
-                throw new Error(
-                  `FBank stream ended after ${row} of ${actualBatchSize} windows`,
-                );
-              }
-              const matrix = next.value.features;
-              if (matrix.binCount !== embedding.featureDim) {
-                throw new Error(
-                  `FBank produced ${matrix.binCount} bins; CAM++ expects ${embedding.featureDim}`,
-                );
-              }
-              copyFeatureWindow(
-                matrix.data,
-                matrix.frameCount,
-                matrix.binCount,
-                features,
-                row,
-                embedding.frames,
+        const fbankIterator = extractor!
+          .extract(requests)
+          [Symbol.asyncIterator]();
+        for (let row = 0; row < actualBatchSize; row += 1) {
+          const fbankStart = now();
+          try {
+            throwIfCancelled(hooks.signal);
+            const next = await fbankIterator.next();
+            if (next.done) {
+              throw new Error(
+                `FBank stream ended after ${row} of ${actualBatchSize} windows`,
               );
-              totalFrameCount += matrix.frameCount;
-              throwIfCancelled(hooks.signal);
-            } catch (error) {
-              rethrowForStage("fbank", error, hooks.signal);
-            } finally {
-              fbankElapsedMs += elapsedSince(now, fbankStart);
             }
+            const matrix = next.value.features;
+            if (matrix.binCount !== embedding.featureDim) {
+              throw new Error(
+                `FBank produced ${matrix.binCount} bins; CAM++ expects ${embedding.featureDim}`,
+              );
+            }
+            copyFeatureWindow(
+              matrix.data,
+              matrix.frameCount,
+              matrix.binCount,
+              features,
+              row,
+              embedding.frames,
+            );
+            totalFrameCount += matrix.frameCount;
+            throwIfCancelled(hooks.signal);
+          } catch (error) {
+            rethrowForStage("fbank", error, hooks.signal);
+          } finally {
+            fbankElapsedMs += elapsedSince(now, fbankStart);
           }
+        }
 
-          // A serial backend still overlaps extraction with its preceding run.
-          // Direct CAM++ advertises two safe slots, so it can additionally queue
-          // this batch before the preceding readback maps on the host.
-          while (pendingEmbeddings.length >= embeddingRunLimit) {
-            await settleOldestEmbedding();
-          }
-          pendingEmbeddings.push(startEmbeddingRun(
+        // A serial backend still overlaps extraction with its preceding run.
+        // Direct CAM++ advertises two safe submissions and readback slots.
+        while (pendingEmbeddings.length >= embeddingRunLimit) {
+          await settleOldestEmbedding();
+        }
+        pendingEmbeddings.push(
+          startEmbeddingRun(
             embedding,
             features,
-            batchStart,
+            nextEmbeddingStart,
             actualBatchSize,
             featureSlot,
             now,
-          ));
-          batchIndex += 1;
-        }
-
-        while (pendingEmbeddings.length > 0) {
-          await settleOldestEmbedding();
-        }
-      } catch (error) {
-        // Outcome handlers never reject. Drain all submitted work before model
-        // release so a later failure cannot become unhandled or destroy an
-        // in-use readback slot.
-        await Promise.all(pendingEmbeddings.map((pending) => pending.outcome));
-        throw error;
+          ),
+        );
+        peakPendingEmbeddingRuns = Math.max(
+          peakPendingEmbeddingRuns,
+          pendingEmbeddings.length,
+        );
+        nextEmbeddingStart += actualBatchSize;
+        embeddingBatchIndex += 1;
+        submitted += 1;
+        observeStreamingCpu(activeVad !== undefined);
       }
-    }
+    };
 
-    if (embeddingStageNeedsFinish) {
-      const finishStart = now();
+    const consumeActiveVad = async (): Promise<VadBatchResult> => {
+      const pending = activeVad;
+      if (pending === undefined) {
+        throw new Error("VAD batch queue is unexpectedly empty");
+      }
+      const outcome = await pending.outcome;
+      activeVad = undefined;
+      vadElapsedMs += Math.max(0, outcome.completedAtMs - pending.startedAtMs);
       try {
-        await models.finishEmbeddingStage?.();
-        embeddingStageNeedsFinish = false;
+        if (!outcome.ok) throw outcome.error;
+        if (outcome.result.done) {
+          throw new Error("VAD stream ended before all advertised chunks ran");
+        }
         throwIfCancelled(hooks.signal);
+        const batch = outcome.result.value;
+        const emission = reducer.consumeBatch(
+          batch.rawSegments,
+          batch.nextUnprocessedChunkTime,
+        );
+        streamedSubsegments.push(...emission.emittedSubsegments);
+        vadModelRuns += 1;
+        return batch;
       } catch (error) {
-        rethrowForStage("embedding", error, hooks.signal);
-      } finally {
-        embeddingElapsedMs += elapsedSince(now, finishStart);
+        rethrowForStage("vad", error, hooks.signal);
       }
+    };
+
+    let subsegments: readonly Subsegment[];
+    let vadSegments: readonly { readonly start: number; readonly end: number }[];
+    try {
+      if (vadChunkCount > 0) {
+        activeVad = startVadBatch(vadIterator, now);
+        let completed = await consumeActiveVad();
+        while (completed.completedChunks < completed.totalChunks) {
+          // Submit VAD first so its GPU work is live while CPU FBank and the
+          // separate CAM++ device consume the stable prefix from prior logits.
+          activeVad = startVadBatch(vadIterator, now);
+          await pumpEmbeddingBatches(2, false);
+          completed = await consumeActiveVad();
+        }
+      }
+      await vadIterator.return?.();
+      const finished = reducer.finish();
+      vadSegments = finished.vadSegments;
+      subsegments = finished.subsegments;
+      availableSubsegments = subsegments;
+      hooks.onSubsegmentsCreated?.(subsegments);
+      throwIfCancelled(hooks.signal);
+
+      const vadResult: StageResult<"vad"> = {
+        stage: "vad",
+        elapsedMs: vadElapsedMs,
+        metrics: {
+          modelRuns: vadModelRuns,
+          regionCount: vadSegments.length,
+          speechSeconds: sumDurations(vadSegments),
+        },
+      };
+      completeStage(vadResult, stages, hooks);
+      const currentPcmCacheBytes =
+        (extractor?.stats.peakCachedSamples ?? 0) *
+        Float32Array.BYTES_PER_ELEMENT;
+      memory.setCurrentKnownCpuBytes(
+        wavReadBufferBytes +
+          currentPcmCacheBytes +
+          batchFeatures.length * featureBatchBytes +
+          pendingEmbeddings.length * outputBatchBytes +
+          bufferedEmbeddingBytes,
+      );
+      memory.checkpoint("vad", "complete");
+
+      embeddings = new Float32Array(
+        subsegments.length * embedding.embeddingDim,
+      );
+      peakRetainedEmbeddingBytes = Math.max(
+        peakRetainedEmbeddingBytes,
+        embeddings.byteLength + bufferedEmbeddingBytes,
+      );
+      observeStreamingCpu(false);
+      for (const chunk of bufferedEmbeddingChunks) {
+        embeddings.set(
+          chunk.values,
+          chunk.batchStart * embedding.embeddingDim,
+        );
+      }
+      bufferedEmbeddingChunks.length = 0;
+      bufferedEmbeddingBytes = 0;
+
+      await pumpEmbeddingBatches(Number.POSITIVE_INFINITY, true);
+      while (pendingEmbeddings.length > 0) {
+        await settleOldestEmbedding();
+      }
+      if (nextEmbeddingStart !== subsegments.length) {
+        throw new Error(
+          `CAM++ embedded ${nextEmbeddingStart}/${subsegments.length} windows`,
+        );
+      }
+    } catch (error) {
+      // All submitted outcomes are non-rejecting. Drain both devices before
+      // propagating a cancellation/failure so neither fixed readback slot can
+      // be reused while work from this job is still in flight.
+      await Promise.all([
+        ...(activeVad === undefined ? [] : [activeVad.outcome]),
+        ...pendingEmbeddings.map((pending) => pending.outcome),
+      ]);
+      try {
+        await vadIterator.return?.();
+      } catch {
+        // Preserve the original stage error.
+      }
+      throwIfCancelled(hooks.signal);
+      throw error;
     }
+
+    const finalEmbeddings = embeddings!;
+    const retainedEmbeddingsBytes = finalEmbeddings.byteLength;
+    const camInputBatchBytes = batchFeatures.length * featureBatchBytes;
+    const camOutputBatchBytes = peakPendingEmbeddingRuns * outputBatchBytes;
+    memory.recordAllocation(
+      "retainedEmbeddingsBytes",
+      peakRetainedEmbeddingBytes,
+    );
+    memory.recordAllocation("camInputBatchBytes", camInputBatchBytes);
+    memory.recordAllocation("camOutputBatchBytes", camOutputBatchBytes);
+    // Drop the two 768 KB host upload slots before CPU-only clustering. Their
+    // contents have already been copied into GPU-owned input buffers.
+    batchFeatures = [];
 
     const pcmCachePeakBytes =
       (extractor?.stats.peakCachedSamples ?? 0) *
@@ -443,7 +559,7 @@ export async function runBrowserPipeline(
         pcmCachePeakBytes +
         camInputBatchBytes +
         camOutputBatchBytes +
-        retainedEmbeddingsBytes,
+        peakRetainedEmbeddingBytes,
     );
     // The CAM input batches are no longer logically retained after the loop. The
     // PCM cache remains owned by the streaming extractor until final disposal.
@@ -505,7 +621,7 @@ export async function runBrowserPipeline(
       labels =
         clusteringAlgorithm === "spectral"
           ? clusterEmbeddingsSpectral(
-              embeddings,
+              finalEmbeddings,
               subsegments.length,
               embedding.embeddingDim,
               {
@@ -515,7 +631,7 @@ export async function runBrowserPipeline(
               },
             )
           : clusterEmbeddings(
-              embeddings,
+              finalEmbeddings,
               subsegments.length,
               embedding.embeddingDim,
               {
@@ -554,7 +670,7 @@ export async function runBrowserPipeline(
     const postprocessStart = now();
     let processed;
     try {
-      processed = postprocessClustering(embeddings, labels, subsegments);
+      processed = postprocessClustering(finalEmbeddings, labels, subsegments);
       throwIfCancelled(hooks.signal);
     } catch (error) {
       rethrowForStage("postprocess", error, hooks.signal);
@@ -587,15 +703,33 @@ export async function runBrowserPipeline(
     } else {
       extractor.dispose();
     }
-    if (embeddingStageNeedsFinish) {
-      try {
-        await models.finishEmbeddingStage?.();
-      } catch {
-        // Preserve the original cancellation or stage failure. Model release
-        // is idempotent and the worker can reconstruct the stage on retry.
-      }
-    }
   }
+}
+
+function startVadBatch(
+  iterator: AsyncIterator<VadBatchResult, void, void>,
+  now: () => number,
+): PendingVadBatch {
+  const startedAtMs = now();
+  let next: Promise<IteratorResult<VadBatchResult, void>>;
+  try {
+    next = iterator.next();
+  } catch (error) {
+    next = Promise.reject(error);
+  }
+  const outcome = next.then(
+    (result): VadBatchOutcome => ({
+      ok: true,
+      result,
+      completedAtMs: now(),
+    }),
+    (error: unknown): VadBatchOutcome => ({
+      ok: false,
+      error,
+      completedAtMs: now(),
+    }),
+  );
+  return { outcome, startedAtMs };
 }
 
 function startEmbeddingRun(
@@ -640,7 +774,7 @@ function startEmbeddingRun(
 async function settleEmbeddingRun(
   pending: PendingEmbeddingRun,
   embedding: EmbeddingBatchBackend,
-  embeddings: Float32Array,
+  embeddings: Float32Array | undefined,
   signal: AbortSignal | undefined,
   coveredUntilMs: number | undefined,
 ): Promise<SettledEmbeddingRun> {
@@ -654,8 +788,13 @@ async function settleEmbeddingRun(
         `CAM++ produced ${outcome.output.length} values; expected at least ${actualValueCount}`,
       );
     }
-    embeddings.set(
-      outcome.output.subarray(0, actualValueCount),
+    const values = outcome.output.subarray(0, actualValueCount);
+    const chunk =
+      embeddings === undefined
+        ? { batchStart: pending.batchStart, values: values.slice() }
+        : undefined;
+    embeddings?.set(
+      values,
       pending.batchStart * embedding.embeddingDim,
     );
     throwIfCancelled(signal);
@@ -672,6 +811,7 @@ async function settleEmbeddingRun(
         coveredUntilMs ?? pending.startedAtMs,
         outcome.completedAtMs,
       ),
+      ...(chunk === undefined ? {} : { chunk }),
     };
   } catch (error) {
     rethrowForStage("embedding", error, signal);

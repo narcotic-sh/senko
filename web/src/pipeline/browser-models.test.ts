@@ -1,56 +1,31 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const fakes = vi.hoisted(() => {
-  const events: string[] = [];
-  const device = {
-    queue: {
-      async onSubmittedWorkDone() {
-        events.push("queue-idle");
-      },
-    },
-    destroy() {
-      events.push("destroy-device");
-    },
-  };
-  const adapter = {
-    features: new Set(["shader-f16"]),
-    limits: {
-      maxBufferSize: 1_000_000_000,
-      maxStorageBufferBindingSize: 1_000_000_000,
-      maxComputeWorkgroupStorageSize: 32_768,
-      maxComputeInvocationsPerWorkgroup: 256,
-      maxComputeWorkgroupSizeX: 256,
-      maxComputeWorkgroupsPerDimension: 65_535,
-    },
-    async requestDevice() {
-      return device;
-    },
-  };
-  const manifest = {
+const fakes = vi.hoisted(() => ({
+  events: [] as string[],
+  failEmbeddingCreate: false,
+  manifest: {
     models: {
       segmentation: { split: { frontend: {} } },
       campplus: { id: "campplus", batches: { "32": {} }, direct_webgpu: {} },
     },
-  };
-  return { adapter, device, events, manifest };
-});
+  },
+}));
 
 vi.mock("./model-manifest", () => ({
-  chooseVadBatchSize: () => 8,
   loadModelManifest: async () => fakes.manifest,
   selectSegmentationSplit: () => ({
     batchSize: 8,
     directWebGpu: {
       frontendMetadata: { url: "https://example.test/frontend.json" },
       tailMetadata: { url: "https://example.test/tail.json" },
-      explicitGpuBytes: 20_000_000,
+      explicitGpuBytes: 24_845_312,
     },
   }),
   selectCampPlusDirect: () => ({
     batchSize: 16,
     metadata: { url: "https://example.test/campplus.json" },
     weights: { url: "https://example.test/campplus.bin" },
-    explicitGpuBufferBytes: 2_000_000,
+    explicitGpuBufferBytes: 39_855_360,
   }),
 }));
 
@@ -60,26 +35,28 @@ vi.mock("./raw-campplus-backend", () => {
     readonly frames = 150;
     readonly featureDim = 80;
     readonly embeddingDim = 192;
-    readonly gpuBufferBytes = { total: 2_000_000 };
+    readonly gpuBufferBytes = { total: 39_855_360 };
+    private released = false;
 
-    static async create(): Promise<FakeEmbeddingBackend> {
-      fakes.events.push("create-embedding");
+    static async create(device: GPUDevice): Promise<FakeEmbeddingBackend> {
+      fakes.events.push(`create-embedding:${fakeDeviceRole(device)}`);
+      if (fakes.failEmbeddingCreate) throw new Error("embedding load failed");
       return new FakeEmbeddingBackend();
     }
 
     async run(_input: Float32Array): Promise<Float32Array> {
+      if (this.released) throw new Error("Direct WebGPU CAM++ has been released");
       fakes.events.push("run-embedding");
       return new Float32Array(this.batchSize * this.embeddingDim);
     }
 
     async release(): Promise<void> {
+      this.released = true;
       fakes.events.push("release-embedding");
     }
   }
 
-  return {
-    RawCampPlusEmbeddingBackend: FakeEmbeddingBackend,
-  };
+  return { RawCampPlusEmbeddingBackend: FakeEmbeddingBackend };
 });
 
 vi.mock("./raw-vad-backend", () => {
@@ -88,10 +65,10 @@ vi.mock("./raw-vad-backend", () => {
     readonly chunkSamples = 160_000;
     readonly outputFrames = 589;
     readonly outputClasses = 7;
-    readonly gpuBufferBytes = { totalOwned: 20_000_000 };
+    readonly gpuBufferBytes = { totalOwned: 24_845_312 };
 
-    static async create(): Promise<FakeVadBackend> {
-      fakes.events.push("create-vad");
+    static async create(device: GPUDevice): Promise<FakeVadBackend> {
+      fakes.events.push(`create-vad:${fakeDeviceRole(device)}`);
       return new FakeVadBackend();
     }
 
@@ -112,89 +89,160 @@ vi.mock("./raw-vad-backend", () => {
 
 import { BrowserModelSet } from "./browser-models";
 
-describe("BrowserModelSet stage residency", () => {
+interface FakeDevice {
+  readonly role: "vad" | "embedding";
+  readonly queue: { onSubmittedWorkDone(): Promise<void> };
+  destroy(): void;
+}
+
+function fakeDeviceRole(device: GPUDevice): string {
+  return (device as unknown as FakeDevice).role;
+}
+
+function createGpu(): {
+  readonly gpu: GPU;
+  readonly devices: readonly [FakeDevice, FakeDevice];
+} {
+  const devices = (["vad", "embedding"] as const).map((role): FakeDevice => ({
+    role,
+    queue: {
+      async onSubmittedWorkDone() {
+        fakes.events.push(`queue-idle:${role}`);
+      },
+    },
+    destroy() {
+      fakes.events.push(`destroy-device:${role}`);
+    },
+  })) as unknown as readonly [FakeDevice, FakeDevice];
+  let adapterIndex = 0;
+  const gpu = {
+    async requestAdapter() {
+      const index = adapterIndex;
+      adapterIndex += 1;
+      const device = devices[index];
+      if (device === undefined) throw new Error("unexpected third adapter request");
+      fakes.events.push(`request-adapter:${device.role}`);
+      return {
+        features: new Set(["shader-f16"]),
+        limits: {
+          maxBufferSize: 1_000_000_000,
+          maxStorageBufferBindingSize: 1_000_000_000,
+          maxComputeWorkgroupStorageSize: 32_768,
+          maxComputeInvocationsPerWorkgroup: 256,
+          maxComputeWorkgroupSizeX: 256,
+          maxComputeWorkgroupsPerDimension: 65_535,
+        },
+        async requestDevice() {
+          fakes.events.push(`request-device:${device.role}`);
+          return device;
+        },
+      };
+    },
+  };
+  return { gpu: gpu as unknown as GPU, devices };
+}
+
+describe("BrowserModelSet dual residency", () => {
   beforeEach(() => {
     fakes.events.length = 0;
+    fakes.failEmbeddingCreate = false;
   });
 
-  it("never retains VAD and CAM++ at the same stage boundary", async () => {
+  it("loads, warms, and retains VAD and CAM++ on separate devices", async () => {
+    const { gpu, devices } = createGpu();
     const models = await BrowserModelSet.load(
       "https://example.test/manifest.json",
-      fakes.adapter as unknown as GPUAdapter,
-      {
-        vadBatchSize: 8,
-        embeddingBatchSize: 16,
-        warmupRuns: 1,
-      },
+      gpu,
+      { vadBatchSize: 8, embeddingBatchSize: 16, warmupRuns: 1 },
     );
 
-    expect(fakes.events).toEqual(["create-vad", "run-vad"]);
-    expect(models.knownGpuBufferBytes).toBe(20_000_000);
-    await expect(
-      models.embedding.run(new Float32Array(16 * 150 * 80)),
-    ).rejects.toThrow("has not been prepared");
-
-    fakes.events.length = 0;
-    await models.prepareEmbeddingStage();
+    expect(models.vadDevice).toBe(devices[0]);
+    expect(models.embeddingDevice).toBe(devices[1]);
     expect(fakes.events).toEqual([
-      "release-vad",
-      "queue-idle",
-      "create-embedding",
+      "request-adapter:vad",
+      "request-adapter:embedding",
+      "request-device:vad",
+      "request-device:embedding",
+      "create-vad:vad",
+      "create-embedding:embedding",
+      "run-vad",
       "run-embedding",
     ]);
+    expect(models.knownGpuBufferBytes).toBe(64_700_672);
+
+    fakes.events.length = 0;
+    await models.vad.run(new Float32Array(8 * 160_000));
     await models.embedding.run(new Float32Array(16 * 150 * 80));
-    expect(fakes.events.at(-1)).toBe("run-embedding");
-    // Residency is mutually exclusive, so this is max(VAD, CAM), not their sum.
-    expect(models.knownGpuBufferBytes).toBe(20_000_000);
-
-    fakes.events.length = 0;
-    await models.finishEmbeddingStage();
-    expect(fakes.events).toEqual(["release-embedding", "queue-idle"]);
-
-    fakes.events.length = 0;
-    await models.prepareVadStage();
-    expect(fakes.events).toEqual(["create-vad", "run-vad"]);
-    await models.release();
-    expect(fakes.events.slice(-2)).toEqual(["release-vad", "destroy-device"]);
+    expect(fakes.events).toEqual(["run-vad", "run-embedding"]);
   });
 
-  it("makes final release idempotent", async () => {
+  it("reports both concurrent load and warmup paths", async () => {
+    const progress: Array<{ readonly stage: string; readonly message: string }> = [];
+    const { gpu } = createGpu();
+
+    await BrowserModelSet.load("https://example.test/manifest.json", gpu, {
+      warmupRuns: 1,
+      onProgress: (event) => progress.push(event),
+    });
+
+    expect(progress.map((event) => event.stage)).toEqual([
+      "manifest",
+      "vad",
+      "embedding",
+      "warmup",
+      "warmup",
+    ]);
+    expect(progress.map((event) => event.message)).toEqual([
+      "Loading model manifest",
+      "Loading pyannote segmentation B8",
+      "Loading CAM++ embedding B16",
+      "Compiling pyannote WebGPU kernels",
+      "Compiling CAM++ WebGPU kernels",
+    ]);
+  });
+
+  it("drains, releases, and destroys both devices exactly once", async () => {
+    const { gpu } = createGpu();
     const models = await BrowserModelSet.load(
       "https://example.test/manifest.json",
-      fakes.adapter as unknown as GPUAdapter,
-      {
-        vadBatchSize: 8,
-        embeddingBatchSize: 16,
-        warmupRuns: 0,
-      },
+      gpu,
+      { warmupRuns: 0 },
     );
     fakes.events.length = 0;
 
     await models.release();
     await models.release();
 
-    expect(fakes.events).toEqual(["release-vad", "destroy-device"]);
-    await expect(models.prepareVadStage()).rejects.toThrow("has been released");
-  });
-
-  it("releases VAD without loading CAM++ when there is no speech", async () => {
-    const models = await BrowserModelSet.load(
-      "https://example.test/manifest.json",
-      fakes.adapter as unknown as GPUAdapter,
-      {
-        vadBatchSize: 8,
-        embeddingBatchSize: 16,
-        warmupRuns: 0,
-      },
-    );
-    fakes.events.length = 0;
-
-    await models.prepareEmbeddingStage(false);
-
-    expect(fakes.events).toEqual(["release-vad", "queue-idle"]);
+    expect(fakes.events).toEqual([
+      "release-vad",
+      "release-embedding",
+      "queue-idle:vad",
+      "queue-idle:embedding",
+      "destroy-device:vad",
+      "destroy-device:embedding",
+    ]);
+    expect(() => models.vad).toThrow("has been released");
     await expect(
       models.embedding.run(new Float32Array(16 * 150 * 80)),
-    ).rejects.toThrow("has not been prepared");
-    await models.release();
+    ).rejects.toThrow("has been released");
+  });
+
+  it("cleans up both devices after a partial concurrent load failure", async () => {
+    const { gpu } = createGpu();
+    fakes.failEmbeddingCreate = true;
+
+    await expect(
+      BrowserModelSet.load("https://example.test/manifest.json", gpu, {
+        warmupRuns: 0,
+      }),
+    ).rejects.toThrow("embedding load failed");
+
+    expect(fakes.events).toContain("release-vad");
+    expect(fakes.events.slice(-4)).toEqual([
+      "queue-idle:vad",
+      "queue-idle:embedding",
+      "destroy-device:vad",
+      "destroy-device:embedding",
+    ]);
   });
 });

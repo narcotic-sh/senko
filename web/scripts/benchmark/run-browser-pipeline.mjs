@@ -1281,9 +1281,9 @@ export async function runBrowserBenchmark(options) {
 
     if (mode === "retained-memory") {
       process.stderr.write(
-        "[senko-benchmark] models ready; measuring initial VAD-resident state\n",
+        "[senko-benchmark] models ready; measuring initial dual-resident state\n",
       );
-      const initialVadResident = await measurePageAgentClusterMemory(
+      const initialDualResident = await measurePageAgentClusterMemory(
         cdp,
         sessionId,
         options.pageMemoryTimeoutMs,
@@ -1363,21 +1363,21 @@ export async function runBrowserBenchmark(options) {
           api: "performance.measureUserAgentSpecificMemory",
           samples: [
             {
-              label: "models-ready-vad-resident-context",
-              bytes: initialVadResident.bytes,
+              label: "models-ready-dual-resident-context",
+              bytes: initialDualResident.bytes,
             },
             {
-              label: "post-run-1-no-model-resident-baseline",
+              label: "post-run-1-dual-resident-baseline",
               bytes: postRun1.bytes,
             },
             {
-              label: "post-run-2-no-model-resident",
+              label: "post-run-2-dual-resident",
               bytes: postRun2.bytes,
             },
           ],
           deltasBytes: {
-            lifecycleTransitionPostRun1MinusInitialVadResident:
-              postRun1.bytes - initialVadResident.bytes,
+            postRun1MinusModelsReady:
+              postRun1.bytes - initialDualResident.bytes,
             retainedGrowthPostRun2MinusPostRun1:
               postRun2.bytes - postRun1.bytes,
           },

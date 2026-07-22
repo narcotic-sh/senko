@@ -7,7 +7,6 @@ import {
   type SelectedCampPlusDirect,
   type SelectedSegmentationSplit,
 } from "./model-manifest";
-import { CAMPPLUS_RAW_MAX_IN_FLIGHT_RUNS } from "./campplus-webgpu";
 import { RawCampPlusEmbeddingBackend } from "./raw-campplus-backend";
 import {
   RawWebGpuVadBackend,
@@ -32,19 +31,19 @@ export class BrowserModelSet {
   private released = false;
   private vadBackend: RawWebGpuVadBackend | undefined;
   private embeddingBackend: RawCampPlusEmbeddingBackend | undefined;
-  private peakKnownGpuBufferBytes = 0;
 
   readonly embedding: EmbeddingBatchBackend;
 
-  /**
-   * Peak explicitly owned WebGPU buffers across the mutually exclusive model
-   * stages. Both direct-WebGPU backends expose every owned GPUBuffer.
-   */
+  /** Exact sum of the two concurrently resident direct-WebGPU model sets. */
   get knownGpuBufferBytes(): number {
-    return this.peakKnownGpuBufferBytes;
+    return (
+      (this.vadBackend?.gpuBufferBytes.totalOwned ?? 0) +
+      (this.embeddingBackend?.gpuBufferBytes.total ?? 0)
+    );
   }
 
   get vad(): RawWebGpuVadBackend {
+    this.ensureNotReleased();
     const backend = this.vadBackend;
     if (backend === undefined) {
       throw new Error("The pyannote VAD stage has not been prepared");
@@ -53,33 +52,24 @@ export class BrowserModelSet {
   }
 
   private constructor(
-    readonly device: GPUDevice,
+    readonly vadDevice: GPUDevice,
+    readonly embeddingDevice: GPUDevice,
     readonly manifest: BrowserModelManifest,
     readonly vadVariant: SelectedSegmentationSplit,
     readonly embeddingVariant: SelectedCampPlusDirect,
     readonly embeddingPrecision: "float16",
     vad: RawWebGpuVadBackend,
-    private readonly rawVadModelAssets: RawVadModelAssets,
-    private readonly warmupRuns: number,
+    embedding: RawCampPlusEmbeddingBackend,
     readonly loadElapsedMs: number,
   ) {
     this.vadBackend = vad;
-    this.observeKnownGpuBufferBytes(vad.gpuBufferBytes.totalOwned);
-    // Shape metadata is available before the CAM++ session exists, while run
-    // dispatches only to the backend active during the embedding stage.
-    this.embedding = {
-      batchSize: embeddingVariant.batchSize,
-      frames: 150,
-      featureDim: 80,
-      embeddingDim: 192,
-      maxInFlightRuns: CAMPPLUS_RAW_MAX_IN_FLIGHT_RUNS,
-      run: (features) => this.runEmbedding(features),
-    };
+    this.embeddingBackend = embedding;
+    this.embedding = embedding;
   }
 
   static async load(
     manifestUrl: string,
-    adapter: GPUAdapter,
+    gpu: GPU,
     options: BrowserModelSetOptions = {},
   ): Promise<BrowserModelSet> {
     const start = performance.now();
@@ -101,116 +91,96 @@ export class BrowserModelSet {
       manifest.models.campplus,
       options.embeddingBatchSize,
     );
-    const device = await requestMaximumPerformanceDevice(adapter);
-
-    options.onProgress?.({
-      stage: "vad",
-      message: `Loading pyannote segmentation B${vadBatchSize}`,
-    });
     const warmupRuns = options.warmupRuns ?? 1;
+    let vadDevice: GPUDevice | undefined;
+    let embeddingDevice: GPUDevice | undefined;
     let vad: RawWebGpuVadBackend | undefined;
+    let embedding: RawCampPlusEmbeddingBackend | undefined;
     try {
+      // Chrome/Dawn consumes a GPUAdapter handle after requestDevice(). The two
+      // production residency sets therefore require independently requested
+      // handles to the same high-performance physical adapter.
+      const vadAdapter = await requestMaximumPerformanceAdapter(gpu);
+      const embeddingAdapter = await requestMaximumPerformanceAdapter(gpu);
+      vadDevice = await requestMaximumPerformanceDevice(vadAdapter);
+      embeddingDevice = await requestMaximumPerformanceDevice(embeddingAdapter);
+
       const directVadAssets = rawVadAssets(vadVariant);
-      vad = await RawWebGpuVadBackend.create(
-        device,
-        vadVariant,
-        directVadAssets,
-        (message) =>
-          options.onProgress?.({ stage: "vad", message: `Pyannote: ${message}` }),
-      );
-      if (warmupRuns > 0) {
+      const loadVad = async (): Promise<RawWebGpuVadBackend> => {
         options.onProgress?.({
-          stage: "warmup",
-          message: "Compiling pyannote WebGPU kernels",
+          stage: "vad",
+          message: `Loading pyannote segmentation B${vadBatchSize}`,
         });
-        const vadInput = new Float32Array(vad.batchSize * vad.chunkSamples);
-        for (let index = 0; index < warmupRuns; index += 1) {
-          await vad.run(vadInput);
+        const backend = await RawWebGpuVadBackend.create(
+          vadDevice!,
+          vadVariant,
+          directVadAssets,
+          (message) =>
+            options.onProgress?.({
+              stage: "vad",
+              message: `Pyannote: ${message}`,
+            }),
+        );
+        vad = backend;
+        if (warmupRuns > 0) {
+          options.onProgress?.({
+            stage: "warmup",
+            message: "Compiling pyannote WebGPU kernels",
+          });
+          await warmVad(backend, warmupRuns);
         }
-      }
+        return backend;
+      };
+      const loadEmbedding = async (): Promise<RawCampPlusEmbeddingBackend> => {
+        options.onProgress?.({
+          stage: "embedding",
+          message: `Loading CAM++ embedding B${embeddingVariant.batchSize}`,
+        });
+        const backend = await RawCampPlusEmbeddingBackend.create(
+          embeddingDevice!,
+          embeddingVariant,
+          (message) =>
+            options.onProgress?.({
+              stage: "embedding",
+              message: `CAM++: ${message}`,
+            }),
+        );
+        embedding = backend;
+        if (warmupRuns > 0) {
+          options.onProgress?.({
+            stage: "warmup",
+            message: "Compiling CAM++ WebGPU kernels",
+          });
+          await warmEmbedding(backend, warmupRuns);
+        }
+        return backend;
+      };
+
+      const [vadResult, embeddingResult] = await Promise.allSettled([
+        loadVad(),
+        loadEmbedding(),
+      ]);
+      if (vadResult.status === "rejected") throw vadResult.reason;
+      if (embeddingResult.status === "rejected") throw embeddingResult.reason;
 
       return new BrowserModelSet(
-        device,
+        vadDevice,
+        embeddingDevice,
         manifest,
         vadVariant,
         embeddingVariant,
         embeddingPrecision,
-        vad,
-        directVadAssets,
-        warmupRuns,
+        vadResult.value,
+        embeddingResult.value,
         performance.now() - start,
       );
     } catch (error) {
-      await vad?.release();
-      device.destroy();
+      await Promise.allSettled([vad?.release(), embedding?.release()]);
+      await drainDevices(vadDevice, embeddingDevice);
+      vadDevice?.destroy();
+      embeddingDevice?.destroy();
       throw error;
     }
-  }
-
-  /** Ensure a VAD-only model residency set, loading it after a previous run. */
-  async prepareVadStage(): Promise<void> {
-    this.ensureNotReleased();
-    if (this.vadBackend !== undefined) return;
-
-    await this.releaseEmbeddingBackend();
-    this.ensureNotReleased();
-
-    let vad: RawWebGpuVadBackend | undefined;
-    try {
-      vad = await RawWebGpuVadBackend.create(
-        this.device,
-        this.vadVariant,
-        this.rawVadModelAssets,
-      );
-      await warmVad(vad, this.warmupRuns);
-      this.ensureNotReleased();
-      this.vadBackend = vad;
-      this.observeKnownGpuBufferBytes(vad.gpuBufferBytes.totalOwned);
-    } catch (error) {
-      await vad?.release();
-      throw error;
-    }
-  }
-
-  /**
-   * Drop all VAD sessions and buffers before constructing and warming CAM++.
-   * The two direct-WebGPU residency sets are deliberately mutually exclusive.
-   */
-  async prepareEmbeddingStage(hasEmbeddingWork = true): Promise<void> {
-    this.ensureNotReleased();
-    if (hasEmbeddingWork && this.embeddingBackend !== undefined) return;
-
-    const vad = this.vadBackend;
-    this.vadBackend = undefined;
-    if (vad !== undefined) await vad.release();
-    await this.device.queue.onSubmittedWorkDone();
-    this.ensureNotReleased();
-    if (!hasEmbeddingWork) {
-      await this.releaseEmbeddingBackend();
-      return;
-    }
-
-    let embedding: RawCampPlusEmbeddingBackend | undefined;
-    try {
-      embedding = await RawCampPlusEmbeddingBackend.create(
-        this.device,
-        this.embeddingVariant,
-        (message) => console.info(`[senko] ${message}`),
-      );
-      await warmEmbedding(embedding, this.warmupRuns);
-      this.ensureNotReleased();
-      this.embeddingBackend = embedding;
-      this.observeKnownGpuBufferBytes(embedding.gpuBufferBytes.total);
-    } catch (error) {
-      await embedding?.release();
-      throw error;
-    }
-  }
-
-  /** Release CAM++ before the CPU-only clustering and post-processing stages. */
-  async finishEmbeddingStage(): Promise<void> {
-    this.ensureNotReleased();
-    await this.releaseEmbeddingBackend();
   }
 
   async release(): Promise<void> {
@@ -221,39 +191,24 @@ export class BrowserModelSet {
     this.vadBackend = undefined;
     this.embeddingBackend = undefined;
     await Promise.allSettled([vad?.release(), embedding?.release()]);
-    this.device.destroy();
-  }
-
-  private async runEmbedding(features: Float32Array): Promise<Float32Array> {
-    this.ensureNotReleased();
-    const backend = this.embeddingBackend;
-    if (backend === undefined) {
-      throw new Error("The CAM++ embedding stage has not been prepared");
-    }
-    return await backend.run(features);
-  }
-
-  private async releaseEmbeddingBackend(): Promise<void> {
-    const embedding = this.embeddingBackend;
-    this.embeddingBackend = undefined;
-    if (embedding === undefined) return;
-    try {
-      await embedding.release();
-    } finally {
-      await this.device.queue.onSubmittedWorkDone();
-    }
-  }
-
-  private observeKnownGpuBufferBytes(bytes: number): void {
-    this.peakKnownGpuBufferBytes = Math.max(
-      this.peakKnownGpuBufferBytes,
-      bytes,
-    );
+    await drainDevices(this.vadDevice, this.embeddingDevice);
+    this.vadDevice.destroy();
+    this.embeddingDevice.destroy();
   }
 
   private ensureNotReleased(): void {
     if (this.released) throw new Error("Browser model set has been released");
   }
+}
+
+async function drainDevices(
+  ...devices: readonly (GPUDevice | undefined)[]
+): Promise<void> {
+  await Promise.allSettled(
+    devices.flatMap((device) =>
+      device === undefined ? [] : [device.queue.onSubmittedWorkDone()],
+    ),
+  );
 }
 
 async function warmVad(vad: RawWebGpuVadBackend, runs: number): Promise<void> {
