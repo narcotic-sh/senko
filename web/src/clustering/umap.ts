@@ -570,6 +570,28 @@ function optimizeLayout(
   }
 
   const { a, b } = curveParameters(minDistance);
+  if (dim === 10) {
+    optimizeTenDimensionalLayout(
+      graph,
+      count,
+      epochs,
+      random,
+      embedding,
+      epochsPerSample,
+      epochOfNextSample,
+      epochsPerNegativeSample,
+      epochOfNextNegativeSample,
+      a,
+      b,
+    );
+    allocations.release(
+      epochsPerSample.byteLength +
+        epochOfNextSample.byteLength +
+        epochsPerNegativeSample.byteLength +
+        epochOfNextNegativeSample.byteLength,
+    );
+    return embedding;
+  }
   for (let epoch = 0; epoch < epochs; epoch += 1) {
     const alpha = 1 - epoch / epochs;
     for (let edge = 0; edge < graph.edgeCount; edge += 1) {
@@ -652,6 +674,197 @@ function optimizeLayout(
       epochOfNextNegativeSample.byteLength,
   );
   return embedding;
+}
+
+/** Production's fixed 10-D layout keeps each row difference live across its update. */
+function optimizeTenDimensionalLayout(
+  graph: FuzzyGraph,
+  count: number,
+  epochs: number,
+  random: () => number,
+  embedding: Float32Array,
+  epochsPerSample: Float32Array,
+  epochOfNextSample: Float32Array,
+  epochsPerNegativeSample: Float32Array,
+  epochOfNextNegativeSample: Float32Array,
+  a: number,
+  b: number,
+): void {
+  const dim = 10;
+  for (let epoch = 0; epoch < epochs; epoch += 1) {
+    const alpha = 1 - epoch / epochs;
+    for (let edge = 0; edge < graph.edgeCount; edge += 1) {
+      if (epochOfNextSample[edge]! > epoch) {
+        continue;
+      }
+      const currentRow = graph.head[edge]!;
+      const otherRow = graph.tail[edge]!;
+      const currentOffset = currentRow * dim;
+      const otherOffset = otherRow * dim;
+      const difference0 = embedding[currentOffset]! - embedding[otherOffset]!;
+      const difference1 =
+        embedding[currentOffset + 1]! - embedding[otherOffset + 1]!;
+      const difference2 =
+        embedding[currentOffset + 2]! - embedding[otherOffset + 2]!;
+      const difference3 =
+        embedding[currentOffset + 3]! - embedding[otherOffset + 3]!;
+      const difference4 =
+        embedding[currentOffset + 4]! - embedding[otherOffset + 4]!;
+      const difference5 =
+        embedding[currentOffset + 5]! - embedding[otherOffset + 5]!;
+      const difference6 =
+        embedding[currentOffset + 6]! - embedding[otherOffset + 6]!;
+      const difference7 =
+        embedding[currentOffset + 7]! - embedding[otherOffset + 7]!;
+      const difference8 =
+        embedding[currentOffset + 8]! - embedding[otherOffset + 8]!;
+      const difference9 =
+        embedding[currentOffset + 9]! - embedding[otherOffset + 9]!;
+      let squaredDistance = 0;
+      squaredDistance += difference0 * difference0;
+      squaredDistance += difference1 * difference1;
+      squaredDistance += difference2 * difference2;
+      squaredDistance += difference3 * difference3;
+      squaredDistance += difference4 * difference4;
+      squaredDistance += difference5 * difference5;
+      squaredDistance += difference6 * difference6;
+      squaredDistance += difference7 * difference7;
+      squaredDistance += difference8 * difference8;
+      squaredDistance += difference9 * difference9;
+      let coefficient = 0;
+      if (squaredDistance > 0) {
+        const distancePower = squaredDistance ** b;
+        coefficient =
+          (-2 * a * b * distancePower) /
+          (squaredDistance * (a * distancePower + 1));
+      }
+
+      let gradient = clip(coefficient * difference0, 4) * alpha;
+      embedding[currentOffset] = embedding[currentOffset]! + gradient;
+      embedding[otherOffset] = embedding[otherOffset]! - gradient;
+      gradient = clip(coefficient * difference1, 4) * alpha;
+      embedding[currentOffset + 1] = embedding[currentOffset + 1]! + gradient;
+      embedding[otherOffset + 1] = embedding[otherOffset + 1]! - gradient;
+      gradient = clip(coefficient * difference2, 4) * alpha;
+      embedding[currentOffset + 2] = embedding[currentOffset + 2]! + gradient;
+      embedding[otherOffset + 2] = embedding[otherOffset + 2]! - gradient;
+      gradient = clip(coefficient * difference3, 4) * alpha;
+      embedding[currentOffset + 3] = embedding[currentOffset + 3]! + gradient;
+      embedding[otherOffset + 3] = embedding[otherOffset + 3]! - gradient;
+      gradient = clip(coefficient * difference4, 4) * alpha;
+      embedding[currentOffset + 4] = embedding[currentOffset + 4]! + gradient;
+      embedding[otherOffset + 4] = embedding[otherOffset + 4]! - gradient;
+      gradient = clip(coefficient * difference5, 4) * alpha;
+      embedding[currentOffset + 5] = embedding[currentOffset + 5]! + gradient;
+      embedding[otherOffset + 5] = embedding[otherOffset + 5]! - gradient;
+      gradient = clip(coefficient * difference6, 4) * alpha;
+      embedding[currentOffset + 6] = embedding[currentOffset + 6]! + gradient;
+      embedding[otherOffset + 6] = embedding[otherOffset + 6]! - gradient;
+      gradient = clip(coefficient * difference7, 4) * alpha;
+      embedding[currentOffset + 7] = embedding[currentOffset + 7]! + gradient;
+      embedding[otherOffset + 7] = embedding[otherOffset + 7]! - gradient;
+      gradient = clip(coefficient * difference8, 4) * alpha;
+      embedding[currentOffset + 8] = embedding[currentOffset + 8]! + gradient;
+      embedding[otherOffset + 8] = embedding[otherOffset + 8]! - gradient;
+      gradient = clip(coefficient * difference9, 4) * alpha;
+      embedding[currentOffset + 9] = embedding[currentOffset + 9]! + gradient;
+      embedding[otherOffset + 9] = embedding[otherOffset + 9]! - gradient;
+
+      epochOfNextSample[edge] =
+        epochOfNextSample[edge]! + epochsPerSample[edge]!;
+      const negativePeriod = epochsPerNegativeSample[edge]!;
+      const negativeSamples = Math.floor(
+        (epoch - epochOfNextNegativeSample[edge]!) / negativePeriod,
+      );
+      for (let sample = 0; sample < negativeSamples; sample += 1) {
+        const negativeRow = Math.floor(random() * count);
+        if (negativeRow === currentRow) {
+          continue;
+        }
+        const negativeOffset = negativeRow * dim;
+        const negativeDifference0 =
+          embedding[currentOffset]! - embedding[negativeOffset]!;
+        const negativeDifference1 =
+          embedding[currentOffset + 1]! - embedding[negativeOffset + 1]!;
+        const negativeDifference2 =
+          embedding[currentOffset + 2]! - embedding[negativeOffset + 2]!;
+        const negativeDifference3 =
+          embedding[currentOffset + 3]! - embedding[negativeOffset + 3]!;
+        const negativeDifference4 =
+          embedding[currentOffset + 4]! - embedding[negativeOffset + 4]!;
+        const negativeDifference5 =
+          embedding[currentOffset + 5]! - embedding[negativeOffset + 5]!;
+        const negativeDifference6 =
+          embedding[currentOffset + 6]! - embedding[negativeOffset + 6]!;
+        const negativeDifference7 =
+          embedding[currentOffset + 7]! - embedding[negativeOffset + 7]!;
+        const negativeDifference8 =
+          embedding[currentOffset + 8]! - embedding[negativeOffset + 8]!;
+        const negativeDifference9 =
+          embedding[currentOffset + 9]! - embedding[negativeOffset + 9]!;
+        squaredDistance = 0;
+        squaredDistance += negativeDifference0 * negativeDifference0;
+        squaredDistance += negativeDifference1 * negativeDifference1;
+        squaredDistance += negativeDifference2 * negativeDifference2;
+        squaredDistance += negativeDifference3 * negativeDifference3;
+        squaredDistance += negativeDifference4 * negativeDifference4;
+        squaredDistance += negativeDifference5 * negativeDifference5;
+        squaredDistance += negativeDifference6 * negativeDifference6;
+        squaredDistance += negativeDifference7 * negativeDifference7;
+        squaredDistance += negativeDifference8 * negativeDifference8;
+        squaredDistance += negativeDifference9 * negativeDifference9;
+        let repulsion = 0;
+        if (squaredDistance > 0) {
+          repulsion =
+            (2 * b) /
+            ((0.001 + squaredDistance) * (a * squaredDistance ** b + 1));
+        }
+
+        gradient =
+          (repulsion > 0 ? clip(repulsion * negativeDifference0, 4) : 4) *
+          alpha;
+        embedding[currentOffset] = embedding[currentOffset]! + gradient;
+        gradient =
+          (repulsion > 0 ? clip(repulsion * negativeDifference1, 4) : 4) *
+          alpha;
+        embedding[currentOffset + 1] = embedding[currentOffset + 1]! + gradient;
+        gradient =
+          (repulsion > 0 ? clip(repulsion * negativeDifference2, 4) : 4) *
+          alpha;
+        embedding[currentOffset + 2] = embedding[currentOffset + 2]! + gradient;
+        gradient =
+          (repulsion > 0 ? clip(repulsion * negativeDifference3, 4) : 4) *
+          alpha;
+        embedding[currentOffset + 3] = embedding[currentOffset + 3]! + gradient;
+        gradient =
+          (repulsion > 0 ? clip(repulsion * negativeDifference4, 4) : 4) *
+          alpha;
+        embedding[currentOffset + 4] = embedding[currentOffset + 4]! + gradient;
+        gradient =
+          (repulsion > 0 ? clip(repulsion * negativeDifference5, 4) : 4) *
+          alpha;
+        embedding[currentOffset + 5] = embedding[currentOffset + 5]! + gradient;
+        gradient =
+          (repulsion > 0 ? clip(repulsion * negativeDifference6, 4) : 4) *
+          alpha;
+        embedding[currentOffset + 6] = embedding[currentOffset + 6]! + gradient;
+        gradient =
+          (repulsion > 0 ? clip(repulsion * negativeDifference7, 4) : 4) *
+          alpha;
+        embedding[currentOffset + 7] = embedding[currentOffset + 7]! + gradient;
+        gradient =
+          (repulsion > 0 ? clip(repulsion * negativeDifference8, 4) : 4) *
+          alpha;
+        embedding[currentOffset + 8] = embedding[currentOffset + 8]! + gradient;
+        gradient =
+          (repulsion > 0 ? clip(repulsion * negativeDifference9, 4) : 4) *
+          alpha;
+        embedding[currentOffset + 9] = embedding[currentOffset + 9]! + gradient;
+      }
+      epochOfNextNegativeSample[edge] =
+        epochOfNextNegativeSample[edge]! + negativeSamples * negativePeriod;
+    }
+  }
 }
 
 function euclideanDistance(
