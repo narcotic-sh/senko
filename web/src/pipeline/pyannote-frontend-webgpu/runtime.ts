@@ -245,9 +245,12 @@ export class RawPyannoteFrontendFoundation {
     this.finalNormDispatch.encode(encoder);
   }
 
-  encode(encoder: GPUCommandEncoder): void {
+  encode(
+    encoder: GPUCommandEncoder,
+    timestampWrites?: GPUComputePassTimestampWrites,
+  ): void {
     this.assertAlive();
-    this.sincDispatch.encode(encoder);
+    this.sincDispatch.encode(encoder, timestampWrites);
     this.norm0Dispatch.encode(encoder);
     this.conv1Dispatch.encode(encoder);
     this.norm1Dispatch.encode(encoder);

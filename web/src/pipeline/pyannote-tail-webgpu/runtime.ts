@@ -141,9 +141,16 @@ export class RawPyannoteTail {
     );
   }
 
-  encode(encoder: GPUCommandEncoder, copyToReadback = false): void {
+  encode(
+    encoder: GPUCommandEncoder,
+    copyToReadback = false,
+    timestampWrites?: GPUComputePassTimestampWrites,
+  ): void {
     this.assertAlive();
-    const pass = encoder.beginComputePass({ label: "senko-pyannote-raw-tail" });
+    const pass = encoder.beginComputePass({
+      label: "senko-pyannote-raw-tail",
+      ...(timestampWrites === undefined ? {} : { timestampWrites }),
+    });
     pass.setPipeline(this.pipeline);
     pass.setBindGroup(0, this.bindGroup);
     pass.dispatchWorkgroups(589, this.metadata.batch);

@@ -216,9 +216,13 @@ export class PyannoteSincAbsPoolDispatch {
     private readonly sincBindings: GPUBindGroup,
   ) {}
 
-  encode(encoder: GPUCommandEncoder): void {
+  encode(
+    encoder: GPUCommandEncoder,
+    timestampWrites?: GPUComputePassTimestampWrites,
+  ): void {
     const statsPass = encoder.beginComputePass({
       label: "senko-pyannote-waveform-instance-norm",
+      ...(timestampWrites === undefined ? {} : { timestampWrites }),
     });
     statsPass.setPipeline(this.statsPipeline);
     statsPass.setBindGroup(0, this.statsBindings);

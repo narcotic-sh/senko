@@ -1,16 +1,31 @@
 /// <reference types="@webgpu/types" />
 
 import { requestMaximumPerformanceAdapter } from "./pipeline/browser-models";
-import { loadModelManifest, selectSegmentationSplit } from "./pipeline/model-manifest";
+import {
+  loadModelManifest,
+  selectModelVariant,
+  type BrowserModelManifest,
+  type SelectedSegmentationSplit,
+} from "./pipeline/model-manifest";
 import { configureOrt, OrtVadBackend } from "./pipeline/ort-backends";
 import { PersistentWebGpuLstm } from "./pipeline/persistent-lstm";
 import { RawPyannoteFrontendFoundation } from "./pipeline/pyannote-frontend-webgpu";
 import { RawPyannoteTail } from "./pipeline/pyannote-tail-webgpu";
 
-const BATCH = 8;
+const parameters = new URLSearchParams(location.search);
+const BATCH = diagnosticBatch(parameters.get("batch"));
 const SAMPLES = 160_000;
 const FRAMES = 589;
 const CLASSES = 7;
+const LONG_FILE_CHUNKS = 370;
+
+function diagnosticBatch(source: string | null): 8 | 16 | 32 {
+  const batch = source === null ? 8 : Number(source);
+  if (batch !== 8 && batch !== 16 && batch !== 32) {
+    throw new Error(`Raw VAD diagnostic batch must be 8, 16, or 32; received ${source}`);
+  }
+  return batch;
+}
 
 const element = document.querySelector<HTMLPreElement>("#output");
 if (element === null) throw new Error("Missing diagnostic output");
@@ -82,52 +97,156 @@ function parity(reference: Float32Array, actual: Float32Array): {
   };
 }
 
+function selectDiagnosticSplit(
+  manifestUrl: string,
+  manifest: BrowserModelManifest,
+  batchSize: number,
+): SelectedSegmentationSplit {
+  const split = manifest.models.segmentation.split;
+  const declaredBufferBytes = split.buffer_bytes_by_batch[String(batchSize)];
+  if (declaredBufferBytes === undefined) {
+    throw new Error(`Split segmentation has no B${batchSize} buffer accounting`);
+  }
+  const asset = (record: { file: string; bytes: number; sha256: string }) => ({
+    url: new URL(record.file, manifestUrl).toString(),
+    byteLength: record.bytes,
+    sha256: record.sha256,
+  });
+  return {
+    batchSize,
+    frontend: selectModelVariant(manifestUrl, split.frontend, batchSize),
+    tail: selectModelVariant(manifestUrl, split.tail, batchSize),
+    weights: asset(split.lstm.weights),
+    metadata: asset(split.lstm.metadata),
+    // The isolated diagnostic loads its direct packages from a batch-specific
+    // directory, so no production-manifest direct entry is required.
+    directWebGpu: {
+      frontendMetadata: { url: "diagnostic-only" },
+      tailMetadata: { url: "diagnostic-only" },
+      explicitGpuBytes: 1,
+    },
+    declaredBufferBytes,
+    artifact: split.lstm,
+  };
+}
+
+interface TimestampResources {
+  readonly querySet: GPUQuerySet;
+  readonly resolve: GPUBuffer;
+  readonly readback: GPUBuffer;
+}
+
+interface RawRunMeasurement {
+  readonly output: Float32Array;
+  readonly wallMs: number;
+  readonly gpuMs?: number;
+}
+
+function createTimestampResources(device: GPUDevice): TimestampResources | undefined {
+  if (!device.features.has("timestamp-query")) return undefined;
+  return {
+    querySet: device.createQuerySet({ type: "timestamp", count: 2 }),
+    resolve: device.createBuffer({
+      label: "senko-raw-vad-timestamp-resolve",
+      size: 16,
+      usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC,
+    }),
+    readback: device.createBuffer({
+      label: "senko-raw-vad-timestamp-readback",
+      size: 16,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    }),
+  };
+}
+
 async function runRaw(
   device: GPUDevice,
   frontend: RawPyannoteFrontendFoundation,
   lstm: PersistentWebGpuLstm,
   tail: RawPyannoteTail,
-): Promise<Float32Array> {
+  timestamps?: TimestampResources,
+): Promise<RawRunMeasurement> {
   const encoder = device.createCommandEncoder({ label: "senko-raw-vad" });
-  frontend.encode(encoder);
+  frontend.encode(
+    encoder,
+    timestamps === undefined
+      ? undefined
+      : { querySet: timestamps.querySet, beginningOfPassWriteIndex: 0 },
+  );
   lstm.encode(encoder);
-  tail.encode(encoder, true);
+  tail.encode(
+    encoder,
+    true,
+    timestamps === undefined
+      ? undefined
+      : { querySet: timestamps.querySet, endOfPassWriteIndex: 1 },
+  );
+  if (timestamps !== undefined) {
+    encoder.resolveQuerySet(timestamps.querySet, 0, 2, timestamps.resolve, 0);
+    encoder.copyBufferToBuffer(timestamps.resolve, 0, timestamps.readback, 0, 16);
+  }
+  const wallStarted = performance.now();
   device.queue.submit([encoder.finish()]);
-  return tail.readback();
+  const [result] = await Promise.all([
+    tail.readback(),
+    timestamps?.readback.mapAsync(GPUMapMode.READ),
+  ]);
+  const wallMs = performance.now() - wallStarted;
+  if (timestamps === undefined) return { output: result, wallMs };
+  try {
+    const values = new BigUint64Array(timestamps.readback.getMappedRange());
+    return {
+      output: result,
+      wallMs,
+      gpuMs: Number(values[1]! - values[0]!) / 1_000_000,
+    };
+  } finally {
+    timestamps.readback.unmap();
+  }
 }
 
 async function main(): Promise<void> {
-  output.textContent = "0.0 ms  Starting";
+  output.textContent = `0.0 ms  Starting raw VAD B${BATCH}`;
   if (navigator.gpu === undefined) throw new Error("WebGPU unavailable");
   const adapter = await requestMaximumPerformanceAdapter(navigator.gpu);
+  if (!adapter.features.has("shader-f16")) {
+    throw new Error("Raw VAD requires shader-f16");
+  }
+  const timestampQuery = adapter.features.has("timestamp-query");
+  const requiredFeatures: GPUFeatureName[] = ["shader-f16"];
+  if (timestampQuery) requiredFeatures.push("timestamp-query");
+  const device = await adapter.requestDevice({
+    requiredFeatures,
+    requiredLimits: {
+      maxBufferSize: adapter.limits.maxBufferSize,
+      maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+      maxComputeWorkgroupStorageSize:
+        adapter.limits.maxComputeWorkgroupStorageSize,
+      maxComputeInvocationsPerWorkgroup:
+        adapter.limits.maxComputeInvocationsPerWorkgroup,
+      maxComputeWorkgroupSizeX: adapter.limits.maxComputeWorkgroupSizeX,
+      maxComputeWorkgroupsPerDimension:
+        adapter.limits.maxComputeWorkgroupsPerDimension,
+    },
+  });
+  const referenceAdapter = await requestMaximumPerformanceAdapter(navigator.gpu);
   const runtime = configureOrt({
-    adapter,
+    adapter: referenceAdapter,
     graphCapture: false,
     graphOptimizationLevel: "all",
     strictWebGpu: true,
   });
   const manifestUrl = new URL("/models/manifest.json", location.href).toString();
   const manifest = await loadModelManifest(manifestUrl);
-  const selected = selectSegmentationSplit(
-    manifestUrl,
-    manifest.models.segmentation,
-    BATCH,
-  );
+  const selected = selectDiagnosticSplit(manifestUrl, manifest, BATCH);
   const waveform = new Float32Array(BATCH * SAMPLES);
   fillDeterministic(waveform);
 
-  const referenceBackend = await OrtVadBackend.create(runtime, selected);
-  const device = await runtime.device;
-  const referenceStarted = performance.now();
-  const reference = await referenceBackend.run(waveform);
-  report(`split ORT reference ${(performance.now() - referenceStarted).toFixed(2)} ms`);
-  await referenceBackend.release();
-  await device.queue.onSubmittedWorkDone();
-  report("split ORT reference released");
-
+  const directDirectory = BATCH === 8 ? "/models" : `/models/diagnostic-vad-b${BATCH}`;
+  const rawLoadStarted = performance.now();
   const frontend = await RawPyannoteFrontendFoundation.create(
     device,
-    "/models/pyannote-segmentation-3.0-frontend-webgpu-f16.json",
+    `${directDirectory}/pyannote-segmentation-3.0-frontend-webgpu-f16.json`,
   );
   const lstm = await PersistentWebGpuLstm.create(
     device,
@@ -139,33 +258,47 @@ async function main(): Promise<void> {
   const tail = await RawPyannoteTail.create(
     device,
     lstm.outputBuffer,
-    "/models/pyannote-segmentation-3.0-tail-webgpu-f16.json",
+    `${directDirectory}/pyannote-segmentation-3.0-tail-webgpu-f16.json`,
   );
-  frontend.uploadWaveform(waveform);
+  const rawLoadMs = performance.now() - rawLoadStarted;
   report(
-    `raw resources frontend=${frontend.gpuBytes.total}, lstm=${lstm.bufferBytes.total}, tail=${tail.gpuBytes.total}`,
+    `raw resources loaded in ${rawLoadMs.toFixed(3)} ms; frontend=${frontend.gpuBytes.total}, lstm=${lstm.bufferBytes.total}, tail=${tail.gpuBytes.total}`,
   );
 
-  const actual = await runRaw(device, frontend, lstm, tail);
-  const comparison = parity(reference, actual);
-  const outputSha256 = await floatSha256(actual);
+  const timestamps = createTimestampResources(device);
+  frontend.uploadWaveform(waveform);
+  const warm = await runRaw(device, frontend, lstm, tail, timestamps);
+  const actual = warm.output;
   report(
-    `parity max_abs=${comparison.maxAbsolute.toExponential(6)}, rms=${comparison.rms.toExponential(6)}, nonfinite=${comparison.nonFinite}, argmax=${comparison.matchingArgmax}/${comparison.totalFrames}`,
+    `raw warmup wall=${warm.wallMs.toFixed(3)} ms${warm.gpuMs === undefined ? "" : `, gpu=${warm.gpuMs.toFixed(3)} ms`}`,
   );
 
   const timings: number[] = [];
+  const gpuTimings: number[] = [];
   for (let run = 0; run < 10; run += 1) {
     frontend.uploadWaveform(waveform);
-    const runStarted = performance.now();
-    await runRaw(device, frontend, lstm, tail);
-    const elapsed = performance.now() - runStarted;
-    timings.push(elapsed);
-    report(`raw VAD run ${run + 1}: ${elapsed.toFixed(3)} ms`);
+    const measured = await runRaw(device, frontend, lstm, tail, timestamps);
+    timings.push(measured.wallMs);
+    if (measured.gpuMs !== undefined) gpuTimings.push(measured.gpuMs);
+    report(
+      `raw VAD run ${run + 1}: wall=${measured.wallMs.toFixed(3)} ms${measured.gpuMs === undefined ? "" : `, gpu=${measured.gpuMs.toFixed(3)} ms`}`,
+    );
   }
   const settled = timings.slice(3);
   const settledMeanMs = settled.reduce((sum, value) => sum + value, 0) / settled.length;
   const sorted = [...settled].sort((left, right) => left - right);
   const settledMedianMs = sorted[Math.floor(sorted.length / 2)]!;
+  const settledGpu = gpuTimings.slice(3);
+  const settledGpuMeanMs =
+    settledGpu.length === 0
+      ? undefined
+      : settledGpu.reduce((sum, value) => sum + value, 0) / settledGpu.length;
+  const settledGpuMedianMs =
+    settledGpu.length === 0
+      ? undefined
+      : [...settledGpu].sort((left, right) => left - right)[
+          Math.floor(settledGpu.length / 2)
+        ];
 
   const stageProfiles: Array<{
     frontendMs: number;
@@ -235,38 +368,95 @@ async function main(): Promise<void> {
     tail: tail.gpuBytes.total,
     total: frontend.gpuBytes.total + lstm.bufferBytes.total + tail.gpuBytes.total,
   };
+  const frontendMetadataSerializedBytes = new TextEncoder().encode(
+    JSON.stringify(frontend.gpuPackage.metadata),
+  ).byteLength;
+  const tailMetadataSerializedBytes = new TextEncoder().encode(
+    JSON.stringify({
+      ...tail.metadata,
+      sections: [...tail.metadata.sections.values()],
+    }),
+  ).byteLength;
+  if (timestamps !== undefined) {
+    timestamps.readback.destroy();
+    timestamps.resolve.destroy();
+    timestamps.querySet.destroy();
+  }
+  tail.destroy();
+  lstm.release();
+  frontend.destroy();
+  await device.queue.onSubmittedWorkDone();
+  report("raw resources released");
+
+  const referenceLoadStarted = performance.now();
+  const referenceBackend = await OrtVadBackend.create(runtime, selected);
+  const referenceLoadMs = performance.now() - referenceLoadStarted;
+  const referenceStarted = performance.now();
+  const reference = await referenceBackend.run(waveform);
+  const referenceRunMs = performance.now() - referenceStarted;
+  report(
+    `split ORT reference load=${referenceLoadMs.toFixed(2)} ms, run=${referenceRunMs.toFixed(2)} ms`,
+  );
+  await referenceBackend.release();
+  const referenceDevice = await runtime.device;
+  await referenceDevice.queue.onSubmittedWorkDone();
+
+  const comparison = parity(reference, actual);
+  const outputSha256 = await floatSha256(actual);
+  report(
+    `parity max_abs=${comparison.maxAbsolute.toExponential(6)}, rms=${comparison.rms.toExponential(6)}, nonfinite=${comparison.nonFinite}, argmax=${comparison.matchingArgmax}/${comparison.totalFrames}`,
+  );
+  const longBatchRuns = Math.ceil(LONG_FILE_CHUNKS / BATCH);
+  const longPaddedChunks = longBatchRuns * BATCH - LONG_FILE_CHUNKS;
+  const projectedLongSteadyWallMs = settledMeanMs * longBatchRuns;
+  const projectedLongFirstUseWallMs =
+    rawLoadMs + warm.wallMs + projectedLongSteadyWallMs;
   const ok =
     comparison.nonFinite === 0 &&
     comparison.matchingArgmax === comparison.totalFrames;
   const result = {
     ok,
+    batchSize: BATCH,
+    timestampQuery,
     outputSha256,
     comparison,
+    rawLoadMs,
+    warmup: warm.gpuMs === undefined
+      ? { wallMs: warm.wallMs }
+      : { wallMs: warm.wallMs, gpuMs: warm.gpuMs },
+    reference: { loadMs: referenceLoadMs, runMs: referenceRunMs },
     timings,
+    gpuTimings,
     settledMeanMs,
     settledMedianMs,
-    projected47BatchMs: settledMeanMs * 47,
+    settledGpuMeanMs,
+    settledGpuMedianMs,
+    projectedLongFile: {
+      chunks: LONG_FILE_CHUNKS,
+      batchRuns: longBatchRuns,
+      processedStaticChunks: longBatchRuns * BATCH,
+      paddedChunks: longPaddedChunks,
+      steadyWallMs: projectedLongSteadyWallMs,
+      firstUseWallMs: projectedLongFirstUseWallMs,
+    },
     stageProfiles,
     lstmLayerProfiles,
     gpuBytes,
     retainedCpuBytes: {
-      frontendMetadataSerialized: new TextEncoder().encode(
-        JSON.stringify(frontend.gpuPackage.metadata),
-      ).byteLength,
-      tailMetadataSerialized: new TextEncoder().encode(
-        JSON.stringify({
-          ...tail.metadata,
-          sections: [...tail.metadata.sections.values()],
-        }),
-      ).byteLength,
+      frontendMetadataSerialized: frontendMetadataSerializedBytes,
+      tailMetadataSerialized: tailMetadataSerializedBytes,
       packedModelBinariesRetained: 0,
       callerOwnedWaveform: waveform.byteLength,
       diagnosticOnlyReferenceAndActual: reference.byteLength + actual.byteLength,
+      productionWavReadBuffer: 320_000,
+      productionVadLogits: BATCH * FRAMES * CLASSES * 4,
+      productionLogicalLive:
+        320_000 + waveform.byteLength + BATCH * FRAMES * CLASSES * 4,
+      productionFixedWasmHeaps: 9_961_472,
     },
   };
-  tail.destroy();
-  lstm.release();
-  frontend.destroy();
+  referenceDevice.destroy();
+  device.destroy();
   Object.assign(globalThis, { __senkoRawVadDiagnostic: result });
   output.textContent = JSON.stringify(result, null, 2);
   output.dataset.status = ok ? "passed" : "failed";
