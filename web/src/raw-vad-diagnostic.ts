@@ -29,6 +29,19 @@ function fillDeterministic(values: Float32Array): void {
   }
 }
 
+async function floatSha256(values: Float32Array): Promise<string> {
+  const bytes =
+    values.buffer instanceof ArrayBuffer
+      ? values.buffer.slice(values.byteOffset, values.byteOffset + values.byteLength)
+      : new Uint8Array(
+          new Uint8Array(values.buffer, values.byteOffset, values.byteLength),
+        ).buffer;
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+  let result = "";
+  for (const byte of digest) result += byte.toString(16).padStart(2, "0");
+  return result;
+}
+
 function parity(reference: Float32Array, actual: Float32Array): {
   readonly maxAbsolute: number;
   readonly rms: number;
@@ -135,6 +148,7 @@ async function main(): Promise<void> {
 
   const actual = await runRaw(device, frontend, lstm, tail);
   const comparison = parity(reference, actual);
+  const outputSha256 = await floatSha256(actual);
   report(
     `parity max_abs=${comparison.maxAbsolute.toExponential(6)}, rms=${comparison.rms.toExponential(6)}, nonfinite=${comparison.nonFinite}, argmax=${comparison.matchingArgmax}/${comparison.totalFrames}`,
   );
@@ -183,19 +197,57 @@ async function main(): Promise<void> {
     stageProfiles.push({ frontendMs, lstmMs, tailReadbackMs });
   }
 
+  const lstmLayerProfiles: Array<{
+    layerMs: readonly [number, number, number, number];
+    totalMs: number;
+  }> = [];
+  for (let profile = 0; profile < 5; profile += 1) {
+    frontend.uploadWaveform(waveform);
+    const frontendEncoder = device.createCommandEncoder();
+    frontend.encode(frontendEncoder);
+    device.queue.submit([frontendEncoder.finish()]);
+    await device.queue.onSubmittedWorkDone();
+
+    const measured: number[] = [];
+    for (let layer = 0; layer < 4; layer += 1) {
+      const layerStarted = performance.now();
+      const layerEncoder = device.createCommandEncoder();
+      lstm.encodeLayer(layerEncoder, layer);
+      device.queue.submit([layerEncoder.finish()]);
+      await device.queue.onSubmittedWorkDone();
+      measured.push(performance.now() - layerStarted);
+    }
+    const layerMs = [
+      measured[0]!,
+      measured[1]!,
+      measured[2]!,
+      measured[3]!,
+    ] as const;
+    lstmLayerProfiles.push({
+      layerMs,
+      totalMs: layerMs.reduce((sum, value) => sum + value, 0),
+    });
+  }
+
   const gpuBytes = {
     frontend: frontend.gpuBytes.total,
     lstm: lstm.bufferBytes.total,
     tail: tail.gpuBytes.total,
     total: frontend.gpuBytes.total + lstm.bufferBytes.total + tail.gpuBytes.total,
   };
+  const ok =
+    comparison.nonFinite === 0 &&
+    comparison.matchingArgmax === comparison.totalFrames;
   const result = {
+    ok,
+    outputSha256,
     comparison,
     timings,
     settledMeanMs,
     settledMedianMs,
     projected47BatchMs: settledMeanMs * 47,
     stageProfiles,
+    lstmLayerProfiles,
     gpuBytes,
     retainedCpuBytes: {
       frontendMetadataSerialized: new TextEncoder().encode(
@@ -212,15 +264,27 @@ async function main(): Promise<void> {
       diagnosticOnlyReferenceAndActual: reference.byteLength + actual.byteLength,
     },
   };
-  Object.assign(globalThis, { __senkoRawVadDiagnostic: result });
-  report(`summary ${JSON.stringify(result)}`);
   tail.destroy();
   lstm.release();
   frontend.destroy();
-  report("raw VAD resources released");
+  Object.assign(globalThis, { __senkoRawVadDiagnostic: result });
+  output.textContent = JSON.stringify(result, null, 2);
+  output.dataset.status = ok ? "passed" : "failed";
+  globalThis.dispatchEvent(
+    new CustomEvent("senko-raw-vad-diagnostic", { detail: result }),
+  );
 }
 
 void main().catch((error: unknown) => {
-  report(`ERROR ${error instanceof Error ? `${error.name}: ${error.message}` : String(error)}`);
-  throw error;
+  const failure = {
+    ok: false,
+    error: error instanceof Error ? `${error.name}: ${error.message}` : String(error),
+  };
+  Object.assign(globalThis, { __senkoRawVadDiagnostic: failure });
+  output.textContent = JSON.stringify(failure, null, 2);
+  output.dataset.status = "error";
+  globalThis.dispatchEvent(
+    new CustomEvent("senko-raw-vad-diagnostic", { detail: failure }),
+  );
+  console.error(failure.error);
 });
