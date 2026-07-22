@@ -16,6 +16,19 @@ interface Dendrogram {
   readonly distances: Float64Array;
 }
 
+interface SortedMutualReachabilityEdges {
+  readonly order: Uint32Array;
+  readonly weights: Float64Array;
+  readonly edgeCount: number;
+}
+
+const RADIX_BITS = 16;
+const RADIX_SIZE = 1 << RADIX_BITS;
+const RADIX_MASK = RADIX_SIZE - 1;
+const FLOAT64_WORD_ORDER = new Uint32Array(new Float64Array([1]).buffer);
+const FLOAT64_LOW_WORD_OFFSET = FLOAT64_WORD_ORDER[0] === 0 ? 0 : 1;
+const FLOAT64_HIGH_WORD_OFFSET = 1 - FLOAT64_LOW_WORD_OFFSET;
+
 /**
  * Extract HDBSCAN-style clusters from a sparse k-NN graph.
  *
@@ -96,35 +109,11 @@ function buildDendrogram(
   count: number,
   coreDistances: Float64Array,
 ): Dendrogram {
-  const directedEdgeCount = count * graph.neighborCount;
-  const edgeFrom = new Int32Array(directedEdgeCount);
-  const edgeTo = new Int32Array(directedEdgeCount);
-  const edgeWeight = new Float64Array(directedEdgeCount);
-  const order: number[] = [];
-
-  for (let from = 0; from < count; from += 1) {
-    const offset = from * graph.neighborCount;
-    for (let rank = 0; rank < graph.neighborCount; rank += 1) {
-      const edge = offset + rank;
-      const to = graph.indices[edge]!;
-      if (to < 0 || to === from) {
-        continue;
-      }
-      const distance = Math.max(0, 1 - graph.similarities[edge]!);
-      edgeFrom[edge] = from;
-      edgeTo[edge] = to;
-      edgeWeight[edge] = Math.max(coreDistances[from]!, coreDistances[to]!, distance);
-      order.push(edge);
-    }
-  }
-  order.sort((left, right) => {
-    const difference = edgeWeight[left]! - edgeWeight[right]!;
-    if (difference !== 0) {
-      return difference;
-    }
-    const fromDifference = edgeFrom[left]! - edgeFrom[right]!;
-    return fromDifference !== 0 ? fromDifference : edgeTo[left]! - edgeTo[right]!;
-  });
+  const sortedEdges = buildSortedMutualReachabilityEdges(
+    graph,
+    count,
+    coreDistances,
+  );
 
   const maximumNodes = count * 2;
   const left = new Int32Array(maximumNodes);
@@ -145,9 +134,12 @@ function buildDendrogram(
 
   let nextNode = count;
   let maximumWeight = 0;
-  for (const edge of order) {
-    let fromRoot = findRoot(parent, edgeFrom[edge]!);
-    let toRoot = findRoot(parent, edgeTo[edge]!);
+  for (let cursor = 0; cursor < sortedEdges.edgeCount; cursor += 1) {
+    const edge = sortedEdges.order[cursor]!;
+    const from = Math.floor(edge / graph.neighborCount);
+    const to = graph.indices[edge]!;
+    let fromRoot = findRoot(parent, from);
+    let toRoot = findRoot(parent, to);
     if (fromRoot === toRoot) {
       continue;
     }
@@ -161,7 +153,7 @@ function buildDendrogram(
     left[node] = componentNode[fromRoot]!;
     right[node] = componentNode[toRoot]!;
     sizes[node] = componentSize[fromRoot]! + componentSize[toRoot]!;
-    const weight = edgeWeight[edge]!;
+    const weight = sortedEdges.weights[edge]!;
     distances[node] = weight;
     maximumWeight = Math.max(maximumWeight, weight);
 
@@ -196,6 +188,111 @@ function buildDendrogram(
   }
 
   return { root: rootNode, left, right, sizes, distances };
+}
+
+/**
+ * Build the deterministic Kruskal edge order without allocating boxed indices.
+ *
+ * Mutual-reachability weights are non-negative Float64 values, whose unsigned
+ * IEEE-754 bit patterns have the same order as their numeric values. Stable LSD
+ * radix passes over `(weight, from, to)` therefore reproduce the former
+ * comparator sort exactly, including insertion order for duplicate edges.
+ * Exported from this module so the ordering invariant can be tested directly.
+ */
+export function buildSortedMutualReachabilityEdges(
+  graph: KnnGraph,
+  count: number,
+  coreDistances: Float64Array,
+): SortedMutualReachabilityEdges {
+  const directedEdgeCount = count * graph.neighborCount;
+  const weights = new Float64Array(directedEdgeCount);
+  let order = new Uint32Array(directedEdgeCount);
+  let edgeCount = 0;
+
+  for (let from = 0; from < count; from += 1) {
+    const offset = from * graph.neighborCount;
+    for (let rank = 0; rank < graph.neighborCount; rank += 1) {
+      const edge = offset + rank;
+      const to = graph.indices[edge]!;
+      if (to < 0 || to === from) {
+        continue;
+      }
+      const distance = Math.max(0, 1 - graph.similarities[edge]!);
+      weights[edge] = Math.max(coreDistances[from]!, coreDistances[to]!, distance);
+      order[edgeCount] = edge;
+      edgeCount += 1;
+    }
+  }
+  if (edgeCount < 2) {
+    return { order, weights, edgeCount };
+  }
+
+  let temporary = new Uint32Array(directedEdgeCount);
+  const counts = new Uint32Array(RADIX_SIZE);
+  const weightWords = new Uint32Array(weights.buffer);
+  // Production is far below 65,536 rows, but retain exact endpoint ordering for
+  // larger valid Int32 graphs by adding a second 16-bit pass per endpoint.
+  const endpointPasses = count <= RADIX_SIZE ? 1 : 2;
+  const weightPassStart = endpointPasses * 2;
+  const totalPasses = weightPassStart + 4;
+
+  for (let pass = 0; pass < totalPasses; pass += 1) {
+    counts.fill(0);
+    for (let cursor = 0; cursor < edgeCount; cursor += 1) {
+      const edge = order[cursor]!;
+      let key: number;
+      if (pass < endpointPasses) {
+        key = (graph.indices[edge]! >>> (pass * RADIX_BITS)) & RADIX_MASK;
+      } else if (pass < weightPassStart) {
+        const from = Math.floor(edge / graph.neighborCount);
+        key =
+          (from >>> ((pass - endpointPasses) * RADIX_BITS)) & RADIX_MASK;
+      } else {
+        const weightPass = pass - weightPassStart;
+        const wordOffset =
+          weightPass < 2 ? FLOAT64_LOW_WORD_OFFSET : FLOAT64_HIGH_WORD_OFFSET;
+        const word = weightWords[edge * 2 + wordOffset]!;
+        key =
+          weightPass % 2 === 0 ? word & RADIX_MASK : word >>> RADIX_BITS;
+      }
+      counts[key] = counts[key]! + 1;
+    }
+
+    let position = 0;
+    for (let key = 0; key < RADIX_SIZE; key += 1) {
+      const size = counts[key]!;
+      counts[key] = position;
+      position += size;
+    }
+
+    for (let cursor = 0; cursor < edgeCount; cursor += 1) {
+      const edge = order[cursor]!;
+      let key: number;
+      if (pass < endpointPasses) {
+        key = (graph.indices[edge]! >>> (pass * RADIX_BITS)) & RADIX_MASK;
+      } else if (pass < weightPassStart) {
+        const from = Math.floor(edge / graph.neighborCount);
+        key =
+          (from >>> ((pass - endpointPasses) * RADIX_BITS)) & RADIX_MASK;
+      } else {
+        const weightPass = pass - weightPassStart;
+        const wordOffset =
+          weightPass < 2 ? FLOAT64_LOW_WORD_OFFSET : FLOAT64_HIGH_WORD_OFFSET;
+        const word = weightWords[edge * 2 + wordOffset]!;
+        key =
+          weightPass % 2 === 0 ? word & RADIX_MASK : word >>> RADIX_BITS;
+      }
+      const destination = counts[key]!;
+      temporary[destination] = edge;
+      counts[key] = destination + 1;
+    }
+
+    const previous = order;
+    order = temporary;
+    temporary = previous;
+  }
+
+  return { order, weights, edgeCount };
 }
 
 function condense(

@@ -31,6 +31,22 @@ so a 192-dimensional distance is never recomputed; that triangular bitset is
 floating-point distances. The post-UMAP exact graph is quadratic in distance
 computations but linear in retained memory.
 
+Hierarchy construction orders its 228,520 fixture edges with stable 16-bit LSD
+radix passes over `to`, `from`, and the unsigned bits of each non-negative
+Float64 mutual-reachability weight. This is exactly the former comparator order,
+including stable ordering of duplicate edges; a focused test compares every
+edge against that comparator. On the 5,713-row controlled fixture, warmed
+hierarchy time fell from 48–63 ms to 10.6–12.4 ms while final labels remained
+byte-identical with ARI 1.0.
+
+At that shape, radix ordering holds 3,918,464 explicitly sized bytes: the
+1,828,160-byte weight array, two 914,080-byte Uint32 order arrays, and a
+262,144-byte count table. The old path held 3,656,320 typed-array bytes plus a
+228,520-element boxed-number order, so the replacement saves at least 651,936
+transient bytes even if each boxed slot is counted as only four bytes. Pipeline
+`clusteringPeakWorkingBytes` does not decrease: that ledger reports the earlier,
+larger UMAP allocation peak rather than hierarchy's later transient storage.
+
 `onUmapStats` exposes stage timings and deterministic typed-array allocation
 accounting. On the native hour-long reference, the production WASM-assisted
 path's logical peak is about 5.1 MB including its 0.23 MB output. The fixed
