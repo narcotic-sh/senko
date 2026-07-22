@@ -5,6 +5,7 @@ import {
   inputAffineLstmWgsl,
   parsePersistentLstmMetadata,
   persistentLstmWgsl,
+  persistentLstmInputAffineFrameTile,
   recurrentLstmWgsl,
   type PersistentLstmWeightPrecision,
 } from "./persistent-lstm";
@@ -95,8 +96,11 @@ function encodeMetadata(metadata: Record<string, unknown>): ArrayBuffer {
 }
 
 describe("persistent LSTM package contract", () => {
-  it("selects the measured four-frame input-affine split for production", () => {
-    expect(DEFAULT_PERSISTENT_LSTM_VARIANT).toBe("input-affine-tile4");
+  it("selects the measured eight-frame input-affine split for production", () => {
+    expect(DEFAULT_PERSISTENT_LSTM_VARIANT).toBe("input-affine-tile8");
+    expect(persistentLstmInputAffineFrameTile("persistent")).toBeUndefined();
+    expect(persistentLstmInputAffineFrameTile("input-affine-tile4")).toBe(4);
+    expect(persistentLstmInputAffineFrameTile("input-affine-tile8")).toBe(8);
   });
 
   it.each(["float32", "float16"] as const)(
@@ -147,8 +151,8 @@ describe("persistent LSTM package contract", () => {
     expect(fp16).toContain("var cell = 0.0");
   });
 
-  it("splits the exact FP32 input-affine prefix into a four-frame tile", () => {
-    const inputAffine = inputAffineLstmWgsl("float16");
+  it("retains the exact FP32 input-affine prefix in the tile-4 baseline", () => {
+    const inputAffine = inputAffineLstmWgsl("float16", 4);
     const recurrent = recurrentLstmWgsl("float16");
 
     expect(inputAffine).toContain("var<workgroup> shared_input: array<f32, 1024>");
@@ -162,5 +166,22 @@ describe("persistent LSTM package contract", () => {
     expect(recurrent).toContain("let recurrent_column = params.input_size + column");
     expect(recurrent).not.toContain("shared_input");
     expect(recurrent).not.toContain("bias_ih_offset");
+  });
+
+  it("retains per-frame FP32 arithmetic in the production eight-frame tile", () => {
+    expect(inputAffineLstmWgsl("float16")).toBe(
+      inputAffineLstmWgsl("float16", 8),
+    );
+    const inputAffine = inputAffineLstmWgsl("float16", 8);
+
+    expect(inputAffine).toContain("var<workgroup> shared_input: array<f32, 2048>");
+    expect(inputAffine).toContain("let first_frame = group_id.z * 8u");
+    expect(inputAffine).toContain("for (var tile = 0u; tile < 8u");
+    expect(inputAffine).toContain("var first_gates_0 = vec4<f32>(first_bias)");
+    expect(inputAffine).toContain("var first_gates_1 = vec4<f32>(first_bias)");
+    expect(inputAffine).toContain("shared_input[1792u + column + 3u]");
+    expect(inputAffine).toContain("let frame = first_frame + 4u + tile");
+    expect(inputAffine.match(/dot\(first_weights, values_[0-7]\)/g)).toHaveLength(8);
+    expect(inputAffine.match(/dot\(second_weights, values_[0-7]\)/g)).toHaveLength(8);
   });
 });

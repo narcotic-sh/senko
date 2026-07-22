@@ -90,14 +90,25 @@ staged until EOF, so inference count and output ordering stay identical to the
 sequential pipeline. Against the preceding cooled 12.05-12.21-second checkpoint,
 the dual-device scheduler's 11.062-second median was roughly 9% faster.
 
-The current checkpoint additionally tiles the LSTM input-affine term across
-four independent frames and leaves only the hidden-state term in the serial
-recurrent kernel. The raw B8 VAD call fell from 48.7475 to 35.2525 ms wall
-(27.68%) with a byte-identical output. Its 19,300,352-byte FP32 preactivation
-arena raises exact VAD ownership from 24,845,312 to 44,145,664 bytes. A
-persistent unordered-pair bitset also lowers long-file clustering by about
-0.1 seconds. Together they move the full median from 11.061990 to 10.573895
-seconds while the measured logical CPU peak remains 9.82 MB.
+The split LSTM initially tiled its input-affine term across four independent
+frames and left only the hidden-state term in the serial recurrent kernel. That
+moved the raw B8 VAD call from 48.7475 to 35.2525 ms wall (27.68%) with a
+byte-identical output. Production now shares each packed input weight across
+eight frames; tile-4 remains the explicit diagnostic baseline. In a later
+production-build A/B, pooled tile-8 medians improved whole-call wall/GPU from
+36.9775/35.389440 ms to 35.9500/33.914880 ms and reduced the four-layer
+input-affine profile from 9.0075 to 7.7225 ms. The 47-call long-file projection
+is 48.29 ms. Full short/long acceptance for this promotion is intentionally
+pending so it can be combined with the next clustering candidate.
+
+Tile-8 and tile-4 have identical output SHA-256 and ORT parity, and both retain
+the same 19,300,352-byte FP32 preactivation arena. Exact VAD ownership remains
+44,145,664 GPU-buffer bytes; only local workgroup storage changes from 4096 to
+8192 bytes while four-layer B8 input-affine workgroups halve from 9472 to 4736.
+A persistent unordered-pair bitset also lowers long-file clustering by about
+0.1 seconds. Together the earlier split-LSTM and clustering changes moved the
+full median from 11.061990 to 10.573895 seconds while the measured logical CPU
+peak remained 9.82 MB.
 
 The TDNN's cached baseline measured 3.080192 ms; `direct-tile8-wg96` measured
 0.655360-0.720896 ms and delivered a 22.806528 ms nine-run pooled full-graph

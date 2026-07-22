@@ -9,6 +9,7 @@ import {
 } from "./pipeline/model-manifest";
 import { configureOrt, OrtVadBackend } from "./pipeline/ort-backends";
 import {
+  DEFAULT_PERSISTENT_LSTM_VARIANT,
   PersistentWebGpuLstm,
   type PersistentLstmVariant,
 } from "./pipeline/persistent-lstm";
@@ -45,10 +46,14 @@ function diagnosticFrontendMode(
 }
 
 function diagnosticLstmVariant(source: string | null): PersistentLstmVariant {
-  const variant = source ?? "input-affine-tile4";
-  if (variant !== "persistent" && variant !== "input-affine-tile4") {
+  const variant = source ?? DEFAULT_PERSISTENT_LSTM_VARIANT;
+  if (
+    variant !== "persistent" &&
+    variant !== "input-affine-tile4" &&
+    variant !== "input-affine-tile8"
+  ) {
     throw new Error(
-      `Raw VAD LSTM variant must be persistent or input-affine-tile4; received ${source}`,
+      `Raw VAD LSTM variant must be input-affine-tile8, input-affine-tile4, or persistent; received ${source}`,
     );
   }
   return variant;

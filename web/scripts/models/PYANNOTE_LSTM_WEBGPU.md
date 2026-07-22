@@ -109,8 +109,8 @@ allocation.
 
 Production uses two dispatches per layer. The first evaluates the independent
 `bias_ih + bias_hh + W_ih*x_t` prefix across every frame. A 256-invocation
-workgroup tiles four frames, loads each packed FP16 weight vector once, and
-retains four independent FP32 accumulation chains. It writes a reusable FP32
+workgroup tiles eight frames, loads each packed FP16 weight vector once, and
+retains eight independent FP32 accumulation chains. It writes a reusable FP32
 preactivation arena. The recurrent dispatch then uses one 256-invocation
 workgroup for each `(batch,direction)` pair; every invocation owns two gate
 rows and evaluates only `W_hh*h_(t-1)` before the state update. Both directions
@@ -144,18 +144,32 @@ respective contiguous column ranges without changing the artifact format.
 
 ## Input-affine split A/B
 
-Balanced isolated-Chrome B8 runs measured 14 settled samples per variant. The
-retained persistent baseline had pooled medians of 48.7475 ms wall and
-46.891008 ms GPU for the full raw VAD call. Production `input-affine-tile4`
-measured 35.2525 ms wall and 33.619968 ms GPU, saving 13.4950 ms wall (27.68%)
-and 13.27104 ms GPU (28.30%). The isolated LSTM stage fell from roughly
-34.2--35.4 ms to 20.7--21.2 ms.
+The original balanced isolated-Chrome B8 split A/B measured 14 settled samples
+per variant. The retained single-dispatch `persistent` baseline had pooled
+medians of 48.7475 ms wall and 46.891008 ms GPU for the full raw VAD call;
+`input-affine-tile4` measured 35.2525 ms wall and 33.619968 ms GPU. Tile-4
+therefore remains the explicit split-kernel diagnostic baseline.
 
-Both variants produced SHA-256
+A later production-build B8 A/B ran tile-4/tile-8/tile-4/tile-8, with seven
+settled whole-call samples inside each run. Pooled medians were 36.9775 ms wall
+and 35.389440 ms GPU for tile-4 versus 35.9500 ms wall and 33.914880 ms GPU for
+production tile-8. Tile-8 saved 1.0275 ms wall (2.78%) and 1.474560 ms GPU
+(4.17%) per call. Its four-layer input-affine profile fell from 9.0075 to
+7.7225 ms (14.27%); across 47 B8 calls that projects to 48.29 ms less wall time
+before dual-device overlap. Absolute times varied between the paired runs, so
+the conclusion uses the pooled settled samples and the isolated subgroup, not
+one favorable invocation.
+
+All persistent, tile-4, and tile-8 checks produced SHA-256
 `20c74873f618bd7f6b846f289a898a7bb8fdc44964eb8a80aa580944473b2323`,
 the same ORT error metrics, no non-finite values, and 4712/4712 matching frame
-argmax decisions. The speedup costs exactly 19,300,352 persistent GPU bytes at
-B8; the complete direct VAD now owns 44,145,664 bytes.
+argmax decisions. Tile-8 halves input-affine workgroups at B8 from 9472 to 4736
+across four layers. Its local workgroup input tile is 8192 bytes rather than
+tile-4's 4096 bytes, but both use the same 19,300,352-byte persistent
+preactivation arena. The LSTM owns exactly 31,711,360 GPU-buffer bytes and the
+complete direct VAD owns 44,145,664 bytes on either split geometry. Reported
+production logical CPU residency also remains 5,571,936 bytes, with 12,058,624
+bytes in the fixed WASM heaps.
 
 ## FP16-weight A/B diagnostic
 

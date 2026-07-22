@@ -8,13 +8,23 @@ const OUTPUT_FEATURES = 256;
 const LAYERS = 4;
 const DIRECTIONS = 2;
 const WORKGROUP_SIZE = 256;
-const INPUT_AFFINE_FRAME_TILE = 4;
 const FLOAT_BYTES = 4;
 
 export type PersistentLstmWeightPrecision = "float32" | "float16";
-export type PersistentLstmVariant = "persistent" | "input-affine-tile4";
+export type PersistentLstmInputAffineFrameTile = 4 | 8;
+export type PersistentLstmVariant =
+  | "persistent"
+  | "input-affine-tile4"
+  | "input-affine-tile8";
 export const DEFAULT_PERSISTENT_LSTM_VARIANT: PersistentLstmVariant =
-  "input-affine-tile4";
+  "input-affine-tile8";
+
+export function persistentLstmInputAffineFrameTile(
+  variant: PersistentLstmVariant,
+): PersistentLstmInputAffineFrameTile | undefined {
+  if (variant === "persistent") return undefined;
+  return variant === "input-affine-tile4" ? 4 : 8;
+}
 
 interface PackedTensor {
   readonly offset_bytes: number;
@@ -97,6 +107,7 @@ export class PersistentWebGpuLstm {
     private readonly pingA: GPUBuffer,
     private readonly pingB: GPUBuffer,
     private readonly inputAffineScratch: GPUBuffer | undefined,
+    private readonly inputAffineFrameTile: PersistentLstmInputAffineFrameTile | undefined,
     private readonly uniformBuffers: readonly GPUBuffer[],
     bufferBytes: PersistentLstmBufferBytes,
     weightPrecision: PersistentLstmWeightPrecision,
@@ -150,6 +161,7 @@ export class PersistentWebGpuLstm {
     }
 
     onProgress?.("Compiling persistent LSTM WebGPU kernel");
+    const inputAffineFrameTile = persistentLstmInputAffineFrameTile(variant);
     const recurrentShader = device.createShaderModule({
       label: `senko-pyannote-${variant}-lstm-${metadata.weightPrecision}`,
       code:
@@ -167,10 +179,13 @@ export class PersistentWebGpuLstm {
       );
     }
     const inputAffineShader =
-      variant === "input-affine-tile4"
+      inputAffineFrameTile !== undefined
         ? device.createShaderModule({
-            label: `senko-pyannote-input-affine-tile4-${metadata.weightPrecision}`,
-            code: inputAffineLstmWgsl(metadata.weightPrecision),
+            label: `senko-pyannote-${variant}-${metadata.weightPrecision}`,
+            code: inputAffineLstmWgsl(
+              metadata.weightPrecision,
+              inputAffineFrameTile,
+            ),
           })
         : undefined;
     if (inputAffineShader !== undefined) {
@@ -222,7 +237,7 @@ export class PersistentWebGpuLstm {
       inputAffineShader === undefined
         ? undefined
         : device.createComputePipelineAsync({
-            label: "senko-pyannote-lstm-input-affine-tile4",
+            label: `senko-pyannote-lstm-input-affine-tile${inputAffineFrameTile}`,
             layout: pipelineLayout,
             compute: { module: inputAffineShader, entryPoint: "main" },
           }),
@@ -251,7 +266,7 @@ export class PersistentWebGpuLstm {
         size: recurrentBytes,
         usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
       });
-      if (variant === "input-affine-tile4") {
+      if (inputAffineFrameTile !== undefined) {
         inputAffineScratch = device.createBuffer({
           label: "senko-pyannote-lstm-input-affine-scratch",
           size:
@@ -338,6 +353,7 @@ export class PersistentWebGpuLstm {
         pingA,
         pingB,
         inputAffineScratch,
+        inputAffineFrameTile,
         uniformBuffers,
         bufferBytes,
         metadata.weightPrecision,
@@ -379,7 +395,12 @@ export class PersistentWebGpuLstm {
     if (this.released) throw new Error("Persistent LSTM has been released");
     const pipeline = this.inputAffinePipeline;
     const bindGroup = this.bindGroups[layerIndex]?.inputAffine;
-    if (pipeline === undefined || bindGroup === undefined) {
+    const frameTile = this.inputAffineFrameTile;
+    if (
+      pipeline === undefined ||
+      bindGroup === undefined ||
+      frameTile === undefined
+    ) {
       throw new Error("The persistent LSTM variant has no input-affine stage");
     }
     const pass = encoder.beginComputePass({
@@ -390,7 +411,7 @@ export class PersistentWebGpuLstm {
     pass.dispatchWorkgroups(
       this.batchSize,
       DIRECTIONS,
-      Math.ceil(FRAMES / INPUT_AFFINE_FRAME_TILE),
+      Math.ceil(FRAMES / frameTile),
     );
     pass.end();
   }
@@ -791,13 +812,70 @@ fn main(
 }
 
 /**
- * Production input-affine pass. Four independent frames share each packed
- * weight load while retaining the scalar FP32 accumulation order per frame.
+ * Input-affine pass. Production shares each packed weight load across eight
+ * frames; tile-4 remains the diagnostic baseline. Both retain the same scalar
+ * FP32 accumulation order independently for every frame.
  */
 export function inputAffineLstmWgsl(
   precision: PersistentLstmWeightPrecision,
+  frameTile: PersistentLstmInputAffineFrameTile = 8,
 ): string {
   const halfPrecision = precision === "float16";
+  const gateVectorCount = frameTile / 4;
+  const gateName = (gate: "first" | "second", vector: number): string =>
+    gateVectorCount === 1 ? `${gate}_gates` : `${gate}_gates_${vector}`;
+  const gateDeclarations = Array.from(
+    { length: gateVectorCount },
+    (_, vector) => `  var ${gateName("first", vector)} = vec4<f32>(first_bias);
+  var ${gateName("second", vector)} = vec4<f32>(second_bias);`,
+  ).join("\n");
+  const inputVectors = Array.from({ length: frameTile }, (_, tile) => {
+    const offset = tile === 0 ? "" : `${tile * 256}u + `;
+    return `    let values_${tile} = vec4<f32>(
+      shared_input[${offset}column],
+      shared_input[${offset}column + 1u],
+      shared_input[${offset}column + 2u],
+      shared_input[${offset}column + 3u],
+    );`;
+  }).join("\n");
+  const accumulations = Array.from(
+    { length: gateVectorCount },
+    (_, vector) => {
+      const firstTile = vector * 4;
+      const dots = (weights: "first_weights" | "second_weights") =>
+        Array.from(
+          { length: 4 },
+          (_, lane) =>
+            `      dot(${weights}, values_${firstTile + lane}),`,
+        ).join("\n");
+      return `    ${gateName("first", vector)} += vec4<f32>(
+${dots("first_weights")}
+    );
+    ${gateName("second", vector)} += vec4<f32>(
+${dots("second_weights")}
+    );`;
+    },
+  ).join("\n");
+  const stores = Array.from(
+    { length: gateVectorCount },
+    (_, vector) => {
+      const firstTile = vector * 4;
+      const frame = firstTile === 0
+        ? "first_frame + tile"
+        : `first_frame + ${firstTile}u + tile`;
+      return `  for (var tile = 0u; tile < 4u; tile += 1u) {
+    let frame = ${frame};
+    if (frame < params.frames) {
+      preactivation.values[
+        preactivation_index(batch, direction, frame, first_gate_index, lane)
+      ] = ${gateName("first", vector)}[tile];
+      preactivation.values[
+        preactivation_index(batch, direction, frame, second_gate_index, lane)
+      ] = ${gateName("second", vector)}[tile];
+    }
+  }`;
+    },
+  ).join("\n");
   return /* wgsl */ `
 ${halfPrecision ? "enable f16;" : ""}
 struct FloatBuffer {
@@ -824,7 +902,7 @@ struct Parameters {
 @group(0) @binding(2) var<storage, read_write> preactivation: FloatBuffer;
 @group(0) @binding(3) var<uniform> params: Parameters;
 
-var<workgroup> shared_input: array<f32, 1024>;
+var<workgroup> shared_input: array<f32, ${frameTile * 256}>;
 
 fn scalar_weight(index: u32) -> f32 {
   return f32(weights.values[index >> 2u][index & 3u]);
@@ -855,9 +933,9 @@ fn main(
   let batch = group_id.x;
   let direction = group_id.y;
   let reverse = direction == 1u;
-  let first_frame = group_id.z * 4u;
+  let first_frame = group_id.z * ${frameTile}u;
 
-  for (var tile = 0u; tile < 4u; tile += 1u) {
+  for (var tile = 0u; tile < ${frameTile}u; tile += 1u) {
     let frame = first_frame + tile;
     if (worker < params.input_size) {
       let shared_index = tile * 256u + worker;
@@ -884,34 +962,10 @@ fn main(
     scalar_weight(bias_hh_offset + first_row);
   let second_bias = scalar_weight(bias_ih_offset + second_row) +
     scalar_weight(bias_hh_offset + second_row);
-  var first_gates = vec4<f32>(first_bias);
-  var second_gates = vec4<f32>(second_bias);
+${gateDeclarations}
 
   for (var column = 0u; column < params.input_size; column += 4u) {
-    let values_0 = vec4<f32>(
-      shared_input[column],
-      shared_input[column + 1u],
-      shared_input[column + 2u],
-      shared_input[column + 3u],
-    );
-    let values_1 = vec4<f32>(
-      shared_input[256u + column],
-      shared_input[256u + column + 1u],
-      shared_input[256u + column + 2u],
-      shared_input[256u + column + 3u],
-    );
-    let values_2 = vec4<f32>(
-      shared_input[512u + column],
-      shared_input[512u + column + 1u],
-      shared_input[512u + column + 2u],
-      shared_input[512u + column + 3u],
-    );
-    let values_3 = vec4<f32>(
-      shared_input[768u + column],
-      shared_input[768u + column + 1u],
-      shared_input[768u + column + 2u],
-      shared_input[768u + column + 3u],
-    );
+${inputVectors}
     let column_group = column >> 2u;
     let first_weights = weight_vector(
       matrix_vec4 + ((first_gate_index * groups + column_group) * 128u) + lane,
@@ -919,31 +973,10 @@ fn main(
     let second_weights = weight_vector(
       matrix_vec4 + ((second_gate_index * groups + column_group) * 128u) + lane,
     );
-    first_gates += vec4<f32>(
-      dot(first_weights, values_0),
-      dot(first_weights, values_1),
-      dot(first_weights, values_2),
-      dot(first_weights, values_3),
-    );
-    second_gates += vec4<f32>(
-      dot(second_weights, values_0),
-      dot(second_weights, values_1),
-      dot(second_weights, values_2),
-      dot(second_weights, values_3),
-    );
+${accumulations}
   }
 
-  for (var tile = 0u; tile < 4u; tile += 1u) {
-    let frame = first_frame + tile;
-    if (frame < params.frames) {
-      preactivation.values[
-        preactivation_index(batch, direction, frame, first_gate_index, lane)
-      ] = first_gates[tile];
-      preactivation.values[
-        preactivation_index(batch, direction, frame, second_gate_index, lane)
-      ] = second_gates[tile];
-    }
-  }
+${stores}
 }
 `;
 }

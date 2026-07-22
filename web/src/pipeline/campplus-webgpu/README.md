@@ -83,6 +83,10 @@ VAD first, then overlaps up to two B16 CAM++ batches on this graph's two-slot
 queue while later VAD work continues on the other device. Both models remain
 resident through CPU clustering and across subsequent recordings. Their
 buffers and devices are released only when the model set or worker is disposed.
+The VAD side now uses the eight-frame input-affine LSTM tile; against retained
+tile-4 it reduced pooled raw-call GPU time from 35.389440 to 33.914880 ms and
+halved input-affine workgroups without changing the VAD or summed explicit
+GPU-buffer totals. Its exact tile-4/tile-8 output SHA and ORT parity also match.
 
 All production-selectable graph batches and their exact explicit buffer totals
 are pinned in `public/models/manifest.json`; B4, B8, and B32 remain useful

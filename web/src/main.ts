@@ -11,6 +11,11 @@ if (search.has("dual-device-concurrency-diagnostic")) {
     ({ runDualDeviceConcurrencyDiagnostic }) =>
       runDualDeviceConcurrencyDiagnostic(root),
   );
+} else if (search.has("raw-vad-diagnostic")) {
+  const output = document.createElement("pre");
+  output.id = "output";
+  root.replaceChildren(output);
+  void import("./raw-vad-diagnostic");
 } else if (search.has("raw-campplus-graph-diagnostic")) {
   void import("./raw-campplus-graph-diagnostic").then(
     ({ runRawCampPlusGraphDiagnostic }) => runRawCampPlusGraphDiagnostic(root),

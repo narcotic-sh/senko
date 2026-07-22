@@ -119,14 +119,17 @@ with deterministic B8 input:
   `8.564e-5`, cosine `0.999999831`, and zero non-finite values.
 
 The full raw frontend -> FP16-weight/FP32-state LSTM -> raw tail now uses the
-four-frame input-affine LSTM split. Across balanced isolated-Chrome runs it
-settled at 35.2525 ms wall / 33.6200 ms GPU per synthetic B8 call, versus
-48.7475 / 46.8910 ms for the retained persistent-kernel baseline. Maximum
-logit error versus the split ORT reference remains `5.141e-3`, RMS remains
-`1.183e-3`, all 4712/4712 argmax decisions match, and the output SHA-256 is
-byte-identical. The 19,300,352-byte FP32 preactivation arena raises exact VAD
-ownership to 44,145,664 GPU bytes. Forty-seven steady calls project to about
-1.67 seconds before dual-device scheduler overlap.
+eight-frame input-affine LSTM split. A production-build B8 A/B pooled 14 settled
+samples per geometry: tile-4 measured 36.9775 ms wall / 35.389440 ms GPU and
+tile-8 measured 35.9500 / 33.914880 ms. The four-layer input-affine subgroup
+fell from 9.0075 to 7.7225 ms (14.27%); 47 steady calls project to 48.29 ms less
+wall time before dual-device overlap. Maximum logit error versus the split ORT
+reference remains `5.141e-3`, RMS remains `1.183e-3`, all 4712/4712 argmax
+decisions match, and tile-4/tile-8 output SHA-256 is byte-identical. Both use
+the same 19,300,352-byte FP32 preactivation arena, so exact LSTM ownership stays
+31,711,360 GPU bytes and complete VAD ownership stays 44,145,664 bytes. Tile-8
+halves four-layer input-affine workgroups from 9472 to 4736; only local
+workgroup storage rises, from 4096 to 8192 bytes.
 
 Rounding the Sinc signal tile to FP16 was rejected. It saved only about 0.9 ms
 per B8 beyond the production configuration (roughly 49 ms across 47 calls when
