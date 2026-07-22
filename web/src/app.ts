@@ -32,8 +32,8 @@ const BROWSER_MANIFEST: PipelineAssetManifest = {
       role: "runtime-data",
       format: "json",
       url: "/models/manifest.json",
-      byteLength: 28_446,
-      sha256: "8648dc0b6400b7f47e24bf6eab5397079e048ab54661b1727a137c7eadba89ca",
+      byteLength: 28_653,
+      sha256: "31dd62f9a99ec7f444de50c288728e62cc8db388555a78856b19ddfa6964e869",
     },
   ],
 };

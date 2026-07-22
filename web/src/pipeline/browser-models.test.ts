@@ -18,7 +18,7 @@ vi.mock("./model-manifest", () => ({
     directWebGpu: {
       frontendMetadata: { url: "https://example.test/frontend.json" },
       tailMetadata: { url: "https://example.test/tail.json" },
-      explicitGpuBytes: 24_845_312,
+      explicitGpuBytes: 44_145_664,
     },
   }),
   selectCampPlusDirect: () => ({
@@ -65,7 +65,7 @@ vi.mock("./raw-vad-backend", () => {
     readonly chunkSamples = 160_000;
     readonly outputFrames = 589;
     readonly outputClasses = 7;
-    readonly gpuBufferBytes = { totalOwned: 24_845_312 };
+    readonly gpuBufferBytes = { totalOwned: 44_145_664 };
 
     static async create(device: GPUDevice): Promise<FakeVadBackend> {
       fakes.events.push(`create-vad:${fakeDeviceRole(device)}`);
@@ -168,7 +168,7 @@ describe("BrowserModelSet dual residency", () => {
       "run-vad",
       "run-embedding",
     ]);
-    expect(models.knownGpuBufferBytes).toBe(64_700_672);
+    expect(models.knownGpuBufferBytes).toBe(84_001_024);
 
     fakes.events.length = 0;
     await models.vad.run(new Float32Array(8 * 160_000));

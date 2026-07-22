@@ -546,6 +546,7 @@ export class OrtVadBackend implements VadBatchBackend {
         selected.weights,
         selected.metadata,
         onProgress,
+        "persistent",
       );
       tailSession = await loadSession(runtime, selected.tail.asset, (message) =>
         onProgress?.(`Tail: ${message}`),

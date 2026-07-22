@@ -588,9 +588,13 @@ function optimizeLayout(
       }
       let coefficient = 0;
       if (squaredDistance > 0) {
+        // x^(b - 1) = x^b / x. Reuse the one transcendental in this hot
+        // positive-edge path; the resulting layout retains the fixture's
+        // exact final labels while avoiding a second pow per sampled edge.
+        const distancePower = squaredDistance ** b;
         coefficient =
-          (-2 * a * b * squaredDistance ** (b - 1)) /
-          (a * squaredDistance ** b + 1);
+          (-2 * a * b * distancePower) /
+          (squaredDistance * (a * distancePower + 1));
       }
       for (let component = 0; component < dim; component += 1) {
         const difference =

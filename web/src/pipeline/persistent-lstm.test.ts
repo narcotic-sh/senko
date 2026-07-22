@@ -1,8 +1,11 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  DEFAULT_PERSISTENT_LSTM_VARIANT,
+  inputAffineLstmWgsl,
   parsePersistentLstmMetadata,
   persistentLstmWgsl,
+  recurrentLstmWgsl,
   type PersistentLstmWeightPrecision,
 } from "./persistent-lstm";
 
@@ -92,6 +95,10 @@ function encodeMetadata(metadata: Record<string, unknown>): ArrayBuffer {
 }
 
 describe("persistent LSTM package contract", () => {
+  it("selects the measured four-frame input-affine split for production", () => {
+    expect(DEFAULT_PERSISTENT_LSTM_VARIANT).toBe("input-affine-tile4");
+  });
+
   it.each(["float32", "float16"] as const)(
     "accepts a strict %s package",
     (precision) => {
@@ -138,5 +145,22 @@ describe("persistent LSTM package contract", () => {
     expect(fp16).toContain("fn weight_vector(index: u32) -> vec4<f32>");
     expect(fp16).toContain("var first_gate");
     expect(fp16).toContain("var cell = 0.0");
+  });
+
+  it("splits the exact FP32 input-affine prefix into a four-frame tile", () => {
+    const inputAffine = inputAffineLstmWgsl("float16");
+    const recurrent = recurrentLstmWgsl("float16");
+
+    expect(inputAffine).toContain("var<workgroup> shared_input: array<f32, 1024>");
+    expect(inputAffine).toContain("let first_frame = group_id.z * 4u");
+    expect(inputAffine).toContain("var first_gates = vec4<f32>(first_bias)");
+    expect(inputAffine).toContain("for (var column = 0u; column < params.input_size");
+    expect(inputAffine).not.toContain("hidden_state");
+
+    expect(recurrent).toContain("var<storage, read> preactivation");
+    expect(recurrent).toContain("for (var column = 0u; column < 128u");
+    expect(recurrent).toContain("let recurrent_column = params.input_size + column");
+    expect(recurrent).not.toContain("shared_input");
+    expect(recurrent).not.toContain("bias_ih_offset");
   });
 });

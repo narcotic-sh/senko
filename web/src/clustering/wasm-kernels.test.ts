@@ -75,17 +75,43 @@ describe("WasmClusteringKernels", () => {
     }
   });
 
-  it("uses one fixed nine-megabyte heap and rejects use after disposal", async () => {
+  it("uses one fixed eleven-megabyte heap and rejects use after disposal", async () => {
     const kernels = await createKernels();
     kernels.normalizeRows(deterministicMatrix(32, 16), 32, 16);
-    expect(kernels.memoryStats.heapBytes).toBe(9 * 1024 * 1024);
-    expect(kernels.memoryStats.arenaCapacityBytes).toBe(8 * 1024 * 1024);
+    expect(kernels.memoryStats.heapBytes).toBe(11 * 1024 * 1024);
+    expect(kernels.memoryStats.arenaCapacityBytes).toBe(10 * 1024 * 1024);
     expect(kernels.memoryStats.peakArenaUsedBytes).toBe(32 * 16 * 4);
     expect(kernels.memoryStats.peakReturnedJsBytes).toBe(32 * 16 * 4);
     kernels.dispose();
     expect(() =>
       kernels.normalizeRows(new Float32Array(16), 1, 16),
     ).toThrow(/disposed/);
+  });
+
+  it("preflights refinement against the fixed arena before copying inputs", async () => {
+    const kernels = await createKernels();
+    const count = 6_200;
+    const dim = 192;
+    const seedNeighborCount = 64;
+    const neighborCount = 20;
+    try {
+      expect(() =>
+        kernels.refineEuclideanNeighbors(
+          new Float32Array(count * dim),
+          count,
+          dim,
+          neighborCount,
+          new Int32Array(count * seedNeighborCount),
+          seedNeighborCount,
+          0x6d2b79f5,
+        ),
+      ).toThrow(
+        /needs 10486928 scratch bytes for 6200 rows; fixed arena capacity is 10485760/,
+      );
+      expect(kernels.memoryStats.peakArenaUsedBytes).toBe(0);
+    } finally {
+      kernels.dispose();
+    }
   });
 
   it("preserves complete deterministic clustering labels", async () => {

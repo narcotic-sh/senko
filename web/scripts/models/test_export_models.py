@@ -282,6 +282,7 @@ class ExportModelToolsTest(unittest.TestCase):
         self.assertEqual(buffers["frontend_output_bytes"], 2_261_760)
         self.assertEqual(buffers["recurrent_output_bytes"], 9_650_176)
         self.assertEqual(buffers["first_convolution_activation_bytes"], 81_792_000)
+        self.assertEqual(buffers["input_affine_scratch_bytes"], 38_600_704)
         self.assertEqual(buffers["hidden_and_cell_state_bytes_per_layer"], 32_768)
 
     def test_batch_parser_rejects_unplanned_shapes(self) -> None:

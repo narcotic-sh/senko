@@ -47,7 +47,7 @@ describe.skipIf(!enabled)("clustering WASM benchmark", () => {
       console.info(JSON.stringify(seedParity.candidate));
       expect(seedParity.candidate.exactIndices).toBe(true);
       expect(seedParity.candidate.exactSimilarities).toBe(true);
-      expect(seedParity.candidate.memory.heapBytes).toBe(9 * 1024 * 1024);
+      expect(seedParity.candidate.memory.heapBytes).toBe(11 * 1024 * 1024);
       expect(seedParity.candidate.memory.peakArenaUsedBytes).toBeLessThanOrEqual(
         seedParity.candidate.memory.arenaCapacityBytes,
       );

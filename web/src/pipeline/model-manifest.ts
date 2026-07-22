@@ -68,6 +68,7 @@ export interface VadBufferBytes {
   recurrent_output_bytes: number;
   tail_output_bytes: number;
   two_recurrent_ping_pong_buffers_bytes: number;
+  input_affine_scratch_bytes: number;
   hidden_and_cell_state_bytes_per_layer: number;
 }
 

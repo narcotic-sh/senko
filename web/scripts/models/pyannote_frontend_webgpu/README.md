@@ -118,11 +118,15 @@ with deterministic B8 input:
 - production frontend versus the FP32 baseline: max absolute `1.519e-3`, RMS
   `8.564e-5`, cosine `0.999999831`, and zero non-finite values.
 
-The full raw frontend -> FP16-weight/FP32-state LSTM -> raw tail settled at
-48.43 ms wall / 46.78 ms GPU per synthetic B8 call, down from 57.81 / 56.15
-ms. Maximum logit error versus the split ORT reference is `5.141e-3`, RMS is
-`1.183e-3`, and all 4712/4712 argmax decisions match. It still owns exactly
-24,845,312 GPU bytes. For 370 chunks, 47 steady calls project to 2.276 seconds.
+The full raw frontend -> FP16-weight/FP32-state LSTM -> raw tail now uses the
+four-frame input-affine LSTM split. Across balanced isolated-Chrome runs it
+settled at 35.2525 ms wall / 33.6200 ms GPU per synthetic B8 call, versus
+48.7475 / 46.8910 ms for the retained persistent-kernel baseline. Maximum
+logit error versus the split ORT reference remains `5.141e-3`, RMS remains
+`1.183e-3`, all 4712/4712 argmax decisions match, and the output SHA-256 is
+byte-identical. The 19,300,352-byte FP32 preactivation arena raises exact VAD
+ownership to 44,145,664 GPU bytes. Forty-seven steady calls project to about
+1.67 seconds before dual-device scheduler overlap.
 
 Rounding the Sinc signal tile to FP16 was rejected. It saved only about 0.9 ms
 per B8 beyond the production configuration (roughly 49 ms across 47 calls when

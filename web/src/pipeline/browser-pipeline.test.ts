@@ -389,11 +389,11 @@ describe("runBrowserPipeline", () => {
   it("records the concurrently resident model buffers", async () => {
     const result = await runBrowserPipeline(
       wavBlob(2),
-      { ...modelsWithSpeech(), knownGpuBufferBytes: 64_700_672 },
+      { ...modelsWithSpeech(), knownGpuBufferBytes: 84_001_024 },
       DEFAULT_PIPELINE_OPTIONS,
       { createFbank: async () => new DisposableTestFbank() },
     );
-    expect(result.memory.knownGpuBufferBytes).toBe(64_700_672);
+    expect(result.memory.knownGpuBufferBytes).toBe(84_001_024);
   });
 
   it("extracts the next FBank batch while CAM++ is in flight using distinct bounded buffers", async () => {

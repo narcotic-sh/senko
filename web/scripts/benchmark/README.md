@@ -65,16 +65,16 @@ These numbers are the latest cooled checkpoint on the target M3 Mac, not a
 promise that every run will reproduce the same wall time. VAD, FBank, and
 CAM++ overlap, so stage times must not be summed to derive the end-to-end time.
 The long row is the median-wall run from three fresh isolated-Chrome timing
-acceptances: **11.046020, 11.061990, and 11.186395 seconds**. Every run passed
+acceptances: **10.558180, 10.573895, and 10.581985 seconds**. Every run passed
 the offline-correctness gate.
 
 | Fixture | Worker wall | VAD | FBank | CAM++ | Clustering | Postprocess | Result |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| `test_audio_short.wav` | **1.624155 s** | 0.437610 s | 0.366570 s | 1.342250 s | 0.199665 s | 0.002160 s | 4 speakers, 49 segments |
-| `test_audio.wav` | **11.061990 s** | 2.990445 s | 3.005755 s | 9.594440 s | 1.354415 s | 0.003830 s | 9 speakers, 137 segments |
+| `test_audio_short.wav` | **1.575650 s** | 0.412185 s | 0.402515 s | 1.304150 s | 0.204210 s | 0.001535 s | 4 speakers, 49 segments |
+| `test_audio.wav` | **10.573895 s** | 2.629995 s | 3.055250 s | 9.276500 s | 1.224510 s | 0.004015 s | 9 speakers, 137 segments |
 
-The long median is 3.938 seconds below the 15-second stretch target and
-1.062 seconds above the aspirational 10-second target. The production CAM++
+The long median is 4.426 seconds below the 15-second stretch target and
+0.574 seconds above the aspirational 10-second target. The production CAM++
 graph now combines `tile4-fold` FCM, `direct-tile8-wg96` initial TDNN,
 `direct-tile4-wg128` dense bottlenecks, and `chunk512` pointwise transits. The
 TDNN replaces cached tile-1 with a 96-lane workgroup that shares each input
@@ -87,10 +87,17 @@ streaming. The first B8 VAD batch establishes an immutable speech-window
 prefix. For every later VAD dispatch, the worker submits VAD first and then up
 to two full B16 CAM++ batches on the second device. Partial CAM batches remain
 staged until EOF, so inference count and output ordering stay identical to the
-sequential pipeline. Against the immediately preceding cooled 12.05-12.21
-second checkpoint, the 11.062-second median is roughly 9% faster. This retains
-24,845,312 additional explicit GPU-buffer bytes for VAD; the measured long-file
-logical CPU peak remains 9.82 MB.
+sequential pipeline. Against the preceding cooled 12.05-12.21-second checkpoint,
+the dual-device scheduler's 11.062-second median was roughly 9% faster.
+
+The current checkpoint additionally tiles the LSTM input-affine term across
+four independent frames and leaves only the hidden-state term in the serial
+recurrent kernel. The raw B8 VAD call fell from 48.7475 to 35.2525 ms wall
+(27.68%) with a byte-identical output. Its 19,300,352-byte FP32 preactivation
+arena raises exact VAD ownership from 24,845,312 to 44,145,664 bytes. A
+persistent unordered-pair bitset also lowers long-file clustering by about
+0.1 seconds. Together they move the full median from 11.061990 to 10.573895
+seconds while the measured logical CPU peak remains 9.82 MB.
 
 The TDNN's cached baseline measured 3.080192 ms; `direct-tile8-wg96` measured
 0.655360-0.720896 ms and delivered a 22.806528 ms nine-run pooled full-graph
@@ -102,10 +109,14 @@ results remain documented in the raw runtime README and retained artifacts.
 Long-file UMAP now performs row normalization and deterministic 64-neighbor
 seed discovery as one warmed operation in the fixed clustering WASM arena. On
 the 5,713-row reference fixture, seed construction fell from 395.021 ms to
-179.750 ms while returning byte-identical indices and similarities. Three
-complete hybrid clustering trials took 1.424-1.437 seconds with byte-identical
-final labels and ARI 1.0. The production long-file clustering stage consequently
-fell from 1.766425 seconds to 1.497055 seconds in the isolated acceptance run.
+179.750 ms while returning byte-identical indices and similarities. Refinement
+now records each evaluated unordered row pair in a 2,039,544-byte bitset. Its
+six-trial median fell from 253.45 to 160.24 ms (36.8%) because reverse and
+cross-iteration duplicates can be skipped exactly; fixture labels remain
+byte-identical with ARI 1.0. Reusing one UMAP distance power in the positive
+edge update also removes a redundant transcendental. Current warmed complete
+clustering trials take about 1.23 seconds, and the accepted long-file median
+stage is 1.224510 seconds versus 1.354415 seconds at the preceding checkpoint.
 
 A thermally contended raw-graph A/B measured B16 at 59.5317 ms per 16 items
 and B32 at 115.5783 ms per 32 items. B32 improved per-item throughput by only
@@ -144,13 +155,14 @@ and its native labels scatter. The evidence therefore favors eight meaningful
 speakers. Senko does not add fixture-specific label or count forcing to obtain
 that result; the browser retains the native postprocessing semantics.
 
-The fused WASM seed lowers long-file logical working memory while leaving the
-fixed WASM heap and explicit GPU-buffer ceiling unchanged:
+The clustering pair bitset adds 2 MiB to the fixed WASM heap while the LSTM
+input-affine arena adds 19,300,352 bytes to exact GPU ownership. Known CPU
+peaks are unchanged:
 
 | Fixture | Known CPU peak | Explicit GPU-buffer peak | Fixed WASM heaps | Isolated page + worker diagnostic |
 | --- | ---: | ---: | ---: | ---: |
-| `test_audio_short.wav` | 7,351,392 B | 64,700,672 B | 9,961,472 B | not re-sampled at this checkpoint |
-| `test_audio.wav` | 9,824,264 B | 64,700,672 B | 9,961,472 B | 12,270,537 B post-run-1 baseline |
+| `test_audio_short.wav` | 7,351,392 B | 84,001,024 B | 12,058,624 B | not sampled at this checkpoint |
+| `test_audio.wav` | 9,824,264 B | 84,001,024 B | 12,058,624 B | 14,382,021 B post-run-1 baseline |
 
 These columns are complementary measurements and must not be added together.
 The page value is Chrome's coarse `measureUserAgentSpecificMemory()` result for
@@ -159,14 +171,14 @@ new isolated Chrome profile with one tab, so it excludes the user's other
 Chrome windows and tabs. The 118,273,444-byte long-file `Blob` is externally
 held and streamed without making a file-sized copy; it is therefore reported
 separately from `knownCpuPeakBytes`. The long run's largest named CPU working
-allocation is 5,117,336 bytes for clustering.
+allocation is 5,117,448 bytes for clustering.
 
 Production's fixed ownership is 9,824,264 bytes at the known long-file CPU
-peak, 64,700,672 bytes of explicit GPU buffers, and 9,961,472 bytes across the
-fixed WASM heaps. The GPU total is exactly 24,845,312 bytes for B8 VAD plus
+peak, 84,001,024 bytes of explicit GPU buffers, and 12,058,624 bytes across the
+fixed WASM heaps. The GPU total is exactly 44,145,664 bytes for B8 VAD plus
 39,855,360 bytes for B16 CAM++. The external zero-copy audio `Blob` is
 118,273,444 bytes. The retained-memory protocol below measured the comparable
-post-GC page-agent baseline near 12.27 MB; Chrome's coarse page samples and the
+post-GC page-agent baseline near 14.38 MB; Chrome's coarse page samples and the
 exact logical allocation ledger answer different questions.
 
 The ring adds the named `camOutputBatchBytes = 24,576` host allocation for two
@@ -177,9 +189,9 @@ the second readback slot.
 
 The current long-file retained-memory diagnostic processed the same input twice
 in one isolated page and worker while both WebGPU models remained resident.
-Chrome measured 12,270,537 bytes after run 1 and 12,275,926 bytes after run 2:
-a **+5,389-byte delta (0.044%)**. The two non-acceptance runs were 11.061215 and
-11.080795 seconds. This is small enough to be Chrome measurement/collection
+Chrome measured 14,382,021 bytes after run 1 and 14,388,292 bytes after run 2:
+a **+6,271-byte delta (0.044%)**. The two non-acceptance runs were 10.595130 and
+10.671680 seconds. This is small enough to be Chrome measurement/collection
 noise and shows no material per-run accumulation. Page-memory and
 retained-memory modes are diagnostic only; their timings are not used in the
 three-run acceptance median.
@@ -297,7 +309,8 @@ node web/scripts/benchmark/run-browser-diagnostic.mjs \
   --remove-profile
 ```
 
-Three initial two-CAM isolated runs saved 15.17-22.41 ms per balanced group
+At the pre-input-affine-LSTM checkpoint, three initial two-CAM isolated runs
+saved 15.17-22.41 ms per balanced group
 (1.187-1.266x; median 19.98 ms and 1.238x), with bit-exact outputs, stable
 late/early timing, 64,700,672 bytes of summed explicit GPU buffers, and about
 11.75 MB of page-agent memory. Chrome consumes each `GPUAdapter` handle after

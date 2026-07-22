@@ -90,12 +90,12 @@ evaluation mode.
 The manifest records exact byte counts under
 `models.segmentation.split.buffer_bytes_by_batch`. Useful values are:
 
-| Batch | Waveform | First-conv activation | Frontend output | Recurrent output | Two recurrent ping-pong buffers | Hidden + cell per layer | Logits |
+| Batch | Waveform | First-conv activation | Frontend output | Recurrent output | Two recurrent ping-pong buffers | Input-affine scratch | Logits |
 |---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 640,000 | 5,112,000 | 141,360 | 603,136 | 1,206,272 | 2,048 | 16,492 |
-| 8 | 5,120,000 | 40,896,000 | 1,130,880 | 4,825,088 | 9,650,176 | 16,384 | 131,936 |
-| 16 | 10,240,000 | 81,792,000 | 2,261,760 | 9,650,176 | 19,300,352 | 32,768 | 263,872 |
-| 32 | 20,480,000 | 163,584,000 | 4,523,520 | 19,300,352 | 38,600,704 | 65,536 | 527,744 |
+| 1 | 640,000 | 5,112,000 | 141,360 | 603,136 | 1,206,272 | 2,412,544 | 16,492 |
+| 8 | 5,120,000 | 40,896,000 | 1,130,880 | 4,825,088 | 9,650,176 | 19,300,352 | 131,936 |
+| 16 | 10,240,000 | 81,792,000 | 2,261,760 | 9,650,176 | 19,300,352 | 38,600,704 | 263,872 |
+| 32 | 20,480,000 | 163,584,000 | 4,523,520 | 19,300,352 | 38,600,704 | 77,201,408 | 527,744 |
 
 B32 fits the target M3 after requesting its maximum storage-buffer limit, but
 measured throughput favors B8: B8 settles at 106.8 ms per batch while B16 takes
@@ -107,16 +107,21 @@ allocation.
 
 ## Browser runtime implementation
 
-The shipping kernel uses one 128-invocation workgroup for each
-`(batch,direction)` pair and one dispatch per layer. Each invocation owns one
-hidden index and computes its four IFGO rows. Load the current input vector and
-128-element hidden vector into workgroup memory, synchronize, evaluate all four
-dot products, update cell/hidden state, synchronize, and advance to the next
-frame. Both directions can run in the same dispatch because they write disjoint
-halves of the output feature axis. Each layer uses its own compute pass in one
-command encoder; the pass boundary provides storage visibility before the next
-layer reads the ping-pong output. Within a frame, explicit workgroup barriers
-separate reads of the previous hidden state from writes of the new state.
+Production uses two dispatches per layer. The first evaluates the independent
+`bias_ih + bias_hh + W_ih*x_t` prefix across every frame. A 256-invocation
+workgroup tiles four frames, loads each packed FP16 weight vector once, and
+retains four independent FP32 accumulation chains. It writes a reusable FP32
+preactivation arena. The recurrent dispatch then uses one 256-invocation
+workgroup for each `(batch,direction)` pair; every invocation owns two gate
+rows and evaluates only `W_hh*h_(t-1)` before the state update. Both directions
+write disjoint halves of the output feature axis. Compute-pass boundaries make
+the preactivation arena and each layer's ping-pong output visible to its
+consumer.
+
+The split point is exactly between the original input and recurrent loops.
+Storing the already-FP32 input prefix does not reassociate either dot product,
+so the production output is byte-identical to the retained single-dispatch
+`persistent` diagnostic baseline.
 
 Metal fast-math can return a non-finite value for `tanh` on the trained cell
 states, which reach roughly 490 even though the result is fully saturated.
@@ -124,7 +129,7 @@ The WGSL implementation clamps sigmoid inputs to +/-30 and tanh inputs to
 +/-15. Both bounds are beyond float32 activation saturation and preserve the
 model result while avoiding that backend-specific non-finite path.
 
-The frontend input/output and recurrent tail input are persistent external GPU
+The older ORT split diagnostic keeps frontend input/output and recurrent tail input in external GPU
 tensors on ORT's own JSEP device. Graph capture is disabled: it regressed model
 throughput on Chrome/M3, and JSEP 1.27 did not reliably populate the tail's
 preallocated GPU output. The tail instead owns and downloads its final output,
@@ -133,9 +138,24 @@ readback. With production FP16 weights, explicitly owned buffers total
 4,748,464 bytes for B1 and 18,661,888 bytes for B8, excluding ORT's opaque
 internal arena and final output allocation.
 
-The packed matrix deliberately puts the input and recurrent columns next to
-each other so the inner loop is a single contiguous row read. A more optimized
-kernel can tile rows or vectorize loads without changing the artifact format.
+The packed matrix deliberately keeps input and recurrent columns in the same
+coalesced gate/column/hidden layout. The two production shaders consume their
+respective contiguous column ranges without changing the artifact format.
+
+## Input-affine split A/B
+
+Balanced isolated-Chrome B8 runs measured 14 settled samples per variant. The
+retained persistent baseline had pooled medians of 48.7475 ms wall and
+46.891008 ms GPU for the full raw VAD call. Production `input-affine-tile4`
+measured 35.2525 ms wall and 33.619968 ms GPU, saving 13.4950 ms wall (27.68%)
+and 13.27104 ms GPU (28.30%). The isolated LSTM stage fell from roughly
+34.2--35.4 ms to 20.7--21.2 ms.
+
+Both variants produced SHA-256
+`20c74873f618bd7f6b846f289a898a7bb8fdc44964eb8a80aa580944473b2323`,
+the same ORT error metrics, no non-finite values, and 4712/4712 matching frame
+argmax decisions. The speedup costs exactly 19,300,352 persistent GPU bytes at
+B8; the complete direct VAD now owns 44,145,664 bytes.
 
 ## FP16-weight A/B diagnostic
 
@@ -156,7 +176,7 @@ http://127.0.0.1:5173/ort-diagnostic.html?model=vad-compare&batch=8&verify=1&run
 http://127.0.0.1:5173/ort-diagnostic.html?model=vad-compare&batch=8&verify=1&runs=8&profile=1&lstm=f16
 ```
 
-At B8, FP16 reduces Senko-owned VAD buffers from 21,422,592 to 18,661,888
+On the retained pre-input-affine kernel, B8 FP16 reduces Senko-owned buffers from 21,422,592 to 18,661,888
 bytes (20.43 to 17.80 MiB). ORT's opaque frontend/tail allocations are
 unchanged. On Chrome/M3, FP32 settled at 95.9 ms per complete split run and
 59.2 ms for its profiled LSTM stage; FP16 settled at 82.8 ms and 45.2 ms,

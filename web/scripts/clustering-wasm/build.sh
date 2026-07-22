@@ -17,7 +17,7 @@ mkdir -p "$(dirname "$output")"
   -s STANDALONE_WASM=1 \
   -s FILESYSTEM=0 \
   -s ALLOW_MEMORY_GROWTH=0 \
-  -s INITIAL_MEMORY=9437184 \
+  -s INITIAL_MEMORY=11534336 \
   -s STACK_SIZE=65536 \
   -s EXPORTED_FUNCTIONS='["_cluster_reset","_cluster_alloc","_cluster_heap_base","_cluster_heap_capacity","_cluster_heap_used","_cluster_normalize_rows","_cluster_approximate_cosine_knn","_cluster_refine_euclidean_knn","_cluster_exact_euclidean_knn"]' \
   -Wl,--strip-all \

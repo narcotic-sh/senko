@@ -1022,6 +1022,14 @@ def pyannote_boundary_buffers(batch: int) -> dict[str, int]:
             * PYANNOTE_LSTM_OUTPUT_FEATURES
             * bytes_per_float
         ),
+        "input_affine_scratch_bytes": (
+            batch
+            * len(PYANNOTE_LSTM_DIRECTIONS)
+            * PYANNOTE_FRAMES
+            * len(PYANNOTE_LSTM_GATE_ORDER)
+            * PYANNOTE_LSTM_HIDDEN
+            * bytes_per_float
+        ),
         "hidden_and_cell_state_bytes_per_layer": (
             2
             * len(PYANNOTE_LSTM_DIRECTIONS)
@@ -1085,9 +1093,11 @@ def write_or_verify_direct_webgpu_vad(
     frontend_metadata_path = artifacts[1][0]
     tail_metadata_path = artifacts[3][0]
     recurrent_bytes = batch * PYANNOTE_FRAMES * PYANNOTE_LSTM_OUTPUT_FEATURES * 4
+    input_affine_scratch_bytes = 4 * recurrent_bytes
     lstm_gpu_bytes = (
         int(lstm_package["weights"]["bytes"])
         + 2 * recurrent_bytes
+        + input_affine_scratch_bytes
         + PYANNOTE_LSTM_LAYERS * 32
     )
     frontend_gpu_bytes = (

@@ -25,13 +25,18 @@ post-processing behavior without materializing an `N x N` matrix:
 
 The default LSH workload is bounded by six 8-bit tables and 64 candidates per
 bucket. Large same-speaker buckets are sampled across the full recording rather
-than exhaustively compared. The post-UMAP exact graph is quadratic in distance
+than exhaustively compared. Refinement retains one bit per unordered row pair
+so a 192-dimensional distance is never recomputed; that triangular bitset is
+2.04 MB for the 5,713-row fixture and grows quadratically in bits, not in
+floating-point distances. The post-UMAP exact graph is quadratic in distance
 computations but linear in retained memory.
 
 `onUmapStats` exposes stage timings and deterministic typed-array allocation
 accounting. On the native hour-long reference, the production WASM-assisted
 path's logical peak is about 5.1 MB including its 0.23 MB output. The fixed
-9 MiB WASM heap and caller-owned embeddings are reported separately.
+11 MiB WASM heap and caller-owned embeddings are reported separately.
+At the native 192D/seed-64/neighbor-20 shape, the fixed arena admits up to
+6,199 rows; production preflights the exact requirement before copying data.
 Process-level profiling is higher because it also includes V8 and downstream
 clustering allocations.
 

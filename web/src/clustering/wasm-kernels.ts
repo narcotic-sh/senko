@@ -277,6 +277,17 @@ export class WasmClusteringKernels implements ClusteringNumericKernels {
   ): NumericNeighborHeap {
     requireMatrix("embeddings", embeddings, count, dim);
     requireLength("seed indices", seedIndices, count * seedNeighborCount);
+    const requiredArenaBytes = refinementArenaBytes(
+      count,
+      dim,
+      seedNeighborCount,
+      neighborCount,
+    );
+    if (requiredArenaBytes > this.arenaCapacityBytes) {
+      throw new RangeError(
+        `Clustering WASM Euclidean refinement needs ${requiredArenaBytes} scratch bytes for ${count} rows; fixed arena capacity is ${this.arenaCapacityBytes}`,
+      );
+    }
     const exports = this.beginOperation();
     const embeddingsPointer = this.copyFloat32(exports, embeddings);
     const seedPointer = this.copyInt32(exports, seedIndices);
@@ -551,6 +562,26 @@ function requireLength(
       `${name} length ${values.length} does not match expected ${expected}`,
     );
   }
+}
+
+/** Exact wrapper-plus-kernel high-water mark for Euclidean refinement. */
+function refinementArenaBytes(
+  count: number,
+  dim: number,
+  seedNeighborCount: number,
+  neighborCount: number,
+): number {
+  const n = BigInt(count);
+  const d = BigInt(dim);
+  const seed = BigInt(seedNeighborCount);
+  const neighbors = BigInt(neighborCount);
+  const align16 = (bytes: bigint): bigint => (bytes + 15n) & ~15n;
+  const wrapperBytes = n * (4n * d + 4n * seed + 9n * neighbors);
+  const pairCount = (n * (n - 1n)) / 2n;
+  const pairBitsetBytes = 4n * ((pairCount + 31n) / 32n);
+  const afterBitset = align16(wrapperBytes) + pairBitsetBytes;
+  const afterSnapshotIndices = align16(afterBitset) + 4n * n * neighbors;
+  return Number(align16(afterSnapshotIndices) + n * neighbors);
 }
 
 function emptyKnnGraph(): NumericKnnGraph {

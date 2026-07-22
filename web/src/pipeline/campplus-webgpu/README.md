@@ -75,8 +75,8 @@ hour-long file that prefix is about 1.1 MB and is released immediately after it
 is copied into the final contiguous embedding array.
 
 Production keeps CAM++ and VAD resident together on separate WebGPU devices.
-The B8 VAD owns 24,845,312 GPU-buffer bytes and this B16 graph owns 39,855,360,
-for exact summed ownership of 64,700,672 bytes. Streaming scheduling submits
+The B8 VAD owns 44,145,664 GPU-buffer bytes and this B16 graph owns 39,855,360,
+for exact summed ownership of 84,001,024 bytes. Streaming scheduling submits
 VAD first, then overlaps up to two B16 CAM++ batches on this graph's two-slot
 queue while later VAD work continues on the other device. Both models remain
 resident through CPU clustering and across subsequent recordings. Their
@@ -133,12 +133,25 @@ reduced occupancy enough to outweigh the lower dispatch count. TDNN tile-16
 and tile-8/WG128 were likewise tested and rejected without retaining their
 experimental code.
 
+Several broader FlashAttention-style experiments were also measured and then
+fully removed. Encoding all 119 kernels into one compute pass preserved the
+fingerprint but changed whole-graph timing by less than 1%. A persistent dense
+kernel fit bottleneck scratch, mean reduction, attention state, and local K3
+weights into 30,912 bytes of workgroup storage and reduced the graph to 67
+dispatches; it was bit-exact, but one layer took 1.543 ms versus 0.686 ms split
+and the graph regressed from 23.622 to 35.868 ms because 16 long-lived
+workgroups exposed too little parallelism. F(2x2,3x3) Winograd retained cosine
+0.99999945 but raised FCM from 6.685 to 12.059 ms in its best geometry. A
+second B16 CAM++ device improved isolated CAM throughput by about 11%, but its
+39,855,360 additional GPU bytes projected to at most about 7% end-to-end, so it
+failed the memory trade gate. No code from these rejected paths remains.
+
 The latest cooled production acceptance median for the one-hour fixture is
-11.061990 seconds across 11.046020, 11.061990, and 11.186395-second runs. In the
-median run, VAD attributed 2.990445 seconds, CAM++ 9.594440 seconds,
-clustering 1.354415 seconds, postprocessing 0.003830 seconds, and FBank
-3.005755 seconds. These attributed intervals overlap and must not be summed.
-The short fixture completed in 1.624155 seconds with the exact expected
+10.573895 seconds across 10.558180, 10.573895, and 10.581985-second runs. In the
+median run, VAD attributed 2.629995 seconds, CAM++ 9.276500 seconds,
+clustering 1.224510 seconds, postprocessing 0.004015 seconds, and FBank
+3.055250 seconds. These attributed intervals overlap and must not be summed.
+The short fixture completed in 1.575650 seconds with the exact expected
 4-speaker/49-segment result. The long result passed the offline-Senko timeline
 gates with 9 speakers and 137 segments.
 Exact-boundary windows compared with native Core ML had mean embedding cosine

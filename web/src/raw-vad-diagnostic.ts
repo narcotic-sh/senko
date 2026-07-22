@@ -8,13 +8,17 @@ import {
   type SelectedSegmentationSplit,
 } from "./pipeline/model-manifest";
 import { configureOrt, OrtVadBackend } from "./pipeline/ort-backends";
-import { PersistentWebGpuLstm } from "./pipeline/persistent-lstm";
+import {
+  PersistentWebGpuLstm,
+  type PersistentLstmVariant,
+} from "./pipeline/persistent-lstm";
 import { RawPyannoteFrontendFoundation } from "./pipeline/pyannote-frontend-webgpu";
 import { RawPyannoteTail } from "./pipeline/pyannote-tail-webgpu";
 
 const parameters = new URLSearchParams(location.search);
 const BATCH = diagnosticBatch(parameters.get("batch"));
 const FRONTEND_MODE = diagnosticFrontendMode(parameters.get("frontend"));
+const LSTM_VARIANT = diagnosticLstmVariant(parameters.get("lstm-variant"));
 const SAMPLES = 160_000;
 const FRAMES = 589;
 const CLASSES = 7;
@@ -38,6 +42,16 @@ function diagnosticFrontendMode(
     );
   }
   return mode;
+}
+
+function diagnosticLstmVariant(source: string | null): PersistentLstmVariant {
+  const variant = source ?? "input-affine-tile4";
+  if (variant !== "persistent" && variant !== "input-affine-tile4") {
+    throw new Error(
+      `Raw VAD LSTM variant must be persistent or input-affine-tile4; received ${source}`,
+    );
+  }
+  return variant;
 }
 
 const element = document.querySelector<HTMLPreElement>("#output");
@@ -219,7 +233,7 @@ async function runRaw(
 }
 
 async function main(): Promise<void> {
-  output.textContent = `0.0 ms  Starting raw VAD B${BATCH}`;
+  output.textContent = `0.0 ms  Starting raw VAD B${BATCH} (${LSTM_VARIANT})`;
   if (navigator.gpu === undefined) throw new Error("WebGPU unavailable");
   const adapter = await requestMaximumPerformanceAdapter(navigator.gpu);
   if (!adapter.features.has("shader-f16")) {
@@ -273,6 +287,8 @@ async function main(): Promise<void> {
     frontend.frontendOutputBuffer,
     selected.weights,
     selected.metadata,
+    undefined,
+    LSTM_VARIANT,
   );
   const tail = await RawPyannoteTail.create(
     device,
@@ -351,6 +367,8 @@ async function main(): Promise<void> {
 
   const lstmLayerProfiles: Array<{
     layerMs: readonly [number, number, number, number];
+    inputAffineMs?: readonly [number, number, number, number];
+    recurrentMs?: readonly [number, number, number, number];
     totalMs: number;
   }> = [];
   for (let profile = 0; profile < 5; profile += 1) {
@@ -360,25 +378,69 @@ async function main(): Promise<void> {
     device.queue.submit([frontendEncoder.finish()]);
     await device.queue.onSubmittedWorkDone();
 
-    const measured: number[] = [];
-    for (let layer = 0; layer < 4; layer += 1) {
-      const layerStarted = performance.now();
-      const layerEncoder = device.createCommandEncoder();
-      lstm.encodeLayer(layerEncoder, layer);
-      device.queue.submit([layerEncoder.finish()]);
-      await device.queue.onSubmittedWorkDone();
-      measured.push(performance.now() - layerStarted);
+    if (LSTM_VARIANT === "persistent") {
+      const measured: number[] = [];
+      for (let layer = 0; layer < 4; layer += 1) {
+        const layerStarted = performance.now();
+        const layerEncoder = device.createCommandEncoder();
+        lstm.encodeLayer(layerEncoder, layer);
+        device.queue.submit([layerEncoder.finish()]);
+        await device.queue.onSubmittedWorkDone();
+        measured.push(performance.now() - layerStarted);
+      }
+      const layerMs = [
+        measured[0]!,
+        measured[1]!,
+        measured[2]!,
+        measured[3]!,
+      ] as const;
+      lstmLayerProfiles.push({
+        layerMs,
+        totalMs: layerMs.reduce((sum, value) => sum + value, 0),
+      });
+    } else {
+      const inputAffineMeasured: number[] = [];
+      const recurrentMeasured: number[] = [];
+      for (let layer = 0; layer < 4; layer += 1) {
+        const inputAffineStarted = performance.now();
+        const inputAffineEncoder = device.createCommandEncoder();
+        lstm.encodeInputAffineLayer(inputAffineEncoder, layer);
+        device.queue.submit([inputAffineEncoder.finish()]);
+        await device.queue.onSubmittedWorkDone();
+        inputAffineMeasured.push(performance.now() - inputAffineStarted);
+
+        const recurrentStarted = performance.now();
+        const recurrentEncoder = device.createCommandEncoder();
+        lstm.encodeRecurrentLayer(recurrentEncoder, layer);
+        device.queue.submit([recurrentEncoder.finish()]);
+        await device.queue.onSubmittedWorkDone();
+        recurrentMeasured.push(performance.now() - recurrentStarted);
+      }
+      const inputAffineMs = [
+        inputAffineMeasured[0]!,
+        inputAffineMeasured[1]!,
+        inputAffineMeasured[2]!,
+        inputAffineMeasured[3]!,
+      ] as const;
+      const recurrentMs = [
+        recurrentMeasured[0]!,
+        recurrentMeasured[1]!,
+        recurrentMeasured[2]!,
+        recurrentMeasured[3]!,
+      ] as const;
+      const layerMs = [
+        inputAffineMs[0] + recurrentMs[0],
+        inputAffineMs[1] + recurrentMs[1],
+        inputAffineMs[2] + recurrentMs[2],
+        inputAffineMs[3] + recurrentMs[3],
+      ] as const;
+      lstmLayerProfiles.push({
+        layerMs,
+        inputAffineMs,
+        recurrentMs,
+        totalMs: layerMs.reduce((sum, value) => sum + value, 0),
+      });
     }
-    const layerMs = [
-      measured[0]!,
-      measured[1]!,
-      measured[2]!,
-      measured[3]!,
-    ] as const;
-    lstmLayerProfiles.push({
-      layerMs,
-      totalMs: layerMs.reduce((sum, value) => sum + value, 0),
-    });
   }
 
   const gpuBytes = {
@@ -437,6 +499,7 @@ async function main(): Promise<void> {
     ok,
     batchSize: BATCH,
     frontendMode: FRONTEND_MODE,
+    lstmVariant: LSTM_VARIANT,
     timestampQuery,
     outputSha256,
     comparison,
@@ -472,7 +535,7 @@ async function main(): Promise<void> {
       productionVadLogits: BATCH * FRAMES * CLASSES * 4,
       productionLogicalLive:
         320_000 + waveform.byteLength + BATCH * FRAMES * CLASSES * 4,
-      productionFixedWasmHeaps: 9_961_472,
+      productionFixedWasmHeaps: 12_058_624,
     },
   };
   referenceDevice.destroy();

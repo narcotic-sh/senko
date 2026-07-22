@@ -6,7 +6,7 @@
 
 namespace {
 
-constexpr uint32_t kArenaBytes = 8u * 1024u * 1024u;
+constexpr uint32_t kArenaBytes = 10u * 1024u * 1024u;
 alignas(16) uint8_t arena[kArenaBytes];
 uint32_t arena_cursor = 0;
 
@@ -197,6 +197,23 @@ int heap_push(NeighborHeap heap, int row, double distance, int index,
   heap.indices[offset + position] = index;
   heap.is_new[offset + position] = flag;
   return 1;
+}
+
+bool mark_unordered_pair(uint32_t* evaluated_pairs, int count, int left,
+                         int right) {
+  if (left == right) return false;
+  const uint32_t lower = static_cast<uint32_t>(left < right ? left : right);
+  const uint32_t upper = static_cast<uint32_t>(left < right ? right : left);
+  const uint64_t pair_index =
+      static_cast<uint64_t>(lower) *
+          (static_cast<uint64_t>(count) * 2u - lower - 1u) /
+          2u +
+      upper - lower - 1u;
+  const uint32_t word = static_cast<uint32_t>(pair_index >> 5u);
+  const uint32_t mask = 1u << static_cast<uint32_t>(pair_index & 31u);
+  if ((evaluated_pairs[word] & mask) != 0u) return false;
+  evaluated_pairs[word] |= mask;
+  return true;
 }
 
 }  // namespace
@@ -393,13 +410,25 @@ EMSCRIPTEN_KEEPALIVE int cluster_refine_euclidean_knn(
   }
   NeighborHeap heap{output_indices, output_distances, output_is_new,
                     neighbor_count};
+  const uint64_t pair_count =
+      static_cast<uint64_t>(count) * static_cast<uint64_t>(count - 1) / 2u;
+  const uint64_t pair_word_count_64 = (pair_count + 31u) / 32u;
+  if (pair_word_count_64 > UINT32_MAX) return -2;
+  const uint32_t pair_word_count =
+      static_cast<uint32_t>(pair_word_count_64);
+  uint32_t* evaluated_pairs = allocate_items<uint32_t>(pair_word_count);
+  if (!evaluated_pairs) return -2;
+  memset(evaluated_pairs, 0, pair_word_count * sizeof(uint32_t));
   DeterministicRandom random{random_seed};
   for (int row = 0; row < count; ++row) {
     heap_push(heap, row, 0.0, row, 1);
     const int seed_offset = row * seed_neighbor_count;
     for (int rank = 0; rank < seed_neighbor_count; ++rank) {
       const int candidate = seed_indices[seed_offset + rank];
-      if (candidate < 0) continue;
+      if (candidate < 0 || candidate >= count ||
+          !mark_unordered_pair(evaluated_pairs, count, row, candidate)) {
+        continue;
+      }
       const double distance = euclidean(embeddings + row * dim,
                                         embeddings + candidate * dim, dim);
       heap_push(heap, row, distance, candidate, 1);
@@ -407,6 +436,9 @@ EMSCRIPTEN_KEEPALIVE int cluster_refine_euclidean_knn(
     }
     for (int sample = 0; sample < 4; ++sample) {
       const int candidate = static_cast<int>(floor(random.next() * count));
+      if (!mark_unordered_pair(evaluated_pairs, count, row, candidate)) {
+        continue;
+      }
       const double distance = euclidean(embeddings + row * dim,
                                         embeddings + candidate * dim, dim);
       heap_push(heap, row, distance, candidate, 1);
@@ -416,9 +448,7 @@ EMSCRIPTEN_KEEPALIVE int cluster_refine_euclidean_knn(
 
   int32_t* snapshot_indices = allocate_items<int32_t>(length);
   uint8_t* snapshot_flags = allocate_items<uint8_t>(length);
-  int32_t* candidate_stamps = allocate_items<int32_t>(count);
-  if (!snapshot_indices || !snapshot_flags || !candidate_stamps) return -2;
-  memset(candidate_stamps, 0, count * sizeof(int32_t));
+  if (!snapshot_indices || !snapshot_flags) return -2;
   const int convergence_limit =
       static_cast<int>(floor(0.001 * neighbor_count * count)) > 1
           ? static_cast<int>(floor(0.001 * neighbor_count * count))
@@ -429,7 +459,6 @@ EMSCRIPTEN_KEEPALIVE int cluster_refine_euclidean_knn(
     memset(output_is_new, 0, length * sizeof(uint8_t));
     int changes = 0;
     for (int row = 0; row < count; ++row) {
-      const int candidate_stamp = iteration * count + row + 1;
       const int row_offset = row * neighbor_count;
       for (int rank = 0; rank < neighbor_count; ++rank) {
         const int pivot_offset = row_offset + rank;
@@ -445,12 +474,14 @@ EMSCRIPTEN_KEEPALIVE int cluster_refine_euclidean_knn(
               (!pivot_is_new && snapshot_flags[candidate_offset] == 0)) {
             continue;
           }
-          // A heap's maximum retained distance can only decrease. After one
-          // attempt for this row/candidate pair, every duplicate attempt in
-          // the same snapshot pass is therefore guaranteed to return zero.
-          // Skipping it preserves heaps, flags, and the convergence count.
-          if (candidate_stamps[candidate] == candidate_stamp) continue;
-          candidate_stamps[candidate] = candidate_stamp;
+          // Every distance attempt updates both endpoint heaps, and a heap's
+          // maximum retained distance can only decrease. Once an unordered
+          // pair has been attempted, every later attempt in either direction
+          // is therefore guaranteed to return zero. This remains true across
+          // snapshot iterations as well as within one row.
+          if (!mark_unordered_pair(evaluated_pairs, count, row, candidate)) {
+            continue;
+          }
           const double distance = euclidean(embeddings + row * dim,
                                             embeddings + candidate * dim, dim);
           changes += heap_push(heap, row, distance, candidate, 1);

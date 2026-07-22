@@ -61,7 +61,7 @@ function segmentationModel(): BrowserSegmentationModel {
               bytes: 80,
               sha256: "e".repeat(64),
             },
-            explicit_gpu_bytes: 24_845_312,
+            explicit_gpu_bytes: 44_145_664,
           },
         },
       },
@@ -73,6 +73,7 @@ function segmentationModel(): BrowserSegmentationModel {
           recurrent_output_bytes: 4_825_088,
           tail_output_bytes: 131_936,
           two_recurrent_ping_pong_buffers_bytes: 9_650_176,
+          input_affine_scratch_bytes: 19_300_352,
           hidden_and_cell_state_bytes_per_layer: 16_384,
         },
       },
@@ -154,7 +155,7 @@ describe("model manifest selection", () => {
     expect(selected.directWebGpu.tailMetadata.url).toBe(
       "https://example.test/models/tail-webgpu.json",
     );
-    expect(selected.directWebGpu.explicitGpuBytes).toBe(24_845_312);
+    expect(selected.directWebGpu.explicitGpuBytes).toBe(44_145_664);
     expect(selected.declaredBufferBytes.first_convolution_activation_bytes).toBe(
       40_896_000,
     );
