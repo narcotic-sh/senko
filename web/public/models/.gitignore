@@ -1,0 +1,13 @@
+# Generated deployment payloads. Recreate them with
+# `web/scripts/models/export_models.py`; do not commit local exports.
+*.onnx
+*.onnx.incomplete
+*.bin
+*.bin.incomplete
+
+# Generated descriptors/manifests paired with the payloads above.
+pyannote-segmentation-3.0-lstm*.json
+pyannote-segmentation-3.0-frontend-webgpu*.json
+pyannote-segmentation-3.0-tail-webgpu*.json
+campplus-t150-webgpu-*.json
+manifest.json

@@ -1,0 +1,17 @@
+[project]
+name = "senko-browser-model-tools"
+version = "0.1.0"
+description = "Reproducible ONNX exports for Senko's browser runtime"
+requires-python = "==3.13.*"
+dependencies = [
+    "numpy==2.3.5",
+    "onnx==1.22.0",
+    "onnxconverter-common==1.16.0",
+    "onnxruntime==1.27.0",
+    "pyannote-audio==3.4.0",
+    "torch==2.8.0",
+    "torchaudio==2.8.0",
+]
+
+[tool.uv]
+package = false

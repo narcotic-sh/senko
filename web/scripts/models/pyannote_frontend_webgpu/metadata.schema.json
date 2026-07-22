@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://senko.invalid/schemas/pyannote-frontend-webgpu-pack-v1.json",
+  "title": "Senko pyannote frontend direct-WebGPU package metadata",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "format_version",
+    "source",
+    "binary",
+    "contract",
+    "inventory",
+    "compute",
+    "memory",
+    "sections",
+    "fused_program"
+  ],
+  "properties": {
+    "schema": { "const": "senko.pyannote-frontend.webgpu-pack" },
+    "format_version": { "const": 1 },
+    "source": { "type": "object" },
+    "binary": { "type": "object" },
+    "contract": { "type": "object" },
+    "inventory": { "type": "object" },
+    "compute": { "type": "object" },
+    "memory": { "type": "object" },
+    "sections": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "kind",
+          "byte_offset",
+          "byte_length",
+          "element_count",
+          "dtype",
+          "logical_shape",
+          "packed_shape",
+          "layout",
+          "source_tensors"
+        ],
+        "properties": {
+          "id": { "type": "string" },
+          "kind": { "enum": ["conv_weight", "conv_bias", "instance_norm_affine"] },
+          "byte_offset": { "type": "integer", "minimum": 256, "multipleOf": 256 },
+          "byte_length": { "type": "integer", "minimum": 1 },
+          "element_count": { "type": "integer", "minimum": 1 },
+          "dtype": { "enum": ["float16", "float32"] },
+          "logical_shape": { "type": "array", "items": { "type": "integer", "minimum": 1 } },
+          "packed_shape": { "type": "array", "items": { "type": "integer", "minimum": 1 } },
+          "layout": { "enum": ["K_I_O4_O", "O4", "C4_GAMMA_BETA"] },
+          "source_tensors": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    },
+    "fused_program": { "type": "object" }
+  }
+}

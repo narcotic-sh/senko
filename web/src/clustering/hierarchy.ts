@@ -1,0 +1,317 @@
+import type { KnnGraph } from "./knn";
+
+interface DensityCluster {
+  readonly treeNode: number;
+  readonly birthLambda: number;
+  stability: number;
+  readonly children: DensityCluster[];
+  selected: boolean;
+}
+
+interface Dendrogram {
+  readonly root: number;
+  readonly left: Int32Array;
+  readonly right: Int32Array;
+  readonly sizes: Int32Array;
+  readonly distances: Float64Array;
+}
+
+/**
+ * Extract HDBSCAN-style clusters from a sparse k-NN graph.
+ *
+ * This follows the reference algorithm's mutual-reachability MST, condensed
+ * hierarchy and excess-of-mass selection. The approximation is confined to
+ * neighbor discovery; hierarchy construction itself is deterministic.
+ */
+export function clusterSparseGraph(
+  graph: KnnGraph,
+  count: number,
+  minSamples: number,
+  minClusterSize: number,
+): Int32Array {
+  if (count === 0) {
+    return new Int32Array();
+  }
+  if (count < minClusterSize || graph.neighborCount === 0) {
+    return new Int32Array(count);
+  }
+
+  const coreDistances = calculateCoreDistances(graph, count, minSamples);
+  const dendrogram = buildDendrogram(graph, count, coreDistances);
+  const rootCluster: DensityCluster = {
+    treeNode: dendrogram.root,
+    birthLambda: 0,
+    stability: 0,
+    children: [],
+    selected: false,
+  };
+  condense(
+    dendrogram.root,
+    rootCluster,
+    dendrogram,
+    minClusterSize,
+  );
+
+  // HDBSCAN excludes the all-points root unless allow_single_cluster is set.
+  // Senko's post-processing then naturally turns an all-noise result into one
+  // cluster, matching the Python pipeline's behavior.
+  for (const child of rootCluster.children) {
+    selectExcessOfMass(child);
+  }
+
+  const labels = new Int32Array(count);
+  labels.fill(-1);
+  let nextLabel = 0;
+  const stack: DensityCluster[] = [...rootCluster.children].reverse();
+  while (stack.length > 0) {
+    const cluster = stack.pop()!;
+    if (cluster.selected) {
+      labelSubtree(cluster.treeNode, nextLabel, labels, dendrogram, count);
+      nextLabel += 1;
+      continue;
+    }
+    for (let i = cluster.children.length - 1; i >= 0; i -= 1) {
+      stack.push(cluster.children[i]!);
+    }
+  }
+  return labels;
+}
+
+function calculateCoreDistances(
+  graph: KnnGraph,
+  count: number,
+  minSamples: number,
+): Float64Array {
+  const result = new Float64Array(count);
+  const rank = Math.min(minSamples, graph.neighborCount) - 1;
+  for (let row = 0; row < count; row += 1) {
+    const similarity = graph.similarities[row * graph.neighborCount + rank]!;
+    result[row] = Number.isFinite(similarity) ? Math.max(0, 1 - similarity) : 2;
+  }
+  return result;
+}
+
+function buildDendrogram(
+  graph: KnnGraph,
+  count: number,
+  coreDistances: Float64Array,
+): Dendrogram {
+  const directedEdgeCount = count * graph.neighborCount;
+  const edgeFrom = new Int32Array(directedEdgeCount);
+  const edgeTo = new Int32Array(directedEdgeCount);
+  const edgeWeight = new Float64Array(directedEdgeCount);
+  const order: number[] = [];
+
+  for (let from = 0; from < count; from += 1) {
+    const offset = from * graph.neighborCount;
+    for (let rank = 0; rank < graph.neighborCount; rank += 1) {
+      const edge = offset + rank;
+      const to = graph.indices[edge]!;
+      if (to < 0 || to === from) {
+        continue;
+      }
+      const distance = Math.max(0, 1 - graph.similarities[edge]!);
+      edgeFrom[edge] = from;
+      edgeTo[edge] = to;
+      edgeWeight[edge] = Math.max(coreDistances[from]!, coreDistances[to]!, distance);
+      order.push(edge);
+    }
+  }
+  order.sort((left, right) => {
+    const difference = edgeWeight[left]! - edgeWeight[right]!;
+    if (difference !== 0) {
+      return difference;
+    }
+    const fromDifference = edgeFrom[left]! - edgeFrom[right]!;
+    return fromDifference !== 0 ? fromDifference : edgeTo[left]! - edgeTo[right]!;
+  });
+
+  const maximumNodes = count * 2;
+  const left = new Int32Array(maximumNodes);
+  const right = new Int32Array(maximumNodes);
+  left.fill(-1);
+  right.fill(-1);
+  const sizes = new Int32Array(maximumNodes);
+  const distances = new Float64Array(maximumNodes);
+  const parent = new Int32Array(count);
+  const componentSize = new Int32Array(count);
+  const componentNode = new Int32Array(count);
+  for (let i = 0; i < count; i += 1) {
+    parent[i] = i;
+    componentSize[i] = 1;
+    componentNode[i] = i;
+    sizes[i] = 1;
+  }
+
+  let nextNode = count;
+  let maximumWeight = 0;
+  for (const edge of order) {
+    let fromRoot = findRoot(parent, edgeFrom[edge]!);
+    let toRoot = findRoot(parent, edgeTo[edge]!);
+    if (fromRoot === toRoot) {
+      continue;
+    }
+    if (componentSize[fromRoot]! < componentSize[toRoot]!) {
+      const swap = fromRoot;
+      fromRoot = toRoot;
+      toRoot = swap;
+    }
+    const node = nextNode;
+    nextNode += 1;
+    left[node] = componentNode[fromRoot]!;
+    right[node] = componentNode[toRoot]!;
+    sizes[node] = componentSize[fromRoot]! + componentSize[toRoot]!;
+    const weight = edgeWeight[edge]!;
+    distances[node] = weight;
+    maximumWeight = Math.max(maximumWeight, weight);
+
+    parent[toRoot] = fromRoot;
+    componentSize[fromRoot] = sizes[node]!;
+    componentNode[fromRoot] = node;
+    if (sizes[node] === count) {
+      break;
+    }
+  }
+
+  // Approximate-neighbor graphs can be disconnected. Join their trees at a
+  // distance outside the observed graph, which preserves every component as a
+  // separate high-level density branch.
+  const roots: number[] = [];
+  for (let i = 0; i < count; i += 1) {
+    if (findRoot(parent, i) === i) {
+      roots.push(i);
+    }
+  }
+  let rootNode = componentNode[roots[0]!]!;
+  const bridgeDistance = Math.max(2, maximumWeight + 1e-6);
+  for (let i = 1; i < roots.length; i += 1) {
+    const otherNode = componentNode[roots[i]!]!;
+    const node = nextNode;
+    nextNode += 1;
+    left[node] = rootNode;
+    right[node] = otherNode;
+    sizes[node] = sizes[rootNode]! + sizes[otherNode]!;
+    distances[node] = bridgeDistance;
+    rootNode = node;
+  }
+
+  return { root: rootNode, left, right, sizes, distances };
+}
+
+function condense(
+  node: number,
+  cluster: DensityCluster,
+  dendrogram: Dendrogram,
+  minClusterSize: number,
+): void {
+  if (dendrogram.left[node]! < 0) {
+    return;
+  }
+  const left = dendrogram.left[node]!;
+  const right = dendrogram.right[node]!;
+  const lambda = distanceToLambda(dendrogram.distances[node]!);
+  const leftLarge = dendrogram.sizes[left]! >= minClusterSize;
+  const rightLarge = dendrogram.sizes[right]! >= minClusterSize;
+
+  if (leftLarge && rightLarge) {
+    cluster.stability +=
+      dendrogram.sizes[node]! * Math.max(0, lambda - cluster.birthLambda);
+    const leftCluster: DensityCluster = {
+      treeNode: left,
+      birthLambda: lambda,
+      stability: 0,
+      children: [],
+      selected: false,
+    };
+    const rightCluster: DensityCluster = {
+      treeNode: right,
+      birthLambda: lambda,
+      stability: 0,
+      children: [],
+      selected: false,
+    };
+    cluster.children.push(leftCluster, rightCluster);
+    condense(left, leftCluster, dendrogram, minClusterSize);
+    condense(right, rightCluster, dendrogram, minClusterSize);
+    return;
+  }
+
+  if (leftLarge) {
+    cluster.stability +=
+      dendrogram.sizes[right]! * Math.max(0, lambda - cluster.birthLambda);
+    condense(left, cluster, dendrogram, minClusterSize);
+    return;
+  }
+  if (rightLarge) {
+    cluster.stability +=
+      dendrogram.sizes[left]! * Math.max(0, lambda - cluster.birthLambda);
+    condense(right, cluster, dendrogram, minClusterSize);
+    return;
+  }
+
+  cluster.stability +=
+    dendrogram.sizes[node]! * Math.max(0, lambda - cluster.birthLambda);
+}
+
+function selectExcessOfMass(cluster: DensityCluster): number {
+  if (cluster.children.length === 0) {
+    cluster.selected = true;
+    return cluster.stability;
+  }
+  let descendantsStability = 0;
+  for (const child of cluster.children) {
+    descendantsStability += selectExcessOfMass(child);
+  }
+  if (cluster.stability >= descendantsStability) {
+    clearSelection(cluster.children);
+    cluster.selected = true;
+    return cluster.stability;
+  }
+  return descendantsStability;
+}
+
+function clearSelection(clusters: readonly DensityCluster[]): void {
+  for (const cluster of clusters) {
+    cluster.selected = false;
+    clearSelection(cluster.children);
+  }
+}
+
+function labelSubtree(
+  treeNode: number,
+  label: number,
+  labels: Int32Array,
+  dendrogram: Dendrogram,
+  leafCount: number,
+): void {
+  const stack = [treeNode];
+  while (stack.length > 0) {
+    const node = stack.pop()!;
+    if (node < leafCount) {
+      // A selected ancestor always wins; selected clusters are disjoint.
+      if (labels[node]! < 0) {
+        labels[node] = label;
+      }
+      continue;
+    }
+    stack.push(dendrogram.right[node]!, dendrogram.left[node]!);
+  }
+}
+
+function findRoot(parent: Int32Array, value: number): number {
+  let root = value;
+  while (parent[root] !== root) {
+    root = parent[root]!;
+  }
+  let cursor = value;
+  while (parent[cursor] !== cursor) {
+    const next = parent[cursor]!;
+    parent[cursor] = root;
+    cursor = next;
+  }
+  return root;
+}
+
+function distanceToLambda(distance: number): number {
+  return 1 / Math.max(distance, 1e-7);
+}

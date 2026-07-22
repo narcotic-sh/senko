@@ -1,0 +1,31 @@
+{
+  "name": "@senko/browser",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.20.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build:fbank-wasm": "./scripts/fbank-wasm/build.sh",
+    "build:clustering-wasm": "./scripts/clustering-wasm/build.sh",
+    "benchmark:clustering-wasm": "SENKO_RUN_CLUSTERING_BENCHMARK=1 vitest run scripts/clustering-wasm/benchmark.test.ts --reporter=verbose",
+    "benchmark:fbank-wasm": "node --expose-gc ./scripts/fbank-wasm/benchmark.mjs ../test_audio.wav 6161",
+    "dev": "vite --host 127.0.0.1",
+    "build": "tsc --noEmit && vite build",
+    "check": "tsc --noEmit",
+    "test": "vitest run && node --test scripts/benchmark/*.test.mjs",
+    "test:watch": "vitest",
+    "preview": "vite preview --host 127.0.0.1"
+  },
+  "dependencies": {
+    "onnxruntime-web": "1.27.0"
+  },
+  "devDependencies": {
+    "@webgpu/types": "^0.1.64",
+    "typescript": "^5.8.0",
+    "vite": "^7.0.0",
+    "vitest": "^3.2.0"
+  }
+}

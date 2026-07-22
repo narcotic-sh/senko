@@ -7,6 +7,8 @@ dist/
 build/
 env/
 .venv/
+node_modules/
+/.research/
 
 result/
 
@@ -19,7 +21,7 @@ result/
 
 *.rttm
 
-audio/
+/audio/
 
 examples/*
 !examples/*.py

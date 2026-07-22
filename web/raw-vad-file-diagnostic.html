@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Raw pyannote file diagnostic</title>
+    <style>
+      body { font-family: ui-monospace, monospace; margin: 2rem; }
+      pre { white-space: pre-wrap; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Raw pyannote file diagnostic</h1>
+      <input id="audio" type="file" accept="audio/wav,.wav" />
+      <pre id="output">Waiting for WAV</pre>
+    </main>
+    <script type="module" src="/src/raw-vad-file-diagnostic.ts"></script>
+  </body>
+</html>

@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://senko.invalid/schemas/campplus-webgpu-pack-v1.json",
+  "title": "Senko CAM++ direct-WebGPU package metadata",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "format_version",
+    "source",
+    "binary",
+    "contract",
+    "inventory",
+    "compute",
+    "memory",
+    "sections",
+    "fused_program"
+  ],
+  "properties": {
+    "schema": { "const": "senko.campplus.webgpu-pack" },
+    "format_version": { "const": 1 },
+    "source": {
+      "type": "object",
+      "required": ["file", "byte_length", "sha256", "opset"]
+    },
+    "binary": {
+      "type": "object",
+      "required": [
+        "file",
+        "byte_length",
+        "sha256",
+        "payload_sha256",
+        "header_bytes",
+        "section_alignment",
+        "section_count",
+        "endianness"
+      ]
+    },
+    "contract": {
+      "type": "object",
+      "required": [
+        "input",
+        "output",
+        "internal_dtype",
+        "required_webgpu_features",
+        "channel_tile"
+      ]
+    },
+    "inventory": { "type": "object" },
+    "compute": { "type": "object" },
+    "memory": { "type": "object" },
+    "sections": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "kind",
+          "byte_offset",
+          "byte_length",
+          "element_count",
+          "dtype",
+          "logical_shape",
+          "packed_shape",
+          "layout"
+        ],
+        "properties": {
+          "id": { "type": "string" },
+          "kind": {
+            "enum": ["conv_weight", "conv_bias", "batch_norm_affine"]
+          },
+          "byte_offset": { "type": "integer", "minimum": 256, "multipleOf": 256 },
+          "byte_length": { "type": "integer", "minimum": 1 },
+          "element_count": { "type": "integer", "minimum": 1 },
+          "dtype": { "enum": ["float16", "float32"] },
+          "logical_shape": {
+            "type": "array",
+            "items": { "type": "integer", "minimum": 1 }
+          },
+          "packed_shape": {
+            "type": "array",
+            "items": { "type": "integer", "minimum": 1 }
+          },
+          "layout": { "enum": ["K_O4_I4_I_O", "O4", "C4_SCALE_SHIFT"] }
+        }
+      }
+    },
+    "fused_program": { "type": "object" }
+  }
+}

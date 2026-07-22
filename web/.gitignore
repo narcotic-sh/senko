@@ -1,0 +1,41 @@
+# Package-manager state
+node_modules/
+
+# Production and development build output
+dist/
+.vite/
+*.tsbuildinfo
+
+# Test and browser-runner output
+coverage/
+playwright-report/
+test-results/
+blob-report/
+
+# Local caches and scratch files
+.cache/
+.tmp/
+tmp/
+*.log
+pnpm-debug.log*
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Python model-tooling state
+scripts/models/.venv/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editor and operating-system metadata
+.DS_Store
+.idea/
+.vscode/

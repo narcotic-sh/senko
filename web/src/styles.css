@@ -1,0 +1,259 @@
+:root {
+  color: #e8ecea;
+  background: #0b0e0d;
+  font-family:
+    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+    sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  min-width: 320px;
+  min-height: 100vh;
+  margin: 0;
+  background:
+    radial-gradient(circle at 12% -15%, rgb(98 178 137 / 18%), transparent 34rem),
+    #0b0e0d;
+}
+
+button,
+input {
+  font: inherit;
+}
+
+button,
+.file-picker {
+  min-height: 2.75rem;
+  padding: 0.7rem 1rem;
+  border: 1px solid #375447;
+  border-radius: 0.65rem;
+  color: #d9f9e8;
+  background: #173226;
+  cursor: pointer;
+  font-weight: 650;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.shell {
+  width: min(980px, calc(100% - 2rem));
+  margin: 0 auto;
+  padding: 3rem 0 5rem;
+}
+
+.hero,
+.section-heading,
+.controls {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1.5rem;
+}
+
+.hero {
+  margin-bottom: 2rem;
+}
+
+h1,
+h2,
+p {
+  margin-top: 0;
+}
+
+h1 {
+  margin-bottom: 0.4rem;
+  font-size: clamp(2.2rem, 7vw, 4.5rem);
+  letter-spacing: -0.055em;
+  line-height: 0.95;
+}
+
+h2 {
+  margin-bottom: 0.2rem;
+  font-size: 1rem;
+  letter-spacing: 0.02em;
+}
+
+.eyebrow {
+  margin-bottom: 0.75rem;
+  color: #83d5ac;
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.lede,
+.secondary,
+.runtime-notes {
+  color: #98a39e;
+}
+
+.goal {
+  display: grid;
+  min-width: 10rem;
+  padding: 1rem 1.2rem;
+  border: 1px solid #25332d;
+  border-radius: 0.9rem;
+  background: rgb(18 25 22 / 85%);
+  text-align: right;
+}
+
+.goal strong {
+  color: #92e0b8;
+  font-size: 1.5rem;
+}
+
+.goal span {
+  color: #849089;
+  font-size: 0.75rem;
+}
+
+.panel {
+  margin-top: 1rem;
+  padding: 1.25rem;
+  border: 1px solid #222c28;
+  border-radius: 0.9rem;
+  background: rgb(17 22 20 / 92%);
+  box-shadow: 0 1rem 3rem rgb(0 0 0 / 14%);
+}
+
+.controls p {
+  margin-bottom: 0;
+}
+
+.file-picker input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+}
+
+.status,
+.timing-total {
+  margin: 0;
+  color: #a9b4af;
+  font-size: 0.85rem;
+}
+
+.status[data-kind="ready"] {
+  color: #83d5ac;
+}
+
+.status[data-kind="error"] {
+  color: #ff9d8f;
+}
+
+.capability-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.65rem;
+  margin-top: 1rem;
+}
+
+.capability {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.7rem;
+  border-radius: 0.55rem;
+  background: #0c110f;
+  color: #aab4af;
+  font-size: 0.82rem;
+}
+
+.capability[data-supported="true"] strong {
+  color: #83d5ac;
+}
+
+.capability[data-supported="false"] strong {
+  color: #ff9d8f;
+}
+
+.runtime-notes {
+  margin: 0.9rem 0 0;
+  padding-left: 1.1rem;
+  font-size: 0.8rem;
+}
+
+table {
+  width: 100%;
+  margin-top: 0.7rem;
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+}
+
+th,
+td {
+  padding: 0.7rem 0.25rem;
+  border-bottom: 1px solid #222c28;
+  text-align: left;
+  font-size: 0.86rem;
+}
+
+th {
+  color: #758078;
+  font-size: 0.7rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+th:last-child,
+td:last-child {
+  text-align: right;
+}
+
+.stage-status {
+  color: #7e8983;
+  text-transform: capitalize;
+}
+
+.stage-status[data-status="running"] {
+  color: #ffd280;
+}
+
+.stage-status[data-status="complete"] {
+  color: #83d5ac;
+}
+
+.result-panel pre {
+  max-height: 24rem;
+  overflow: auto;
+  color: #b8c2bd;
+  font: 0.78rem/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.memory-summary {
+  margin: 0.7rem 0 0;
+  color: #92e0b8;
+  font-size: 0.82rem;
+  font-variant-numeric: tabular-nums;
+}
+
+@media (max-width: 700px) {
+  .shell {
+    padding-top: 1.5rem;
+  }
+
+  .hero,
+  .controls {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .goal {
+    text-align: left;
+  }
+
+  .capability-grid {
+    grid-template-columns: 1fr;
+  }
+}
