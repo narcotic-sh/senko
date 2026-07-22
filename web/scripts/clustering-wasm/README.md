@@ -6,7 +6,10 @@ and post-processing. The production path uses three numeric operations:
 
 - Fused row normalization and deterministic SimHash seed-neighbor discovery.
 - Euclidean neighbor-descent refinement over the original 192-dimensional
-  CAM++ embeddings.
+  CAM++ embeddings. Repeated row/candidate pairs within one snapshot pass are
+  removed with a count-sized stamp array before distance evaluation; the
+  bounded heap threshold only decreases, so every removed attempt would have
+  returned zero without changing flags or convergence.
 - Exact Euclidean 40-nearest-neighbor construction over UMAP's 10-dimensional
   layout.
 
@@ -39,20 +42,22 @@ final `Int32Array` labels plus ARI 1.0. A measured M3 run was:
 
 | Measurement | TypeScript | WASM hybrid |
 | --- | ---: | ---: |
-| Whole clustering | 2,269 ms | 1,451 ms first trial; 1,420 ms best |
+| Whole clustering | 2,265 ms | 1,346–1,357 ms warmed |
 | Normalization + seed k-NN | 398 ms | 182 ms first trial; byte-identical graph |
-| Euclidean refinement | 768 ms | 357 ms first trial |
-| Exact post-UMAP k-NN | 360 ms | 124 ms first trial |
+| Euclidean refinement | 770 ms | 251–258 ms warmed |
+| Exact post-UMAP k-NN | 359 ms | 121–123 ms warmed |
 | Final labels | reference | byte-identical; ARI 1.0 |
 
-The bounded initialization warm-up took 86 ms in that run and occurs alongside
-model initialization, before user audio is processed.
+The bounded initialization warm-up took 72–86 ms in these runs and occurs
+alongside model initialization, before user audio is processed.
 
 ## Memory contract
 
 - Fixed clustering linear memory: 9,437,184 bytes.
 - Reusable arena capacity: 8,388,608 bytes.
 - Fixture peak arena cursor: 7,565,888 bytes (fused seed graph).
+- Fixture refinement arena cursor: 7,472,628 bytes, including the 22,852-byte
+  candidate stamp array.
 - Largest returned JS array set: 2,925,056 bytes (seed graph).
 - Returned JS refinement arrays: 1,028,340 bytes at fixture shape.
 - Returned JS exact-graph arrays: 1,828,160 bytes at fixture shape.

@@ -416,7 +416,9 @@ EMSCRIPTEN_KEEPALIVE int cluster_refine_euclidean_knn(
 
   int32_t* snapshot_indices = allocate_items<int32_t>(length);
   uint8_t* snapshot_flags = allocate_items<uint8_t>(length);
-  if (!snapshot_indices || !snapshot_flags) return -2;
+  int32_t* candidate_stamps = allocate_items<int32_t>(count);
+  if (!snapshot_indices || !snapshot_flags || !candidate_stamps) return -2;
+  memset(candidate_stamps, 0, count * sizeof(int32_t));
   const int convergence_limit =
       static_cast<int>(floor(0.001 * neighbor_count * count)) > 1
           ? static_cast<int>(floor(0.001 * neighbor_count * count))
@@ -427,6 +429,7 @@ EMSCRIPTEN_KEEPALIVE int cluster_refine_euclidean_knn(
     memset(output_is_new, 0, length * sizeof(uint8_t));
     int changes = 0;
     for (int row = 0; row < count; ++row) {
+      const int candidate_stamp = iteration * count + row + 1;
       const int row_offset = row * neighbor_count;
       for (int rank = 0; rank < neighbor_count; ++rank) {
         const int pivot_offset = row_offset + rank;
@@ -442,6 +445,12 @@ EMSCRIPTEN_KEEPALIVE int cluster_refine_euclidean_knn(
               (!pivot_is_new && snapshot_flags[candidate_offset] == 0)) {
             continue;
           }
+          // A heap's maximum retained distance can only decrease. After one
+          // attempt for this row/candidate pair, every duplicate attempt in
+          // the same snapshot pass is therefore guaranteed to return zero.
+          // Skipping it preserves heaps, flags, and the convergence count.
+          if (candidate_stamps[candidate] == candidate_stamp) continue;
+          candidate_stamps[candidate] = candidate_stamp;
           const double distance = euclidean(embeddings + row * dim,
                                             embeddings + candidate * dim, dim);
           changes += heap_push(heap, row, distance, candidate, 1);
