@@ -1,19 +1,18 @@
 export const HEADER_MAGIC = 0x534b554d;
-export const HEADER_VERSION = 1;
+export const HEADER_VERSION = 2;
 export const MINIMUM_MEMORY_PAGES = 256;
 
 export const PLAN_SECTION = Object.freeze({
   header: 0,
   embedding: 1,
-  head: 2,
+  rowOffsets: 2,
   tail: 3,
   epochsPerSample: 4,
   rngSeed: 5,
-  epochsPerNegativeSample: 6,
-  epochOfNextNegativeSample: 7,
-  epochOfNextSample: 8,
-  rngStatePerVertex: 9,
-  totalBytes: 10,
+  epochOfNextNegativeSample: 6,
+  epochOfNextSample: 7,
+  rngStatePerVertex: 8,
+  totalBytes: 9,
 });
 
 const LITTLE_ENDIAN = true;
@@ -49,6 +48,7 @@ export function buildPlan(
   }
   return Object.freeze({
     ...values,
+    vertexCount,
     pageCount: values.totalBytes / PAGE_BYTES,
   });
 }
@@ -83,14 +83,14 @@ export function writeRunHeader(
   u32(24, edgeCount);
   u32(28, epochCount);
   u32(32, plan.embedding);
-  u32(36, plan.head);
+  u32(36, plan.rowOffsets);
   u32(40, plan.tail);
   u32(44, plan.epochsPerSample);
   u32(48, plan.rngSeed);
-  u32(52, plan.epochsPerNegativeSample);
-  u32(56, plan.epochOfNextNegativeSample);
-  u32(60, plan.epochOfNextSample);
-  u32(64, plan.rngStatePerVertex);
+  u32(52, plan.epochOfNextNegativeSample);
+  u32(56, plan.epochOfNextSample);
+  u32(60, plan.rngStatePerVertex);
+  u32(64, 0);
   u32(68, 0);
   f64(72, a);
   f64(80, b);
@@ -109,7 +109,20 @@ export function copyRunInputs(
     plan.embedding,
     embedding.length,
   ).set(embedding);
-  new Int32Array(memory.buffer, plan.head, head.length).set(head);
+  const rowOffsets = new Uint32Array(
+    memory.buffer,
+    plan.rowOffsets,
+    plan.vertexCount + 1,
+  );
+  let edge = 0;
+  for (let vertex = 0; vertex + 1 < rowOffsets.length; vertex += 1) {
+    rowOffsets[vertex] = edge;
+    while (edge < head.length && head[edge] === vertex) edge += 1;
+  }
+  rowOffsets[rowOffsets.length - 1] = edge;
+  if (edge !== head.length) {
+    throw new RangeError("UMAP layout heads are not row-major");
+  }
   new Int32Array(memory.buffer, plan.tail, tail.length).set(tail);
   new Float64Array(
     memory.buffer,

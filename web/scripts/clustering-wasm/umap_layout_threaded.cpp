@@ -114,16 +114,14 @@ bool BuildPlan(std::uint32_t worker_count,
   if (!CheckedMultiply(vertex_count, dimension, &embedding_values) ||
       !AddArray(&cursor, embedding_values, sizeof(float),
                 &plan->offsets[kEmbedding]) ||
-      !AddArray(&cursor, edge_count, sizeof(std::int32_t),
-                &plan->offsets[kHead]) ||
+      !AddArray(&cursor, static_cast<std::uint64_t>(vertex_count) + 1,
+                sizeof(std::uint32_t), &plan->offsets[kRowOffsets]) ||
       !AddArray(&cursor, edge_count, sizeof(std::int32_t),
                 &plan->offsets[kTail]) ||
       !AddArray(&cursor, edge_count, sizeof(double),
                 &plan->offsets[kEpochsPerSample]) ||
       !AddArray(&cursor, 3, sizeof(std::int64_t),
                 &plan->offsets[kRngSeed]) ||
-      !AddArray(&cursor, edge_count, sizeof(double),
-                &plan->offsets[kEpochsPerNegativeSample]) ||
       !AddArray(&cursor, edge_count, sizeof(double),
                 &plan->offsets[kEpochOfNextNegativeSample]) ||
       !AddArray(&cursor, edge_count, sizeof(double),
@@ -233,13 +231,11 @@ bool InitializeSharedState(RunHeader* header, const Plan& plan) {
       header->version != kHeaderVersion ||
       header->total_bytes != plan.offsets[kTotalBytes] ||
       header->embedding_offset != plan.offsets[kEmbedding] ||
-      header->head_offset != plan.offsets[kHead] ||
+      header->row_offsets_offset != plan.offsets[kRowOffsets] ||
       header->tail_offset != plan.offsets[kTail] ||
       header->epochs_per_sample_offset !=
           plan.offsets[kEpochsPerSample] ||
       header->rng_seed_offset != plan.offsets[kRngSeed] ||
-      header->epochs_per_negative_sample_offset !=
-          plan.offsets[kEpochsPerNegativeSample] ||
       header->epoch_of_next_negative_sample_offset !=
           plan.offsets[kEpochOfNextNegativeSample] ||
       header->epoch_of_next_sample_offset !=
@@ -258,16 +254,14 @@ bool InitializeSharedState(RunHeader* header, const Plan& plan) {
   }
 
   float* embedding = OffsetPointer<float>(header->embedding_offset);
-  const std::int32_t* head =
-      OffsetPointer<std::int32_t>(header->head_offset);
+  const std::uint32_t* row_offsets =
+      OffsetPointer<std::uint32_t>(header->row_offsets_offset);
   const std::int32_t* tail =
       OffsetPointer<std::int32_t>(header->tail_offset);
   const double* epochs_per_sample =
       OffsetPointer<double>(header->epochs_per_sample_offset);
   const std::int64_t* rng_seed =
       OffsetPointer<std::int64_t>(header->rng_seed_offset);
-  double* epochs_per_negative_sample =
-      OffsetPointer<double>(header->epochs_per_negative_sample_offset);
   double* epoch_of_next_negative_sample =
       OffsetPointer<double>(header->epoch_of_next_negative_sample_offset);
   double* epoch_of_next_sample =
@@ -279,10 +273,15 @@ bool InitializeSharedState(RunHeader* header, const Plan& plan) {
                          header->dimension)) {
     return false;
   }
+  if (row_offsets[0] != 0 ||
+      row_offsets[header->vertex_count] != header->edge_count) {
+    return false;
+  }
+  for (std::uint32_t vertex = 0; vertex < header->vertex_count; ++vertex) {
+    if (row_offsets[vertex] > row_offsets[vertex + 1]) return false;
+  }
   for (std::uint32_t edge = 0; edge < header->edge_count; ++edge) {
-    if (head[edge] < 0 ||
-        static_cast<std::uint32_t>(head[edge]) >= header->vertex_count ||
-        tail[edge] < 0 ||
+    if (tail[edge] < 0 ||
         static_cast<std::uint32_t>(tail[edge]) >= header->vertex_count ||
         !std::isfinite(epochs_per_sample[edge]) ||
         epochs_per_sample[edge] <= 0.0) {
@@ -290,7 +289,6 @@ bool InitializeSharedState(RunHeader* header, const Plan& plan) {
     }
     const double negative_epoch =
         epochs_per_sample[edge] / header->negative_sample_rate;
-    epochs_per_negative_sample[edge] = negative_epoch;
     epoch_of_next_negative_sample[edge] = negative_epoch;
     epoch_of_next_sample[edge] = epochs_per_sample[edge];
   }
@@ -491,14 +489,12 @@ double NegativeGradientCoefficient(float distance_squared,
 
 std::int32_t OptimizeShard(std::uint32_t worker_id, RunHeader* header) {
   float* embedding = OffsetPointer<float>(header->embedding_offset);
-  const std::int32_t* head =
-      OffsetPointer<std::int32_t>(header->head_offset);
+  const std::uint32_t* row_offsets =
+      OffsetPointer<std::uint32_t>(header->row_offsets_offset);
   const std::int32_t* tail =
       OffsetPointer<std::int32_t>(header->tail_offset);
   const double* epochs_per_sample =
       OffsetPointer<double>(header->epochs_per_sample_offset);
-  const double* epochs_per_negative_sample =
-      OffsetPointer<double>(header->epochs_per_negative_sample_offset);
   double* epoch_of_next_negative_sample =
       OffsetPointer<double>(header->epoch_of_next_negative_sample_offset);
   double* epoch_of_next_sample =
@@ -513,83 +509,110 @@ std::int32_t OptimizeShard(std::uint32_t worker_id, RunHeader* header) {
       (static_cast<std::uint64_t>(header->edge_count) * (worker_id + 1)) /
       header->worker_count);
 
+  std::uint32_t first_head_index = 0;
+  if (edge_begin < edge_end) {
+    std::uint32_t lower = 0;
+    std::uint32_t upper = header->vertex_count;
+    while (lower < upper) {
+      const std::uint32_t middle = lower + (upper - lower) / 2;
+      if (row_offsets[middle + 1] <= edge_begin) {
+        lower = middle + 1;
+      } else {
+        upper = middle;
+      }
+    }
+    first_head_index = lower;
+  }
+
   double alpha = 1.0;
   for (std::uint32_t epoch = 0; epoch < header->epoch_count; ++epoch) {
-    for (std::uint32_t edge = edge_begin; edge < edge_end; ++edge) {
-      if ((edge & 1023U) == 0 &&
-          AtomicLoad(&header->cancelled) != 0) {
-        return kCancelled;
+    std::uint32_t head_index = first_head_index;
+    std::uint32_t edge = edge_begin;
+    while (edge < edge_end) {
+      while (head_index + 1 < header->vertex_count &&
+             row_offsets[head_index + 1] <= edge) {
+        ++head_index;
       }
-      if (epoch_of_next_sample[edge] > static_cast<double>(epoch)) continue;
-
-      const std::uint32_t head_index =
-          static_cast<std::uint32_t>(head[edge]);
-      const std::uint32_t tail_index =
-          static_cast<std::uint32_t>(tail[edge]);
-      float* current = embedding +
-          static_cast<std::uint64_t>(head_index) * header->dimension;
-      float* other = embedding +
-          static_cast<std::uint64_t>(tail_index) * header->dimension;
-
-      float distance_squared =
-          ReducedSquaredDistance(current, other, header->dimension);
-      const double positive_coefficient =
-          PositiveGradientCoefficient(distance_squared, header->a, header->b);
-      for (std::uint32_t coordinate = 0;
-           coordinate < header->dimension;
-           ++coordinate) {
-        const float difference =
-            current[coordinate] - other[coordinate];
-        const double gradient =
-            Clip(positive_coefficient * static_cast<double>(difference));
-        current[coordinate] = static_cast<float>(
-            static_cast<double>(current[coordinate]) + gradient * alpha);
-        other[coordinate] = static_cast<float>(
-            static_cast<double>(other[coordinate]) - gradient * alpha);
-      }
-      epoch_of_next_sample[edge] += epochs_per_sample[edge];
-
-      const double negative_epoch = epochs_per_negative_sample[edge];
-      const std::int64_t negative_sample_count =
-          static_cast<std::int64_t>(
-              (static_cast<double>(epoch) -
-               epoch_of_next_negative_sample[edge]) /
-              negative_epoch);
-      for (std::int64_t sample = 0;
-           sample < negative_sample_count;
-           ++sample) {
-        const std::uint32_t negative_tail =
-            static_cast<std::uint32_t>(PositiveModulo(
-                TauRandInt(&rng_state_per_vertex[head_index]),
-                header->vertex_count));
-        other = embedding +
-            static_cast<std::uint64_t>(negative_tail) * header->dimension;
-        distance_squared =
-            ReducedSquaredDistance(current, other, header->dimension);
-        if (!(distance_squared > 0.0f) &&
-            head_index == negative_tail) {
-          continue;
+      const std::uint32_t row_end =
+          row_offsets[head_index + 1] < edge_end
+              ? row_offsets[head_index + 1]
+              : edge_end;
+      for (; edge < row_end; ++edge) {
+        if ((edge & 1023U) == 0 &&
+            AtomicLoad(&header->cancelled) != 0) {
+          return kCancelled;
         }
+        if (epoch_of_next_sample[edge] > static_cast<double>(epoch)) continue;
 
-        const double negative_coefficient =
-            NegativeGradientCoefficient(
-                distance_squared, header->a, header->b, header->gamma);
+        const std::uint32_t tail_index =
+            static_cast<std::uint32_t>(tail[edge]);
+        float* current = embedding +
+            static_cast<std::uint64_t>(head_index) * header->dimension;
+        float* other = embedding +
+            static_cast<std::uint64_t>(tail_index) * header->dimension;
+
+        float distance_squared =
+            ReducedSquaredDistance(current, other, header->dimension);
+        const double positive_coefficient =
+            PositiveGradientCoefficient(
+                distance_squared, header->a, header->b);
         for (std::uint32_t coordinate = 0;
              coordinate < header->dimension;
              ++coordinate) {
-          double gradient = 0.0;
-          if (negative_coefficient > 0.0) {
-            const float difference =
-                current[coordinate] - other[coordinate];
-            gradient = Clip(
-                negative_coefficient * static_cast<double>(difference));
-          }
+          const float difference =
+              current[coordinate] - other[coordinate];
+          const double gradient =
+              Clip(positive_coefficient * static_cast<double>(difference));
           current[coordinate] = static_cast<float>(
               static_cast<double>(current[coordinate]) + gradient * alpha);
+          other[coordinate] = static_cast<float>(
+              static_cast<double>(other[coordinate]) - gradient * alpha);
         }
+        epoch_of_next_sample[edge] += epochs_per_sample[edge];
+
+        const double negative_epoch =
+            epochs_per_sample[edge] / header->negative_sample_rate;
+        const std::int64_t negative_sample_count =
+            static_cast<std::int64_t>(
+                (static_cast<double>(epoch) -
+                 epoch_of_next_negative_sample[edge]) /
+                negative_epoch);
+        for (std::int64_t sample = 0;
+             sample < negative_sample_count;
+             ++sample) {
+          const std::uint32_t negative_tail =
+              static_cast<std::uint32_t>(PositiveModulo(
+                  TauRandInt(&rng_state_per_vertex[head_index]),
+                  header->vertex_count));
+          other = embedding +
+              static_cast<std::uint64_t>(negative_tail) * header->dimension;
+          distance_squared =
+              ReducedSquaredDistance(current, other, header->dimension);
+          if (!(distance_squared > 0.0f) &&
+              head_index == negative_tail) {
+            continue;
+          }
+
+          const double negative_coefficient =
+              NegativeGradientCoefficient(
+                  distance_squared, header->a, header->b, header->gamma);
+          for (std::uint32_t coordinate = 0;
+               coordinate < header->dimension;
+               ++coordinate) {
+            double gradient = 0.0;
+            if (negative_coefficient > 0.0) {
+              const float difference =
+                  current[coordinate] - other[coordinate];
+              gradient = Clip(
+                  negative_coefficient * static_cast<double>(difference));
+            }
+            current[coordinate] = static_cast<float>(
+                static_cast<double>(current[coordinate]) + gradient * alpha);
+          }
+        }
+        epoch_of_next_negative_sample[edge] +=
+            static_cast<double>(negative_sample_count) * negative_epoch;
       }
-      epoch_of_next_negative_sample[edge] +=
-          static_cast<double>(negative_sample_count) * negative_epoch;
     }
 
     if (!Barrier(header)) return kCancelled;

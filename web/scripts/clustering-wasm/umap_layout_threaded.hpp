@@ -18,7 +18,7 @@
 namespace senko::umap_layout_threaded {
 
 constexpr std::uint32_t kHeaderMagic = 0x534b554d;  // "SKUM"
-constexpr std::uint32_t kHeaderVersion = 1;
+constexpr std::uint32_t kHeaderVersion = 2;
 constexpr std::uint32_t kPageBytes = 65'536;
 constexpr std::uint32_t kStackRegionOffset = 131'072;
 constexpr std::uint32_t kWorkerStackBytes = 65'536;
@@ -35,15 +35,14 @@ enum Status : std::int32_t {
 enum PlanSection : std::uint32_t {
   kHeader = 0,
   kEmbedding = 1,
-  kHead = 2,
+  kRowOffsets = 2,
   kTail = 3,
   kEpochsPerSample = 4,
   kRngSeed = 5,
-  kEpochsPerNegativeSample = 6,
-  kEpochOfNextNegativeSample = 7,
-  kEpochOfNextSample = 8,
-  kRngStatePerVertex = 9,
-  kTotalBytes = 10,
+  kEpochOfNextNegativeSample = 6,
+  kEpochOfNextSample = 7,
+  kRngStatePerVertex = 8,
+  kTotalBytes = 9,
 };
 
 /*
@@ -61,15 +60,15 @@ struct alignas(8) RunHeader {
   std::uint32_t edge_count;                         // 24
   std::uint32_t epoch_count;                        // 28
   std::uint32_t embedding_offset;                   // 32
-  std::uint32_t head_offset;                        // 36
+  std::uint32_t row_offsets_offset;                 // 36
   std::uint32_t tail_offset;                        // 40
   std::uint32_t epochs_per_sample_offset;           // 44
   std::uint32_t rng_seed_offset;                    // 48
-  std::uint32_t epochs_per_negative_sample_offset;  // 52
-  std::uint32_t epoch_of_next_negative_sample_offset;  // 56
-  std::uint32_t epoch_of_next_sample_offset;        // 60
-  std::uint32_t rng_state_per_vertex_offset;        // 64
-  std::uint32_t reserved0;                          // 68
+  std::uint32_t epoch_of_next_negative_sample_offset;  // 52
+  std::uint32_t epoch_of_next_sample_offset;        // 56
+  std::uint32_t rng_state_per_vertex_offset;        // 60
+  std::uint32_t reserved0;                          // 64
+  std::uint32_t reserved1;                          // 68
   double a;                                         // 72
   double b;                                         // 80
   double gamma;                                     // 88
@@ -79,7 +78,7 @@ struct alignas(8) RunHeader {
   std::uint32_t cancelled;                          // 112
   std::int32_t status;                              // 116
   std::uint32_t completed_epochs;                   // 120
-  std::uint32_t reserved1;                          // 124
+  std::uint32_t reserved2;                          // 124
 };
 
 static_assert(sizeof(RunHeader) == 128);

@@ -307,6 +307,16 @@ describe("ThreadedUmapLayoutPool", () => {
           controller.workers[0]!.requests[1]!.memory,
         );
       }
+      const productionRequest = controller.workers[0]!.requests[1]!;
+      expect(
+        Array.from(
+          new Uint32Array(
+            productionRequest.memory.buffer,
+            productionRequest.planOffsets[2],
+            3,
+          ),
+        ),
+      ).toEqual([0, 1, 2]);
     } finally {
       pool.dispose();
     }
@@ -398,6 +408,56 @@ describe("ThreadedUmapLayoutPool", () => {
       1, 1,
     ]);
     expect(() => pool.optimize(fixture())).toThrow(/disposed/);
+  });
+
+  it("rejects COO edges that are not in row-major order", async () => {
+    const controller = new FakeWorkerController();
+    const pool = await createPool(controller, 2);
+    try {
+      const input = fixture();
+      expect(() =>
+        pool.optimize({
+          ...input,
+          head: new Int32Array([1, 0]),
+        }),
+      ).toThrow(/edge 1/);
+    } finally {
+      pool.dispose();
+    }
+  });
+
+  it("reports the compact CSR schedule allocation in memory telemetry", async () => {
+    const controller = new FakeWorkerController();
+    const pool = await createPool(controller, 2);
+    try {
+      const edgeCount = 500_000;
+      const result = await pool.optimize({
+        embedding: new Float32Array([0]),
+        rngState: new BigInt64Array([42n, 43n, 44n]),
+        head: new Int32Array(edgeCount),
+        tail: new Int32Array(edgeCount),
+        epochsPerSample: new Float64Array(edgeCount).fill(1),
+        vertexCount: 1,
+        dimension: 1,
+        epochCount: 1,
+        a: 1,
+        b: 1,
+      });
+      expect(result.sharedMemoryBytes).toBe(MINIMUM_SHARED_BYTES);
+      expect(pool.memoryStats.peakSharedBytes).toBe(MINIMUM_SHARED_BYTES);
+      const request = controller.workers[0]!.requests[1]!;
+      expect(
+        Array.from(
+          new Uint32Array(
+            request.memory.buffer,
+            request.planOffsets[2],
+            2,
+          ),
+        ),
+      ).toEqual([0, edgeCount]);
+    } finally {
+      pool.dispose();
+    }
   });
 
   it.each([

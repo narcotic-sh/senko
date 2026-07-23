@@ -1,6 +1,6 @@
 /// <reference lib="webworker" />
 
-const PLAN_SECTION_COUNT = 11;
+const PLAN_SECTION_COUNT = 10;
 
 interface RunRequest {
   readonly type: "run";

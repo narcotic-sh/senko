@@ -6,7 +6,7 @@ const MAXIMUM_MEMORY_BYTES = 2 * 1024 * 1024 * 1024;
 const MAXIMUM_WORKERS = 8;
 const HEADER_BYTES = 128;
 const HEADER_MAGIC = 0x534b554d;
-const HEADER_VERSION = 1;
+const HEADER_VERSION = 2;
 const STACK_REGION_OFFSET = 131_072;
 const WORKER_STACK_BYTES = 65_536;
 const ALIGNMENT = 64;
@@ -21,7 +21,7 @@ const CONTROL_CANCELLED = 2;
 const CONTROL_STATUS = 3;
 const CONTROL_COMPLETED_EPOCHS = 4;
 
-const PLAN_SECTION_COUNT = 11;
+const PLAN_SECTION_COUNT = 10;
 
 export interface ThreadedUmapLayoutInput {
   readonly embedding: Float32Array;
@@ -60,7 +60,7 @@ interface LayoutPlan {
   readonly offsets: readonly number[];
   readonly header: number;
   readonly embedding: number;
-  readonly head: number;
+  readonly rowOffsets: number;
   readonly tail: number;
   readonly epochsPerSample: number;
   readonly rngSeed: number;
@@ -238,8 +238,8 @@ function buildLayoutPlan(
   cursor = appendArray(
     offsets,
     cursor,
-    edgeCount,
-    Int32Array.BYTES_PER_ELEMENT,
+    vertexCount + 1,
+    Uint32Array.BYTES_PER_ELEMENT,
   );
   cursor = appendArray(
     offsets,
@@ -274,12 +274,6 @@ function buildLayoutPlan(
   cursor = appendArray(
     offsets,
     cursor,
-    edgeCount,
-    Float64Array.BYTES_PER_ELEMENT,
-  );
-  cursor = appendArray(
-    offsets,
-    cursor,
     vertexCount * 3,
     BigInt64Array.BYTES_PER_ELEMENT,
   );
@@ -298,7 +292,7 @@ function buildLayoutPlan(
     offsets,
     header: offsets[0]!,
     embedding: offsets[1]!,
-    head: offsets[2]!,
+    rowOffsets: offsets[2]!,
     tail: offsets[3]!,
     epochsPerSample: offsets[4]!,
     rngSeed: offsets[5]!,
@@ -375,6 +369,7 @@ function resolveInput(input: ThreadedUmapLayoutInput): ResolvedLayoutInput {
       throw new RangeError(`Embedding value ${index} is not finite`);
     }
   }
+  let previousHead = -1;
   for (let edge = 0; edge < edgeCount; edge += 1) {
     const headIndex = head[edge]!;
     const tailIndex = tail[edge]!;
@@ -382,6 +377,7 @@ function resolveInput(input: ThreadedUmapLayoutInput): ResolvedLayoutInput {
     if (
       headIndex < 0 ||
       headIndex >= vertexCount ||
+      headIndex < previousHead ||
       tailIndex < 0 ||
       tailIndex >= vertexCount ||
       !Number.isFinite(epochs) ||
@@ -389,6 +385,7 @@ function resolveInput(input: ThreadedUmapLayoutInput): ResolvedLayoutInput {
     ) {
       throw new RangeError(`Invalid threaded UMAP edge ${edge}`);
     }
+    previousHead = headIndex;
   }
   return {
     embedding,
@@ -425,9 +422,10 @@ function writeRun(
   setU32(20, input.dimension);
   setU32(24, input.edgeCount);
   setU32(28, input.epochCount);
-  for (let index = 1; index <= 9; index += 1) {
+  for (let index = 1; index <= 8; index += 1) {
     setU32(28 + index * 4, plan.offsets[index]!);
   }
+  setU32(64, 0);
   setU32(68, 0);
   header.setFloat64(72, input.a, true);
   header.setFloat64(80, input.b, true);
@@ -444,7 +442,19 @@ function writeRun(
     plan.embedding,
     input.embedding.length,
   ).set(input.embedding);
-  new Int32Array(memory.buffer, plan.head, input.head.length).set(input.head);
+  const rowOffsets = new Uint32Array(
+    memory.buffer,
+    plan.rowOffsets,
+    input.vertexCount + 1,
+  );
+  let edge = 0;
+  for (let vertex = 0; vertex < input.vertexCount; vertex += 1) {
+    rowOffsets[vertex] = edge;
+    while (edge < input.edgeCount && input.head[edge] === vertex) {
+      edge += 1;
+    }
+  }
+  rowOffsets[input.vertexCount] = edge;
   new Int32Array(memory.buffer, plan.tail, input.tail.length).set(input.tail);
   new Float64Array(
     memory.buffer,
