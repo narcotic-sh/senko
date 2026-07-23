@@ -124,6 +124,49 @@ describe("WasmClusteringKernels", () => {
     }
   });
 
+  it("matches exact UMAP cosine neighbors below the native threshold", async () => {
+    const kernels = await createKernels();
+    const count = 48;
+    const dim = 12;
+    const neighborCount = 8;
+    const values = deterministicMatrix(count, dim);
+    try {
+      const actual = kernels.buildNativeUmapCosineKnn(
+        values,
+        count,
+        dim,
+        neighborCount,
+        42,
+      );
+      const expected = exactCosineKnnReference(
+        values,
+        count,
+        dim,
+        neighborCount,
+      );
+
+      expect(actual.indices).toEqual(expected.indices);
+      for (let index = 0; index < actual.distances.length; index += 1) {
+        expect(actual.distances[index]).toBeCloseTo(
+          expected.distances[index]!,
+          5,
+        );
+      }
+      expect(actual.neighborCount).toBe(neighborCount);
+      expect(() =>
+        kernels.buildNativeUmapCosineKnn(
+          values,
+          count,
+          dim,
+          count + 1,
+          42,
+        ),
+      ).toThrow(/neighbor count/);
+    } finally {
+      kernels.dispose();
+    }
+  });
+
   it("starts with the compact eleven-megabyte heap and rejects use after disposal", async () => {
     const kernels = await createKernels();
     kernels.normalizeRows(deterministicMatrix(32, 16), 32, 16);
@@ -393,6 +436,55 @@ function deterministicMatrix(count: number, dim: number): Float32Array {
     result[i] = ((state >>> 8) / 0x01000000) * 2 - 1;
   }
   return result;
+}
+
+function exactCosineKnnReference(
+  values: Float32Array,
+  count: number,
+  dim: number,
+  neighborCount: number,
+): {
+  readonly indices: Int32Array;
+  readonly distances: Float32Array;
+} {
+  const indices = new Int32Array(count * neighborCount);
+  const distances = new Float32Array(count * neighborCount);
+  const norms = new Float64Array(count);
+  for (let row = 0; row < count; row += 1) {
+    let squaredNorm = 0;
+    for (let column = 0; column < dim; column += 1) {
+      const value = values[row * dim + column]!;
+      squaredNorm += value * value;
+    }
+    norms[row] = Math.sqrt(squaredNorm);
+  }
+  for (let row = 0; row < count; row += 1) {
+    const candidates = Array.from({ length: count }, (_, candidate) => {
+      let dot = 0;
+      for (let column = 0; column < dim; column += 1) {
+        dot +=
+          values[row * dim + column]! *
+          values[candidate * dim + column]!;
+      }
+      const denominator = norms[row]! * norms[candidate]!;
+      const cosine = denominator === 0 ? 0 : dot / denominator;
+      return {
+        candidate,
+        distance: Math.max(0, Math.min(2, 1 - cosine)),
+      };
+    });
+    candidates.sort(
+      (left, right) =>
+        left.distance - right.distance ||
+        left.candidate - right.candidate,
+    );
+    const offset = row * neighborCount;
+    for (let rank = 0; rank < neighborCount; rank += 1) {
+      indices[offset + rank] = candidates[rank]!.candidate;
+      distances[offset + rank] = candidates[rank]!.distance;
+    }
+  }
+  return { indices, distances };
 }
 
 function deterministicSpeakerMatrix(

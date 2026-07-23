@@ -6,6 +6,7 @@
 #include <emscripten/emscripten.h>
 
 #include "hdbscan.hpp"
+#include "umap_neighbors.h"
 
 namespace {
 
@@ -638,6 +639,40 @@ EMSCRIPTEN_KEEPALIVE int cluster_exact_euclidean_knn(
     }
   }
   return 1;
+}
+
+EMSCRIPTEN_KEEPALIVE uint32_t cluster_umap_cosine_knn_workspace_bytes(
+    int count, int dimension, int neighbor_count, uint32_t random_seed) {
+  senko::umap_neighbors::ApproximateOptions options;
+  options.random_seed = random_seed;
+  const size_t bytes =
+      count < senko::umap_neighbors::kExactThreshold
+          ? senko::umap_neighbors::ExactWorkspaceBytes(count, dimension)
+          : senko::umap_neighbors::ApproximateWorkspaceBytes(
+                count, dimension, neighbor_count, options);
+  return bytes <= UINT32_MAX ? static_cast<uint32_t>(bytes) : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE int cluster_umap_cosine_knn(
+    const float* values, int count, int dimension, int neighbor_count,
+    uint32_t random_seed, int32_t* output_indices,
+    float* output_distances) {
+  senko::umap_neighbors::ApproximateOptions options;
+  options.random_seed = random_seed;
+  const uint32_t workspace_size =
+      cluster_umap_cosine_knn_workspace_bytes(
+          count, dimension, neighbor_count, random_seed);
+  if (workspace_size == 0) return -1;
+  void* const workspace = allocate_bytes(workspace_size, 16u);
+  if (!workspace) return -2;
+  return count < senko::umap_neighbors::kExactThreshold
+             ? senko::umap_neighbors::ExactCosineKnn(
+                   values, count, dimension, neighbor_count, workspace,
+                   workspace_size, output_indices, output_distances)
+             : senko::umap_neighbors::ApproximateCosineKnn(
+                   values, count, dimension, neighbor_count, options,
+                   workspace, workspace_size, output_indices,
+                   output_distances);
 }
 
 EMSCRIPTEN_KEEPALIVE uint32_t cluster_hdbscan_workspace_bytes(

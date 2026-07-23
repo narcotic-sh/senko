@@ -11,6 +11,12 @@ import {
   type ResolvedClusteringOptions,
 } from "./types";
 
+export interface NativeUmapKnnGraph {
+  readonly indices: Int32Array;
+  readonly distances: Float32Array;
+  readonly neighborCount: number;
+}
+
 let compiledModule: Promise<WebAssembly.Module> | undefined;
 const clusteringWasmImports = {
   env: {
@@ -67,6 +73,21 @@ interface ClusteringWasmExports extends WebAssembly.Exports {
     neighborCount: number,
     outputIndices: number,
     outputSimilarities: number,
+  ) => number;
+  readonly cluster_umap_cosine_knn_workspace_bytes: (
+    count: number,
+    dim: number,
+    neighborCount: number,
+    randomSeed: number,
+  ) => number;
+  readonly cluster_umap_cosine_knn: (
+    values: number,
+    count: number,
+    dim: number,
+    neighborCount: number,
+    randomSeed: number,
+    outputIndices: number,
+    outputDistances: number,
   ) => number;
   readonly cluster_hdbscan_workspace_bytes: (
     count: number,
@@ -456,6 +477,106 @@ export class WasmClusteringKernels implements ClusteringNumericKernels {
       similarities: this.copyFloat32Result(
         exports,
         similaritiesPointer,
+        outputLength,
+      ),
+      neighborCount,
+    };
+  }
+
+  /**
+   * Native UMAP 0.5.12 cosine-neighbor semantics: exact below 4,096 rows,
+   * otherwise angular RP trees followed by bounded-memory NNDescent.
+   */
+  buildNativeUmapCosineKnn(
+    values: Float32Array,
+    count: number,
+    dim: number,
+    neighborCount: number,
+    randomSeed: number,
+  ): NativeUmapKnnGraph {
+    requireMatrix("native UMAP input", values, count, dim);
+    if (
+      !Number.isSafeInteger(neighborCount) ||
+      neighborCount <= 0 ||
+      neighborCount > count
+    ) {
+      throw new RangeError(
+        "native UMAP neighbor count must be in [1, count]",
+      );
+    }
+    if (
+      !Number.isSafeInteger(randomSeed) ||
+      randomSeed < 0 ||
+      randomSeed > UINT32_MAX
+    ) {
+      throw new RangeError(
+        "native UMAP random seed must be an unsigned 32-bit integer",
+      );
+    }
+
+    const exports = this.requireExports();
+    const workspaceBytes =
+      exports.cluster_umap_cosine_knn_workspace_bytes(
+        count,
+        dim,
+        neighborCount,
+        randomSeed,
+      );
+    if (workspaceBytes === 0) {
+      throw new RangeError(
+        "native UMAP neighbor dimensions or parameters are unsupported",
+      );
+    }
+    const outputLength = checkedElementCount(
+      "native UMAP k-NN output",
+      count,
+      neighborCount,
+    );
+    const operationExports = this.beginOperation(
+      nativeUmapKnnArenaBytes(
+        count,
+        dim,
+        neighborCount,
+        workspaceBytes,
+      ),
+    );
+    const valuesPointer = this.copyFloat32(operationExports, values);
+    const indicesPointer = this.allocate(
+      operationExports,
+      outputLength * Int32Array.BYTES_PER_ELEMENT,
+      Int32Array.BYTES_PER_ELEMENT,
+    );
+    const distancesPointer = this.allocate(
+      operationExports,
+      outputLength * Float32Array.BYTES_PER_ELEMENT,
+      Float32Array.BYTES_PER_ELEMENT,
+    );
+    this.requireSuccess(
+      "native UMAP cosine k-NN",
+      operationExports.cluster_umap_cosine_knn(
+        valuesPointer,
+        count,
+        dim,
+        neighborCount,
+        randomSeed,
+        indicesPointer,
+        distancesPointer,
+      ),
+      operationExports,
+    );
+    this.observeReturnedJsBytes(
+      outputLength *
+        (Int32Array.BYTES_PER_ELEMENT + Float32Array.BYTES_PER_ELEMENT),
+    );
+    return {
+      indices: this.copyInt32Result(
+        operationExports,
+        indicesPointer,
+        outputLength,
+      ),
+      distances: this.copyFloat32Result(
+        operationExports,
+        distancesPointer,
         outputLength,
       ),
       neighborCount,
@@ -917,6 +1038,35 @@ function hdbscanArenaBytes(
   const sizer = new ArenaSizer();
   sizer.add(BigInt(count) * BigInt(dim), 4n, 4n);
   sizer.add(BigInt(count), 4n, 4n);
+  sizer.add(BigInt(workspaceBytes), 1n, 16n);
+  return sizer.bytes();
+}
+
+function nativeUmapKnnArenaBytes(
+  count: number,
+  dim: number,
+  neighborCount: number,
+  workspaceBytes: number,
+): number {
+  checkedElementCount("native UMAP input", count, dim);
+  const outputLength = checkedElementCount(
+    "native UMAP k-NN output",
+    count,
+    neighborCount,
+  );
+  if (
+    !Number.isSafeInteger(workspaceBytes) ||
+    workspaceBytes <= 0 ||
+    workspaceBytes > UINT32_MAX
+  ) {
+    throw new RangeError(
+      `native UMAP workspace ${workspaceBytes} is outside the wasm32 address range`,
+    );
+  }
+  const sizer = new ArenaSizer();
+  sizer.add(BigInt(count) * BigInt(dim), 4n, 4n);
+  sizer.add(BigInt(outputLength), 4n, 4n);
+  sizer.add(BigInt(outputLength), 4n, 4n);
   sizer.add(BigInt(workspaceBytes), 1n, 16n);
   return sizer.bytes();
 }
