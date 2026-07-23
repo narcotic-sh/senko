@@ -64,7 +64,6 @@ interface LayoutGraph {
   readonly rowOffsets: Int32Array;
   readonly columnIndices: Int32Array;
   readonly values: Float32Array;
-  readonly head: Int32Array;
   readonly epochsPerSample: Float64Array;
 }
 
@@ -163,7 +162,7 @@ export function clusterEmbeddingsNativeSerial(
     initialization,
     count,
     outputDimension,
-    layoutGraph.head,
+    expandCsrHeads(layoutGraph.rowOffsets, layoutGraph.values.length),
     layoutGraph.columnIndices,
     layoutGraph.epochsPerSample,
     epochCount,
@@ -313,7 +312,7 @@ export async function clusterEmbeddingsNativeThreaded(
     {
       embedding: initialization.embedding,
       rngState: initialization.rngState,
-      head: layoutGraph.head,
+      rowOffsets: layoutGraph.rowOffsets,
       tail: layoutGraph.columnIndices,
       epochsPerSample: layoutGraph.epochsPerSample,
       vertexCount: count,
@@ -415,7 +414,6 @@ export function prepareNativeLayoutGraph(
   const rowOffsets = new Int32Array(count + 1);
   const columnIndices = new Int32Array(retainedEdgeCount);
   const values = new Float32Array(retainedEdgeCount);
-  const head = new Int32Array(retainedEdgeCount);
   const epochsPerSample = new Float64Array(retainedEdgeCount);
   let write = 0;
   for (let row = 0; row < count; row += 1) {
@@ -434,7 +432,6 @@ export function prepareNativeLayoutGraph(
       rowOffsets[row + 1] = rowOffsets[row + 1]! + 1;
       columnIndices[write] = column;
       values[write] = weight;
-      head[write] = row;
       // NumPy 2.x keeps both operations in Float32 before the final Float64
       // division in make_epochs_per_sample.
       const normalizedWeight = Math.fround(weight / maximumWeight);
@@ -450,7 +447,18 @@ export function prepareNativeLayoutGraph(
   if (write !== retainedEdgeCount) {
     throw new Error("native UMAP retained-edge count changed while compacting");
   }
-  return { rowOffsets, columnIndices, values, head, epochsPerSample };
+  return { rowOffsets, columnIndices, values, epochsPerSample };
+}
+
+function expandCsrHeads(
+  rowOffsets: Int32Array,
+  edgeCount: number,
+): Int32Array {
+  const head = new Int32Array(edgeCount);
+  for (let row = 0; row + 1 < rowOffsets.length; row += 1) {
+    head.fill(row, rowOffsets[row]!, rowOffsets[row + 1]!);
+  }
+  return head;
 }
 
 /**
@@ -493,7 +501,7 @@ export function estimateNativeUmapPeakWorkingBytes(
   const layoutGraphBytes =
     (count + 1) * Int32Array.BYTES_PER_ELEMENT +
     retainedEdgeCount *
-      (Int32Array.BYTES_PER_ELEMENT * 2 +
+      (Int32Array.BYTES_PER_ELEMENT +
         Float32Array.BYTES_PER_ELEMENT +
         Float64Array.BYTES_PER_ELEMENT);
   const spectralAndInitializationBytes =

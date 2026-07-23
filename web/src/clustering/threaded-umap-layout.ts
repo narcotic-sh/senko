@@ -26,7 +26,7 @@ const PLAN_SECTION_COUNT = 10;
 export interface ThreadedUmapLayoutInput {
   readonly embedding: Float32Array;
   readonly rngState: BigInt64Array;
-  readonly head: Int32Array;
+  readonly rowOffsets: Int32Array;
   readonly tail: Int32Array;
   readonly epochsPerSample: Float64Array;
   readonly vertexCount: number;
@@ -71,7 +71,7 @@ interface LayoutPlan {
 interface ResolvedLayoutInput {
   readonly embedding: Float32Array;
   readonly rngState: BigInt64Array;
-  readonly head: Int32Array;
+  readonly rowOffsets: Int32Array;
   readonly tail: Int32Array;
   readonly epochsPerSample: Float64Array;
   readonly vertexCount: number;
@@ -305,7 +305,7 @@ function resolveInput(input: ThreadedUmapLayoutInput): ResolvedLayoutInput {
   const {
     embedding,
     rngState,
-    head,
+    rowOffsets,
     tail,
     epochsPerSample,
     vertexCount,
@@ -338,14 +338,30 @@ function resolveInput(input: ThreadedUmapLayoutInput): ResolvedLayoutInput {
       `Expected ${valueCount} embedding values, received ${embedding.length}`,
     );
   }
-  const edgeCount = head.length;
+  const edgeCount = tail.length;
   if (
     edgeCount < 1 ||
     edgeCount > 0x7fff_ffff ||
-    tail.length !== edgeCount ||
+    rowOffsets.length !== vertexCount + 1 ||
     epochsPerSample.length !== edgeCount
   ) {
     throw new RangeError("Threaded UMAP edge arrays have mismatched lengths");
+  }
+  if (rowOffsets[0] !== 0 || rowOffsets[vertexCount] !== edgeCount) {
+    throw new RangeError("Threaded UMAP CSR endpoints are invalid");
+  }
+  for (let vertex = 0; vertex < vertexCount; vertex += 1) {
+    const begin = rowOffsets[vertex]!;
+    const end = rowOffsets[vertex + 1]!;
+    if (
+      !Number.isSafeInteger(begin) ||
+      !Number.isSafeInteger(end) ||
+      begin < 0 ||
+      end < begin ||
+      end > edgeCount
+    ) {
+      throw new RangeError(`Invalid threaded UMAP CSR row ${vertex}`);
+    }
   }
   if (rngState.length !== 3) {
     throw new RangeError(
@@ -369,15 +385,10 @@ function resolveInput(input: ThreadedUmapLayoutInput): ResolvedLayoutInput {
       throw new RangeError(`Embedding value ${index} is not finite`);
     }
   }
-  let previousHead = -1;
   for (let edge = 0; edge < edgeCount; edge += 1) {
-    const headIndex = head[edge]!;
     const tailIndex = tail[edge]!;
     const epochs = epochsPerSample[edge]!;
     if (
-      headIndex < 0 ||
-      headIndex >= vertexCount ||
-      headIndex < previousHead ||
       tailIndex < 0 ||
       tailIndex >= vertexCount ||
       !Number.isFinite(epochs) ||
@@ -385,12 +396,11 @@ function resolveInput(input: ThreadedUmapLayoutInput): ResolvedLayoutInput {
     ) {
       throw new RangeError(`Invalid threaded UMAP edge ${edge}`);
     }
-    previousHead = headIndex;
   }
   return {
     embedding,
     rngState,
-    head,
+    rowOffsets,
     tail,
     epochsPerSample,
     vertexCount,
@@ -442,19 +452,11 @@ function writeRun(
     plan.embedding,
     input.embedding.length,
   ).set(input.embedding);
-  const rowOffsets = new Uint32Array(
+  new Uint32Array(
     memory.buffer,
     plan.rowOffsets,
     input.vertexCount + 1,
-  );
-  let edge = 0;
-  for (let vertex = 0; vertex < input.vertexCount; vertex += 1) {
-    rowOffsets[vertex] = edge;
-    while (edge < input.edgeCount && input.head[edge] === vertex) {
-      edge += 1;
-    }
-  }
-  rowOffsets[input.vertexCount] = edge;
+  ).set(input.rowOffsets);
   new Int32Array(memory.buffer, plan.tail, input.tail.length).set(input.tail);
   new Float64Array(
     memory.buffer,
@@ -488,22 +490,23 @@ function buildWarmupInput(): ThreadedUmapLayoutInput {
       );
     }
   }
-  const head = new Int32Array(edgeCount);
+  const rowOffsets = new Int32Array(vertexCount + 1);
   const tail = new Int32Array(edgeCount);
   const epochsPerSample = new Float64Array(edgeCount);
   for (let vertex = 0; vertex < vertexCount; vertex += 1) {
+    rowOffsets[vertex] = vertex * edgesPerVertex;
     for (let neighbor = 0; neighbor < edgesPerVertex; neighbor += 1) {
       const edge = vertex * edgesPerVertex + neighbor;
-      head[edge] = vertex;
       tail[edge] =
         (vertex + 1 + neighbor * 17 + (vertex % 7)) % vertexCount;
       epochsPerSample[edge] = 1 + (edge % 7) * 0.5;
     }
   }
+  rowOffsets[vertexCount] = edgeCount;
   return {
     embedding,
     rngState: new BigInt64Array([42n, 43n, 44n]),
-    head,
+    rowOffsets,
     tail,
     epochsPerSample,
     vertexCount,

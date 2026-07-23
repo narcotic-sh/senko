@@ -232,7 +232,7 @@ function fixture(): ThreadedUmapLayoutInput {
   return {
     embedding: new Float32Array([1, 2, 3, 4]),
     rngState: new BigInt64Array([42n, 43n, 44n]),
-    head: new Int32Array([0, 1]),
+    rowOffsets: new Int32Array([0, 1, 2]),
     tail: new Int32Array([1, 0]),
     epochsPerSample: new Float64Array([1, 1.5]),
     vertexCount: 2,
@@ -410,7 +410,7 @@ describe("ThreadedUmapLayoutPool", () => {
     expect(() => pool.optimize(fixture())).toThrow(/disposed/);
   });
 
-  it("rejects COO edges that are not in row-major order", async () => {
+  it("rejects malformed CSR row offsets", async () => {
     const controller = new FakeWorkerController();
     const pool = await createPool(controller, 2);
     try {
@@ -418,9 +418,9 @@ describe("ThreadedUmapLayoutPool", () => {
       expect(() =>
         pool.optimize({
           ...input,
-          head: new Int32Array([1, 0]),
+          rowOffsets: new Int32Array([0, 2, 1]),
         }),
-      ).toThrow(/edge 1/);
+      ).toThrow(/endpoints/);
     } finally {
       pool.dispose();
     }
@@ -434,7 +434,7 @@ describe("ThreadedUmapLayoutPool", () => {
       const result = await pool.optimize({
         embedding: new Float32Array([0]),
         rngState: new BigInt64Array([42n, 43n, 44n]),
-        head: new Int32Array(edgeCount),
+        rowOffsets: new Int32Array([0, edgeCount]),
         tail: new Int32Array(edgeCount),
         epochsPerSample: new Float64Array(edgeCount).fill(1),
         vertexCount: 1,

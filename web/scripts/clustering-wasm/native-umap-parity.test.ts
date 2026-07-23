@@ -59,7 +59,15 @@ describe("assembled native UMAP/HDBSCAN parity path", () => {
         "umapLayoutEpochsPerSample",
       )) as Float64Array;
 
-      expect(graph.head).toEqual(referenceHead);
+      const candidateHead = new Int32Array(referenceHead.length);
+      for (let row = 0; row + 1 < graph.rowOffsets.length; row += 1) {
+        candidateHead.fill(
+          row,
+          graph.rowOffsets[row]!,
+          graph.rowOffsets[row + 1]!,
+        );
+      }
+      expect(candidateHead).toEqual(referenceHead);
       expect(graph.columnIndices).toEqual(referenceTail);
       expect(graph.epochsPerSample).toEqual(referenceEpochs);
     },
