@@ -103,8 +103,8 @@ environment variables. Final isolated-Chrome acceptance produced:
 - `test_audio_short.wav`: unchanged spectral branch, 4 speakers/49 segments,
   with exact mapped agreement to offline Senko.
 - `test_audio.wav`: the latest accepted optimization run returned 7
-  speakers/131 segments, 99.949% mapped agreement at 10 ms, and a
-  13.225-second full-pipeline wall time. This is one isolated run rather than
-  a cooled multi-run median.
+  speakers/132 segments, 99.977% mapped agreement at 10 ms, and a
+  13.219-second full-pipeline wall time. Clustering itself took 3.673 seconds.
+  This is one isolated run rather than a cooled multi-run median.
 - `test_audio_long.wav` (31,054 seconds): 6 speakers/1,084 segments versus
   offline Senko's 6/1,077, with 99.906% mapped agreement at 10 ms.

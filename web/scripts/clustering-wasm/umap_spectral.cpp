@@ -297,14 +297,27 @@ void apply_laplacian(const std::int32_t* row_offsets,
                      const double* input,
                      double* output) {
   for (std::int32_t row = 0; row < count; ++row) {
-    double value = input[row];
-    for (std::int32_t edge = row_offsets[row]; edge < row_offsets[row + 1];
-         ++edge) {
-      value -=
-          static_cast<double>(normalized_weights[edge]) *
-          input[columns[edge]];
+    double sum0 = 0.0;
+    double sum1 = 0.0;
+    double sum2 = 0.0;
+    double sum3 = 0.0;
+    std::int32_t edge = row_offsets[row];
+    const std::int32_t end = row_offsets[row + 1];
+    for (; edge + 3 < end; edge += 4) {
+      sum0 += static_cast<double>(normalized_weights[edge]) *
+              input[columns[edge]];
+      sum1 += static_cast<double>(normalized_weights[edge + 1]) *
+              input[columns[edge + 1]];
+      sum2 += static_cast<double>(normalized_weights[edge + 2]) *
+              input[columns[edge + 2]];
+      sum3 += static_cast<double>(normalized_weights[edge + 3]) *
+              input[columns[edge + 3]];
     }
-    output[row] = value;
+    for (; edge < end; ++edge) {
+      sum0 += static_cast<double>(normalized_weights[edge]) *
+              input[columns[edge]];
+    }
+    output[row] = input[row] - ((sum0 + sum1) + (sum2 + sum3));
   }
 }
 
@@ -315,14 +328,29 @@ void apply_laplacian_mixed(const std::int32_t* row_offsets,
                            const float* input,
                            double* output) {
   for (std::int32_t row = 0; row < count; ++row) {
-    double value = static_cast<double>(input[row]);
-    for (std::int32_t edge = row_offsets[row]; edge < row_offsets[row + 1];
-         ++edge) {
-      value -=
-          static_cast<double>(normalized_weights[edge]) *
-          static_cast<double>(input[columns[edge]]);
+    double sum0 = 0.0;
+    double sum1 = 0.0;
+    double sum2 = 0.0;
+    double sum3 = 0.0;
+    std::int32_t edge = row_offsets[row];
+    const std::int32_t end = row_offsets[row + 1];
+    for (; edge + 3 < end; edge += 4) {
+      sum0 += static_cast<double>(normalized_weights[edge]) *
+              static_cast<double>(input[columns[edge]]);
+      sum1 += static_cast<double>(normalized_weights[edge + 1]) *
+              static_cast<double>(input[columns[edge + 1]]);
+      sum2 += static_cast<double>(normalized_weights[edge + 2]) *
+              static_cast<double>(input[columns[edge + 2]]);
+      sum3 += static_cast<double>(normalized_weights[edge + 3]) *
+              static_cast<double>(input[columns[edge + 3]]);
     }
-    output[row] = value;
+    for (; edge < end; ++edge) {
+      sum0 += static_cast<double>(normalized_weights[edge]) *
+              static_cast<double>(input[columns[edge]]);
+    }
+    output[row] =
+        static_cast<double>(input[row]) -
+        ((sum0 + sum1) + (sum2 + sum3));
   }
 }
 

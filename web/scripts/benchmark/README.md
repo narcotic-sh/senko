@@ -136,6 +136,17 @@ peak (14,481,828 bytes), ordinary/shared WASM high-water (31,522,816 bytes),
 explicit GPU buffers (84,001,024 bytes), and clustering working memory
 (9,775,012 bytes) were unchanged from the preceding checkpoint.
 
+Four-accumulator sparse Laplacian row sums then reduced the isolated
+43,804-row spectral solve by 18.3% without changing solver parameters or
+memory. The next one-hour production acceptance completed in **13.219015
+seconds**, with clustering down from 4.040865 to **3.673110 seconds**:
+0.549060 seconds of neighbor search, 1.004360 seconds of spectral
+initialization, 1.749810 seconds of layout, and 0.294420 seconds of HDBSCAN.
+The run returned seven speakers and exactly 132 segments, with 99.9927% speech
+IoU and 99.9771% mapped-speaker agreement at 10 ms. Its wall time remained
+nearly level because the overlapping CAM++ stage varied from 9.079780 to
+9.460500 seconds. Every tracked memory value remained unchanged.
+
 ## Historical browser-specific clustering checkpoint (2026-07-22)
 
 These numbers are the latest cooled checkpoint on the target M3 Mac, not a

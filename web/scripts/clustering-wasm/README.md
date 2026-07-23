@@ -101,7 +101,7 @@ k-NN-then-spectral run, WASM heap high-water fell from 146,407,424 to
 compact-arena refactor itself retained byte-for-byte output. Production now
 also explicitly SIMD-vectorizes the three remaining f64 reductions, which
 deliberately changes their last-bit summation grouping. The accepted long WASM
-vector hash is
+vector hash at that checkpoint was
 `9b7d7ed290d2c497fcb6ad52a7d33913075a85cdb33c35524cc39e3a96ba08e5`,
 and the test still requires the post-spectral heap to equal the immediately
 post-k-NN-reserve heap exactly.
@@ -116,6 +116,18 @@ pair-distance error was `1.489e-8`. The final serial UMAP/HDBSCAN gate retained
 seven clusters, the exact zero-noise mask, and ARI 0.999399 against the offline
 partition. The earlier compact-arena native timing remained 5,168.60 ms before
 versus 5,180.31 ms after.
+
+The two irregular Laplacian row sums subsequently moved to four independent
+accumulators with a four-edge unroll. This leaves the solver, parameters,
+workspace, and sparse traversal unchanged while exposing instruction-level
+parallelism despite the gathered input columns. Persistent warmed one-hour
+WASM medians moved from 436.07 to 404.48 ms (7.2%), with 61/61 eigenpairs,
+the same two restarts, and pair-distance error `2.395e-9` against the
+predecessor. The 43,804-row solve moved from 9.191 to 7.512 seconds (18.3%)
+with the same three restarts and 42,492,944-byte workspace. Its pair-distance
+delta was `1.179e-8`; seeded and unseeded downstream runs both retained seven
+clusters and no noise. The accepted long vector hash is now
+`1f57911bb06c1990672b737ba9c6245805ecb1af69c91b6199a8c5e851933582`.
 
 Run both spectral acceptance fixtures explicitly with:
 
