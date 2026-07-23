@@ -83,3 +83,41 @@ hierarchy, and post-processing completed in the remaining 13.55 seconds. The
 row-stamp path used 63,383,408 arena bytes, the page-rounded arena was
 63,438,848 bytes, the complete WASM heap was 63,569,920 bytes, and the final
 9-cluster label hash was `0a3d1ee4`.
+
+## Current real-recording acceptance (2026-07-22)
+
+`test_audio_long.wav` is an 8:37:34.3786875 mono 16 kHz PCM recording
+(993,740,196 bytes, SHA-256
+`a8c260398fccc725dfd7bb1d1a56c4179950b19ba6e2c1d8429e2005077d9a5a`).
+Original offline Senko completed it in 50.91 seconds and produced 43,804
+embeddings. Its unseeded UMAP result is retained under `.research` as the
+correctness oracle; the source pipeline was not modified.
+
+The isolated production-browser correctness run completed in 86.840815
+seconds on the target M3 and exercised the scalable path with 43,838
+embeddings. Its stages were 20.911080 seconds VAD, 27.288750 seconds FBank,
+70.460170 seconds CAM++, 16.031510 seconds clustering, and 0.013210 seconds
+post-processing. VAD, FBank, and CAM++ overlap, so these attributed times must
+not be summed. Against the offline merged timeline, the browser reached
+0.996625 speech IoU and 0.991261 optimally mapped-speaker agreement at 10 ms;
+the corresponding 50 ms values were 0.996806 and 0.991137.
+
+Speaker and absolute merged-segment counts remain diagnostics for this
+recording rather than a reason to alter clustering: native UMAP is stochastic,
+and count differences do not by themselves identify a browser regression. No
+pipeline or acceptance-threshold change was made from this result.
+
+The browser reported a 78,438,432-byte deterministic known-CPU peak,
+58,589,184-byte clustering/Fbank WASM heap, and 84,001,024 bytes of explicit
+GPU buffers. The 993,740,196-byte input remained an uncopied external `File`.
+A two-run retained-memory diagnostic used the same isolated Senko tab, worker,
+models, WebGPU contexts, and grown clustering arena. Page/worker agent-cluster
+memory was 61,279,545 bytes after run one and 61,242,420 after run two, a
+37,125-byte decrease rather than retained growth. Both runs returned
+byte-identical segment payloads.
+
+The post-validation regressions also passed. `test_audio_short.wav` retained
+the exact offline 4-speaker, 49-segment result with 1.000000 mapped-speaker
+agreement in 1.493510 seconds. The canonical one-hour `test_audio.wav` timing
+acceptance completed in 10.073830 seconds with 0.998514 speech IoU and
+0.988287 mapped-speaker agreement at 10 ms.
