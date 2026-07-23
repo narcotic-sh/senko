@@ -301,76 +301,115 @@ function condense(
   dendrogram: Dendrogram,
   minClusterSize: number,
 ): void {
-  if (dendrogram.left[node]! < 0) {
-    return;
-  }
-  const left = dendrogram.left[node]!;
-  const right = dendrogram.right[node]!;
-  const lambda = distanceToLambda(dendrogram.distances[node]!);
-  const leftLarge = dendrogram.sizes[left]! >= minClusterSize;
-  const rightLarge = dendrogram.sizes[right]! >= minClusterSize;
+  const nodes = [node];
+  const clusters = [cluster];
+  while (nodes.length > 0) {
+    const currentNode = nodes.pop()!;
+    const currentCluster = clusters.pop()!;
+    if (dendrogram.left[currentNode]! < 0) {
+      continue;
+    }
+    const left = dendrogram.left[currentNode]!;
+    const right = dendrogram.right[currentNode]!;
+    const lambda = distanceToLambda(dendrogram.distances[currentNode]!);
+    const leftLarge = dendrogram.sizes[left]! >= minClusterSize;
+    const rightLarge = dendrogram.sizes[right]! >= minClusterSize;
 
-  if (leftLarge && rightLarge) {
-    cluster.stability +=
-      dendrogram.sizes[node]! * Math.max(0, lambda - cluster.birthLambda);
-    const leftCluster: DensityCluster = {
-      treeNode: left,
-      birthLambda: lambda,
-      stability: 0,
-      children: [],
-      selected: false,
-    };
-    const rightCluster: DensityCluster = {
-      treeNode: right,
-      birthLambda: lambda,
-      stability: 0,
-      children: [],
-      selected: false,
-    };
-    cluster.children.push(leftCluster, rightCluster);
-    condense(left, leftCluster, dendrogram, minClusterSize);
-    condense(right, rightCluster, dendrogram, minClusterSize);
-    return;
-  }
+    if (leftLarge && rightLarge) {
+      currentCluster.stability +=
+        dendrogram.sizes[currentNode]! *
+        Math.max(0, lambda - currentCluster.birthLambda);
+      const leftCluster: DensityCluster = {
+        treeNode: left,
+        birthLambda: lambda,
+        stability: 0,
+        children: [],
+        selected: false,
+      };
+      const rightCluster: DensityCluster = {
+        treeNode: right,
+        birthLambda: lambda,
+        stability: 0,
+        children: [],
+        selected: false,
+      };
+      currentCluster.children.push(leftCluster, rightCluster);
+      // Push right first so the left subtree is completed first, matching the
+      // recursive traversal and its floating-point accumulation order.
+      nodes.push(right, left);
+      clusters.push(rightCluster, leftCluster);
+      continue;
+    }
 
-  if (leftLarge) {
-    cluster.stability +=
-      dendrogram.sizes[right]! * Math.max(0, lambda - cluster.birthLambda);
-    condense(left, cluster, dendrogram, minClusterSize);
-    return;
-  }
-  if (rightLarge) {
-    cluster.stability +=
-      dendrogram.sizes[left]! * Math.max(0, lambda - cluster.birthLambda);
-    condense(right, cluster, dendrogram, minClusterSize);
-    return;
-  }
+    if (leftLarge) {
+      currentCluster.stability +=
+        dendrogram.sizes[right]! *
+        Math.max(0, lambda - currentCluster.birthLambda);
+      nodes.push(left);
+      clusters.push(currentCluster);
+      continue;
+    }
+    if (rightLarge) {
+      currentCluster.stability +=
+        dendrogram.sizes[left]! *
+        Math.max(0, lambda - currentCluster.birthLambda);
+      nodes.push(right);
+      clusters.push(currentCluster);
+      continue;
+    }
 
-  cluster.stability +=
-    dendrogram.sizes[node]! * Math.max(0, lambda - cluster.birthLambda);
+    currentCluster.stability +=
+      dendrogram.sizes[currentNode]! *
+      Math.max(0, lambda - currentCluster.birthLambda);
+  }
 }
 
 function selectExcessOfMass(cluster: DensityCluster): number {
-  if (cluster.children.length === 0) {
-    cluster.selected = true;
-    return cluster.stability;
+  const stack: Array<{
+    cluster: DensityCluster;
+    nextChild: number;
+    descendantsStability: number;
+  }> = [{ cluster, nextChild: 0, descendantsStability: 0 }];
+
+  while (stack.length > 0) {
+    const frame = stack[stack.length - 1]!;
+    if (frame.nextChild < frame.cluster.children.length) {
+      const child = frame.cluster.children[frame.nextChild]!;
+      frame.nextChild += 1;
+      stack.push({ cluster: child, nextChild: 0, descendantsStability: 0 });
+      continue;
+    }
+
+    let selectedStability: number;
+    if (frame.cluster.children.length === 0) {
+      frame.cluster.selected = true;
+      selectedStability = frame.cluster.stability;
+    } else if (frame.cluster.stability >= frame.descendantsStability) {
+      clearSelection(frame.cluster.children);
+      frame.cluster.selected = true;
+      selectedStability = frame.cluster.stability;
+    } else {
+      selectedStability = frame.descendantsStability;
+    }
+
+    stack.pop();
+    if (stack.length === 0) {
+      return selectedStability;
+    }
+    stack[stack.length - 1]!.descendantsStability += selectedStability;
   }
-  let descendantsStability = 0;
-  for (const child of cluster.children) {
-    descendantsStability += selectExcessOfMass(child);
-  }
-  if (cluster.stability >= descendantsStability) {
-    clearSelection(cluster.children);
-    cluster.selected = true;
-    return cluster.stability;
-  }
-  return descendantsStability;
+
+  return 0;
 }
 
 function clearSelection(clusters: readonly DensityCluster[]): void {
-  for (const cluster of clusters) {
+  const stack = [...clusters].reverse();
+  while (stack.length > 0) {
+    const cluster = stack.pop()!;
     cluster.selected = false;
-    clearSelection(cluster.children);
+    for (let child = cluster.children.length - 1; child >= 0; child -= 1) {
+      stack.push(cluster.children[child]!);
+    }
   }
 }
 

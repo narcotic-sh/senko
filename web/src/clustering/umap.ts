@@ -3,7 +3,10 @@ import {
   normalizeRows,
   type KnnGraph,
 } from "./knn";
-import type { ClusteringNumericKernels } from "./numeric-kernels";
+import type {
+  ClusteringNumericKernels,
+  NumericNeighborHeap,
+} from "./numeric-kernels";
 import type {
   ResolvedClusteringOptions,
   UmapProjectionStats,
@@ -11,6 +14,7 @@ import type {
 
 const FLOAT_BYTES = Float32Array.BYTES_PER_ELEMENT;
 const INT_BYTES = Int32Array.BYTES_PER_ELEMENT;
+const MAX_PACKED_FUZZY_GRAPH_ROWS = 1 << 16;
 const UMAP_A_MIN_DIST_ZERO = 1.9330828875904762;
 const UMAP_B_MIN_DIST_ZERO = 0.7922918021756439;
 
@@ -32,6 +36,32 @@ interface FuzzyGraph {
   readonly tail: Int32Array;
   readonly weights: Float32Array;
   readonly edgeCount: number;
+}
+
+/** Exact TypeScript predecessor used for focused WASM differential tests. */
+export function refineEuclideanNeighborsReference(
+  embeddings: Float32Array,
+  count: number,
+  dim: number,
+  neighborCount: number,
+  seedIndices: Int32Array,
+  seedNeighborCount: number,
+  randomSeed: number,
+): NumericNeighborHeap {
+  const allocations = new AllocationTracker();
+  const heap = initializeEuclideanHeap(
+    embeddings,
+    count,
+    dim,
+    neighborCount,
+    seedIndices,
+    seedNeighborCount,
+    createDeterministicRandom(randomSeed),
+    allocations,
+  );
+  refineNeighborGraph(embeddings, count, dim, heap, allocations);
+  sortNeighborRows(heap, count);
+  return heap;
 }
 
 /**
@@ -360,6 +390,13 @@ function buildFuzzyGraph(
   epochs: number,
   allocations: AllocationTracker,
 ): FuzzyGraph {
+  // Keep the benchmarked two-pass packed-key path unchanged whenever every
+  // `row * count + column` key fits in a Uint32. Above this exact boundary,
+  // sorting the two endpoints independently avoids key wrap and collisions.
+  if (count > MAX_PACKED_FUZZY_GRAPH_ROWS) {
+    return buildWideFuzzyGraph(neighbors, count, epochs, allocations);
+  }
+
   const sigmas = new Float32Array(count);
   const rhos = new Float32Array(count);
   allocations.retain(sigmas.byteLength + rhos.byteLength);
@@ -425,6 +462,100 @@ function buildFuzzyGraph(
   }
   allocations.release(keys.byteLength + weights.byteLength);
   return { head, tail, weights: compactWeights, edgeCount: uniqueCount };
+}
+
+function buildWideFuzzyGraph(
+  neighbors: NeighborHeap,
+  count: number,
+  epochs: number,
+  allocations: AllocationTracker,
+): FuzzyGraph {
+  const sigmas = new Float32Array(count);
+  const rhos = new Float32Array(count);
+  allocations.retain(sigmas.byteLength + rhos.byteLength);
+  smoothKnnDistances(neighbors, count, sigmas, rhos);
+
+  const directedCount = count * Math.max(0, neighbors.size - 1);
+  const capacity = directedCount * 2;
+  let heads: Uint32Array = new Uint32Array(capacity);
+  let tails: Uint32Array = new Uint32Array(capacity);
+  let weights: Float32Array = new Float32Array(capacity);
+  allocations.retain(heads.byteLength + tails.byteLength + weights.byteLength);
+  let cursor = 0;
+  for (let row = 0; row < count; row += 1) {
+    const offset = row * neighbors.size;
+    for (let rank = 1; rank < neighbors.size; rank += 1) {
+      const column = neighbors.indices[offset + rank]!;
+      if (column < 0 || column === row) {
+        continue;
+      }
+      const distance = neighbors.distances[offset + rank]!;
+      const membership =
+        distance - rhos[row]! <= 0
+          ? 1
+          : Math.exp(-((distance - rhos[row]!) / sigmas[row]!));
+      tails[cursor] = row;
+      heads[cursor] = column;
+      weights[cursor] = membership;
+      cursor += 1;
+      tails[cursor] = column;
+      heads[cursor] = row;
+      weights[cursor] = membership;
+      cursor += 1;
+    }
+  }
+  allocations.release(sigmas.byteLength + rhos.byteLength);
+
+  const sorted = radixSortFuzzyEdgePairsTracked(
+    heads,
+    tails,
+    weights,
+    cursor,
+    allocations,
+  );
+  heads = sorted.heads;
+  tails = sorted.tails;
+  weights = sorted.values;
+  let uniqueCount = 0;
+  for (let read = 0; read < cursor; ) {
+    const head = heads[read]!;
+    const tail = tails[read]!;
+    let complement = 1;
+    do {
+      complement *= 1 - weights[read]!;
+      read += 1;
+    } while (
+      read < cursor &&
+      heads[read] === head &&
+      tails[read] === tail
+    );
+    const unionWeight = 1 - complement;
+    if (unionWeight >= 1 / epochs) {
+      heads[uniqueCount] = head;
+      tails[uniqueCount] = tail;
+      weights[uniqueCount] = unionWeight;
+      uniqueCount += 1;
+    }
+  }
+
+  const compactHeads = new Int32Array(uniqueCount);
+  const compactTails = new Int32Array(uniqueCount);
+  const compactWeights = new Float32Array(uniqueCount);
+  allocations.retain(
+    compactHeads.byteLength + compactTails.byteLength + compactWeights.byteLength,
+  );
+  for (let edge = 0; edge < uniqueCount; edge += 1) {
+    compactHeads[edge] = heads[edge]!;
+    compactTails[edge] = tails[edge]!;
+    compactWeights[edge] = weights[edge]!;
+  }
+  allocations.release(heads.byteLength + tails.byteLength + weights.byteLength);
+  return {
+    head: compactHeads,
+    tail: compactTails,
+    weights: compactWeights,
+    edgeCount: uniqueCount,
+  };
 }
 
 function smoothKnnDistances(
@@ -531,6 +662,100 @@ function radixSortKeyValues(
     temporaryKeys.byteLength + temporaryValues.byteLength + counts.byteLength,
   );
   return { keys, values };
+}
+
+interface SortedFuzzyEdgePairs {
+  readonly heads: Uint32Array;
+  readonly tails: Uint32Array;
+  readonly values: Float32Array;
+}
+
+/**
+ * Sort fuzzy-graph edges in packed-key-equivalent `(tail, head)` order.
+ *
+ * Exported so the wide-row ordering and the 65,537-row collision boundary can
+ * be tested without constructing a full UMAP projection at that size.
+ */
+export function radixSortFuzzyEdgePairs(
+  inputHeads: Uint32Array,
+  inputTails: Uint32Array,
+  inputValues: Float32Array,
+  length: number,
+): SortedFuzzyEdgePairs {
+  return radixSortFuzzyEdgePairsTracked(
+    inputHeads,
+    inputTails,
+    inputValues,
+    length,
+    new AllocationTracker(),
+  );
+}
+
+function radixSortFuzzyEdgePairsTracked(
+  inputHeads: Uint32Array,
+  inputTails: Uint32Array,
+  inputValues: Float32Array,
+  length: number,
+  allocations: AllocationTracker,
+): SortedFuzzyEdgePairs {
+  let heads = inputHeads;
+  let tails = inputTails;
+  let values = inputValues;
+  let temporaryHeads: Uint32Array = new Uint32Array(inputHeads.length);
+  let temporaryTails: Uint32Array = new Uint32Array(inputTails.length);
+  let temporaryValues: Float32Array = new Float32Array(inputValues.length);
+  const counts = new Uint32Array(1 << 16);
+  allocations.retain(
+    temporaryHeads.byteLength +
+      temporaryTails.byteLength +
+      temporaryValues.byteLength +
+      counts.byteLength,
+  );
+
+  // Stable LSD passes make head the secondary key and tail the primary key,
+  // exactly matching numeric `tail * count + head` ordering without packing.
+  for (let pass = 0; pass < 4; pass += 1) {
+    const source = pass < 2 ? heads : tails;
+    const shift = (pass & 1) * 16;
+    counts.fill(0);
+    for (let i = 0; i < length; i += 1) {
+      const bucket = (source[i]! >>> shift) & 0xffff;
+      counts[bucket] = counts[bucket]! + 1;
+    }
+    let position = 0;
+    for (let bucket = 0; bucket < counts.length; bucket += 1) {
+      const size = counts[bucket]!;
+      counts[bucket] = position;
+      position += size;
+    }
+    for (let i = 0; i < length; i += 1) {
+      const bucket = (source[i]! >>> shift) & 0xffff;
+      const destination = counts[bucket]!;
+      temporaryHeads[destination] = heads[i]!;
+      temporaryTails[destination] = tails[i]!;
+      temporaryValues[destination] = values[i]!;
+      counts[bucket] = destination + 1;
+    }
+    const oldHeads = heads;
+    const oldTails = tails;
+    const oldValues = values;
+    heads = temporaryHeads;
+    tails = temporaryTails;
+    values = temporaryValues;
+    temporaryHeads = oldHeads;
+    temporaryTails = oldTails;
+    temporaryValues = oldValues;
+  }
+
+  // Four passes return data to the input arrays. Only the temporary arrays and
+  // radix counts cease to be live here.
+  allocations.release(
+    temporaryHeads.byteLength +
+      temporaryTails.byteLength +
+      temporaryValues.byteLength +
+      counts.byteLength,
+  );
+  return { heads, tails, values };
 }
 
 function optimizeLayout(

@@ -14,18 +14,20 @@ export interface NumericNeighborHeap {
 }
 
 export interface ClusteringKernelMemoryStats {
-  /** Fixed WebAssembly linear-memory reservation. */
+  /** Current WebAssembly linear-memory reservation. */
   readonly heapBytes: number;
-  /** Reusable scratch arena within the linear-memory reservation. */
+  /** Current reusable scratch-arena capacity. */
   readonly arenaCapacityBytes: number;
   /** Highest arena cursor observed across completed operations. */
   readonly peakArenaUsedBytes: number;
   /** Largest output set copied once into JS by a completed operation. */
   readonly peakReturnedJsBytes: number;
+  /** Strategy selected by the most recent Euclidean refinement. */
+  readonly lastRefinementMode?: "dense-pair-bitset" | "row-stamps";
 }
 
 /**
- * Numeric clustering stages that can run in a reusable fixed-memory backend.
+ * Numeric clustering stages that can run in a reusable WASM-memory backend.
  * Graph construction and density hierarchy orchestration remain in TypeScript.
  */
 export interface ClusteringNumericKernels {

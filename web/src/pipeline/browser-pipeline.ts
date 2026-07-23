@@ -9,6 +9,8 @@ import {
 import {
   clusterEmbeddings,
   clusterEmbeddingsSpectral,
+  DEFAULT_CLUSTERING_OPTIONS,
+  estimatePostUmapPeakWorkingBytes,
   type ClusteringNumericKernels,
 } from "../clustering";
 import type {
@@ -54,7 +56,7 @@ export interface BrowserPipelineHooks {
   readonly now?: () => number;
   /** Tests can inject the TypeScript reference without fetching a WASM asset. */
   readonly createFbank?: () => Promise<FbankComputer>;
-  /** Preloaded fixed-memory numeric kernels; production supplies one per worker. */
+  /** Preloaded reusable numeric kernels; production supplies one per worker. */
   readonly clusteringKernels?: ClusteringNumericKernels;
   /** Injectable source for Chromium's non-standard performance.memory probe. */
   readonly memoryPerformance?: MemoryPerformanceSource;
@@ -150,9 +152,7 @@ export async function runBrowserPipeline(
   const totalStart = now();
   let fbank: FbankComputer | undefined;
   let extractor: StreamingFbankExtractor | undefined;
-  const clusteringWasmHeapBytes = readExposedWasmHeapBytes(
-    hooks.clusteringKernels,
-  );
+  let fbankWasmHeapBytes: number | undefined;
 
   try {
     const vad = models.vad;
@@ -161,10 +161,11 @@ export async function runBrowserPipeline(
 
     try {
       fbank = await (hooks.createFbank ?? (() => WasmSenkoFbank.create()))();
+      fbankWasmHeapBytes = readExposedWasmHeapBytes(fbank);
       memory.setWasmHeapBytes(
         sumDefinedBytes(
-          readExposedWasmHeapBytes(fbank),
-          clusteringWasmHeapBytes,
+          fbankWasmHeapBytes,
+          readExposedWasmHeapBytes(hooks.clusteringKernels),
         ),
       );
       throwIfCancelled(hooks.signal);
@@ -636,7 +637,16 @@ export async function runBrowserPipeline(
               embedding.embeddingDim,
               {
                 onUmapStats(stats) {
-                  recordClusteringMemory(stats.peakWorkingBytes);
+                  recordClusteringMemory(
+                    Math.max(
+                      stats.peakWorkingBytes,
+                      estimatePostUmapPeakWorkingBytes(
+                        stats.count,
+                        stats.outputDimension,
+                        DEFAULT_CLUSTERING_OPTIONS.neighborCount,
+                      ),
+                    ),
+                  );
                 },
               },
               hooks.clusteringKernels,
@@ -645,6 +655,15 @@ export async function runBrowserPipeline(
     } catch (error) {
       rethrowForStage("clustering", error, hooks.signal);
     }
+    // A growable clustering backend may reserve more linear memory while
+    // processing this recording. Retain the disposed FBank heap's known size
+    // and refresh clustering ownership after its final numeric operation.
+    memory.setWasmHeapBytes(
+      sumDefinedBytes(
+        fbankWasmHeapBytes,
+        readExposedWasmHeapBytes(hooks.clusteringKernels),
+      ),
+    );
     const labelStats = countLabels(labels);
     const clusteringResult: StageResult<"clustering"> = {
       stage: "clustering",

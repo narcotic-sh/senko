@@ -16,10 +16,12 @@ mkdir -p "$(dirname "$output")"
   --no-entry \
   -s STANDALONE_WASM=1 \
   -s FILESYSTEM=0 \
-  -s ALLOW_MEMORY_GROWTH=0 \
+  -s ALLOW_MEMORY_GROWTH=1 \
+  -s MEMORY_GROWTH_GEOMETRIC_STEP=0 \
   -s INITIAL_MEMORY=11534336 \
+  -s MAXIMUM_MEMORY=2147483648 \
   -s STACK_SIZE=65536 \
-  -s EXPORTED_FUNCTIONS='["_cluster_reset","_cluster_alloc","_cluster_heap_base","_cluster_heap_capacity","_cluster_heap_used","_cluster_normalize_rows","_cluster_approximate_cosine_knn","_cluster_refine_euclidean_knn","_cluster_exact_euclidean_knn"]' \
+  -s EXPORTED_FUNCTIONS='["_cluster_reset","_cluster_reserve","_cluster_alloc","_cluster_heap_base","_cluster_heap_capacity","_cluster_heap_used","_cluster_normalize_rows","_cluster_approximate_cosine_knn","_cluster_refine_euclidean_knn","_cluster_exact_euclidean_knn"]' \
   -Wl,--strip-all \
   -o "$output"
 

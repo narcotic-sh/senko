@@ -199,6 +199,32 @@ describe("IncrementalVadSubsegmentReducer", () => {
     expectExactResult(result, expected);
   });
 
+  it("produces 47,999 windows for eight continuous hours without audio", () => {
+    const durationSeconds = 8 * 60 * 60;
+    const reducer = new IncrementalVadSubsegmentReducer();
+
+    const stable = reducer.consumeBatch(
+      [{ start: 0, end: durationSeconds }],
+      durationSeconds,
+    );
+    const result = reducer.finish();
+
+    // The strict native loop emits 47,998 ordinary 1.5-second windows through
+    // repeated 0.6-second addition, then EOF contributes one adjusted tail.
+    expect(stable.emittedSubsegments).toHaveLength(47_998);
+    expect(result.emittedSubsegments).toEqual([
+      { index: 47_998, start: durationSeconds - 1.5, end: durationSeconds },
+    ]);
+    expect(result.subsegments).toHaveLength(47_999);
+    expect(result.subsegments[0]).toEqual({ index: 0, start: 0, end: 1.5 });
+    expect(result.subsegments.at(-1)).toEqual({
+      index: 47_998,
+      start: durationSeconds - 1.5,
+      end: durationSeconds,
+    });
+    expect(result.vadSegments).toEqual([{ start: 0, end: durationSeconds }]);
+  });
+
   it("preserves the untrimmed zero-padded final VAD chunk and ignores padded B8 rows", () => {
     const chunks = createVadChunks(1);
     const logits = new Float32Array(

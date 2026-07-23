@@ -12,12 +12,16 @@ post-processing behavior without materializing an `N x N` matrix:
    production WASM path normalizes and builds this seed graph in one arena
    operation, so it never returns a separate normalized embedding matrix.
 3. Construct the fuzzy simplicial graph using radix-sorted typed edge arrays
-   and optimize the layout in one flat `Float32Array`.
+   and optimize the layout in one flat `Float32Array`. Recordings through
+   65,536 embeddings retain the benchmarked packed-Uint32 edge path; larger
+   graphs switch to a two-endpoint radix order so packed keys cannot wrap.
 4. Build an exact Euclidean 40-nearest-neighbor graph over the 10-dimensional
    layout without allocating an `N x N` distance matrix.
 5. Compute `min_samples=20` core distances and a sparse mutual-reachability MST.
 6. Condense the hierarchy at `min_cluster_size=10` and select clusters by
-   excess of mass, following HDBSCAN's flat-cluster strategy.
+   excess of mass, following HDBSCAN's flat-cluster strategy. Condensation and
+   selection use explicit traversal stacks, so degenerate long-recording trees
+   cannot exhaust the JavaScript call stack.
 7. Reassign every label population smaller than ten using original CAM++
    embedding centroids, then repeatedly merge centroid pairs whose cosine
    similarity is at least `0.875`. HDBSCAN's `-1` label is deliberately treated
@@ -26,10 +30,11 @@ post-processing behavior without materializing an `N x N` matrix:
 The default LSH workload is bounded by six 8-bit tables and 64 candidates per
 bucket. Large same-speaker buckets are sampled across the full recording rather
 than exhaustively compared. Refinement retains one bit per unordered row pair
-so a 192-dimensional distance is never recomputed; that triangular bitset is
-2.04 MB for the 5,713-row fixture and grows quadratically in bits, not in
-floating-point distances. The post-UMAP exact graph is quadratic in distance
-computations but linear in retained memory.
+while the exact operation fits the initial 10 MiB arena, so a 192-dimensional
+distance is never recomputed on the production fixture. That triangular bitset
+is 2.04 MB for 5,713 rows. Larger shapes switch to exact per-pass/per-row stamps
+whose scratch is linear in the row count. The post-UMAP exact graph is
+quadratic in distance computations but linear in retained memory.
 
 Hierarchy construction orders its 228,520 fixture edges with stable 16-bit LSD
 radix passes over `to`, `from`, and the unsigned bits of each non-negative
@@ -44,21 +49,26 @@ At that shape, radix ordering holds 3,918,464 explicitly sized bytes: the
 262,144-byte count table. The old path held 3,656,320 typed-array bytes plus a
 228,520-element boxed-number order, so the replacement saves at least 651,936
 transient bytes even if each boxed slot is counted as only four bytes. Pipeline
-`clusteringPeakWorkingBytes` does not decrease: that ledger reports the earlier,
-larger UMAP allocation peak rather than hierarchy's later transient storage.
+`clusteringPeakWorkingBytes` takes the larger of UMAP's measured typed-array
+peak and the exact graph/hierarchy allocation plan, rather than omitting this
+later transient state.
 
 `onUmapStats` exposes stage timings and deterministic typed-array allocation
-accounting. On the native hour-long reference, the production WASM-assisted
-path's logical peak is about 5.1 MB including its 0.23 MB output. The fixed
-11 MiB WASM heap and caller-owned embeddings are reported separately.
-At the native 192D/seed-64/neighbor-20 shape, the fixed arena admits up to
-6,199 rows; production preflights the exact requirement before copying data.
+accounting. On the 5,713-row reference, UMAP's logical peak is about 5.1 MB;
+the whole-clustering ledger reports 6,020,848 bytes after also accounting for
+the retained projection, exact graph, hierarchy radix state, and dendrogram.
+The initial 11 MiB WASM heap and caller-owned embeddings are reported
+separately. At the
+native 192D/seed-64/neighbor-20 shape, rows through 6,199 retain the fast dense
+bitset. Larger recordings use linear stamps and grow the reusable arena in
+exact 64 KiB pages; production preflights the exact requirement before copying
+data and reports the live grown heap to pipeline memory accounting.
 Process-level profiling is higher because it also includes V8 and downstream
 clustering allocations.
 
-Production workers preload one fixed-memory WASM kernel instance. Fused
+Production workers preload one reusable WASM kernel instance. Fused
 normalization plus seed k-NN, Euclidean neighbor refinement, and exact
 post-UMAP k-NN run there; TypeScript retains layout, hierarchy selection, and
 Senko's `CommonClustering` orchestration.
 See [`scripts/clustering-wasm/README.md`](../../scripts/clustering-wasm/README.md)
-for the reproducible benchmark and fixed-memory accounting.
+for the reproducible benchmark and adaptive-memory accounting.

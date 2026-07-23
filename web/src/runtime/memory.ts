@@ -31,7 +31,7 @@ export function readChromiumUsedJsHeapBytes(
   return isByteCount(used) ? used : undefined;
 }
 
-/** Probe a structurally exposed fixed WASM heap, such as WasmSenkoFbank. */
+/** Probe a structurally exposed WASM heap, including growable implementations. */
 export function readExposedWasmHeapBytes(value: unknown): number | undefined {
   if (typeof value !== "object" || value === null || !("memoryStats" in value)) {
     return undefined;

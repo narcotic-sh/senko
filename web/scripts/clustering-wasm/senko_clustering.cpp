@@ -1,30 +1,47 @@
 #include <math.h>
 #include <stdint.h>
 #include <string.h>
+#include <unistd.h>
 
 #include <emscripten/emscripten.h>
 
 namespace {
 
-constexpr uint32_t kArenaBytes = 10u * 1024u * 1024u;
-alignas(16) uint8_t arena[kArenaBytes];
+constexpr uint32_t kInitialArenaBytes = 10u * 1024u * 1024u;
+constexpr uint32_t kWasmPageBytes = 64u * 1024u;
+uint8_t* arena = nullptr;
+uint32_t arena_capacity = 0;
 uint32_t arena_cursor = 0;
 
 uint32_t align_up(uint32_t value, uint32_t alignment) {
   return (value + alignment - 1u) & ~(alignment - 1u);
 }
 
+uint64_t align_up_64(uint64_t value, uint64_t alignment) {
+  return (value + alignment - 1u) & ~(alignment - 1u);
+}
+
+bool product_fits_int(int left, int right) {
+  return left >= 0 && right >= 0 &&
+         (right == 0 || left <= INT32_MAX / right);
+}
+
 void* allocate_bytes(uint32_t bytes, uint32_t alignment = 16u) {
   const uint32_t start = align_up(arena_cursor, alignment);
-  if (start > kArenaBytes || bytes > kArenaBytes - start) return nullptr;
+  if (!arena || start < arena_cursor || start > arena_capacity ||
+      bytes > arena_capacity - start) {
+    return nullptr;
+  }
   arena_cursor = start + bytes;
   return arena + start;
 }
 
 template <typename T>
-T* allocate_items(uint32_t count) {
+T* allocate_items(uint64_t count) {
   if (count > UINT32_MAX / sizeof(T)) return nullptr;
-  return static_cast<T*>(allocate_bytes(count * sizeof(T), alignof(T) < 16 ? 16 : alignof(T)));
+  return static_cast<T*>(allocate_bytes(
+      static_cast<uint32_t>(count * sizeof(T)),
+      alignof(T) < 16 ? 16 : alignof(T)));
 }
 
 double squared_euclidean_unrolled(const float* left, const float* right,
@@ -222,11 +239,33 @@ extern "C" {
 
 EMSCRIPTEN_KEEPALIVE void cluster_reset() { arena_cursor = 0; }
 
+EMSCRIPTEN_KEEPALIVE int cluster_reserve(uint32_t required_bytes) {
+  if (required_bytes <= arena_capacity) return 1;
+  if (required_bytes > UINT32_MAX - (kWasmPageBytes - 1u)) return 0;
+  const uint32_t rounded_bytes =
+      (required_bytes + kWasmPageBytes - 1u) & ~(kWasmPageBytes - 1u);
+  const uint32_t increment = rounded_bytes - arena_capacity;
+  if (increment > static_cast<uint32_t>(INT32_MAX)) return 0;
+  void* const extension = sbrk(static_cast<intptr_t>(increment));
+  if (extension == reinterpret_cast<void*>(-1)) return 0;
+
+  if (!arena) {
+    if ((reinterpret_cast<uintptr_t>(extension) & 15u) != 0u) return 0;
+    arena = static_cast<uint8_t*>(extension);
+  } else if (extension != arena + arena_capacity) {
+    return 0;
+  }
+  arena_capacity = rounded_bytes;
+  return 1;
+}
+
 EMSCRIPTEN_KEEPALIVE uintptr_t cluster_heap_base() {
   return reinterpret_cast<uintptr_t>(arena);
 }
 
-EMSCRIPTEN_KEEPALIVE uint32_t cluster_heap_capacity() { return kArenaBytes; }
+EMSCRIPTEN_KEEPALIVE uint32_t cluster_heap_capacity() {
+  return arena_capacity;
+}
 
 EMSCRIPTEN_KEEPALIVE uint32_t cluster_heap_used() { return arena_cursor; }
 
@@ -241,7 +280,10 @@ EMSCRIPTEN_KEEPALIVE uintptr_t cluster_alloc(uint32_t bytes,
 EMSCRIPTEN_KEEPALIVE int cluster_normalize_rows(const float* input,
                                                 float* output, int count,
                                                 int dim) {
-  if (!input || !output || count < 0 || dim <= 0) return -1;
+  if (!input || !output || count < 0 || dim <= 0 ||
+      !product_fits_int(count, dim)) {
+    return -1;
+  }
   for (int row = 0; row < count; ++row) {
     const float* source = input + row * dim;
     float* target = output + row * dim;
@@ -266,22 +308,38 @@ EMSCRIPTEN_KEEPALIVE int cluster_approximate_cosine_knn(
   if (!values || !output_indices || !output_similarities || count < 1 ||
       dim < 1 || neighbor_count < 1 || neighbor_count >= count ||
       table_count < 1 || bits < 1 || bits > 16 || bucket_sample_limit < 1 ||
-      temporal_neighbor_radius < 0) {
+      temporal_neighbor_radius < 0 || !product_fits_int(count, dim) ||
+      !product_fits_int(count, neighbor_count) ||
+      !product_fits_int(table_count, bits)) {
     return -1;
   }
   const int bucket_count = 1 << bits;
   const int plane_count = table_count * bits;
-  int8_t* planes = allocate_items<int8_t>(plane_count * dim);
-  uint16_t* signatures = allocate_items<uint16_t>(count * table_count);
-  int32_t* bucket_sizes = allocate_items<int32_t>(table_count * bucket_count);
+  if (!product_fits_int(plane_count, dim) ||
+      !product_fits_int(count, table_count) ||
+      !product_fits_int(table_count, bucket_count) ||
+      !product_fits_int(table_count, bucket_count + 1)) {
+    return -1;
+  }
+  int8_t* planes = allocate_items<int8_t>(
+      static_cast<uint64_t>(plane_count) * dim);
+  uint16_t* signatures = allocate_items<uint16_t>(
+      static_cast<uint64_t>(count) * table_count);
+  int32_t* bucket_sizes = allocate_items<int32_t>(
+      static_cast<uint64_t>(table_count) * bucket_count);
   int32_t* bucket_offsets =
-      allocate_items<int32_t>(table_count * (bucket_count + 1));
-  int32_t* bucket_rows = allocate_items<int32_t>(table_count * count);
+      allocate_items<int32_t>(static_cast<uint64_t>(table_count) *
+                              (bucket_count + 1));
+  int32_t* bucket_rows = allocate_items<int32_t>(
+      static_cast<uint64_t>(table_count) * count);
   int32_t* seen = allocate_items<int32_t>(count);
-  const int candidate_capacity =
-      table_count * bucket_sample_limit * 2 + temporal_neighbor_radius * 2 < count
-          ? table_count * bucket_sample_limit * 2 + temporal_neighbor_radius * 2
-          : count;
+  const int64_t requested_candidate_capacity =
+      static_cast<int64_t>(table_count) * bucket_sample_limit * 2 +
+      static_cast<int64_t>(temporal_neighbor_radius) * 2;
+  const int candidate_capacity = static_cast<int>(
+      requested_candidate_capacity < count ? requested_candidate_capacity
+                                           : count);
+  if (candidate_capacity < 0) return -1;
   int32_t* candidates = allocate_items<int32_t>(candidate_capacity);
   if (!planes || !signatures || !bucket_sizes || !bucket_offsets ||
       !bucket_rows || !seen || !candidates) {
@@ -311,7 +369,7 @@ EMSCRIPTEN_KEEPALIVE int cluster_approximate_cosine_knn(
   }
 
   memset(bucket_sizes, 0,
-         table_count * bucket_count * sizeof(int32_t));
+         static_cast<size_t>(table_count) * bucket_count * sizeof(int32_t));
   for (int table = 0; table < table_count; ++table) {
     int32_t* sizes = bucket_sizes + table * bucket_count;
     int32_t* offsets = bucket_offsets + table * (bucket_count + 1);
@@ -335,7 +393,7 @@ EMSCRIPTEN_KEEPALIVE int cluster_approximate_cosine_knn(
     output_indices[i] = -1;
     output_similarities[i] = -INFINITY;
   }
-  memset(seen, 0, count * sizeof(int32_t));
+  memset(seen, 0, static_cast<size_t>(count) * sizeof(int32_t));
   for (int row = 0; row < count; ++row) {
     const int stamp = row + 1;
     seen[row] = stamp;
@@ -399,7 +457,9 @@ EMSCRIPTEN_KEEPALIVE int cluster_refine_euclidean_knn(
     uint8_t* output_is_new) {
   if (!embeddings || !seed_indices || !output_indices || !output_distances ||
       !output_is_new || count < 1 || dim < 1 || neighbor_count < 2 ||
-      seed_neighbor_count < 1) {
+      seed_neighbor_count < 1 || !product_fits_int(count, dim) ||
+      !product_fits_int(count, neighbor_count) ||
+      !product_fits_int(count, seed_neighbor_count)) {
     return -1;
   }
   const int length = count * neighbor_count;
@@ -413,12 +473,20 @@ EMSCRIPTEN_KEEPALIVE int cluster_refine_euclidean_knn(
   const uint64_t pair_count =
       static_cast<uint64_t>(count) * static_cast<uint64_t>(count - 1) / 2u;
   const uint64_t pair_word_count_64 = (pair_count + 31u) / 32u;
-  if (pair_word_count_64 > UINT32_MAX) return -2;
-  const uint32_t pair_word_count =
-      static_cast<uint32_t>(pair_word_count_64);
-  uint32_t* evaluated_pairs = allocate_items<uint32_t>(pair_word_count);
-  if (!evaluated_pairs) return -2;
-  memset(evaluated_pairs, 0, pair_word_count * sizeof(uint32_t));
+  uint64_t dense_end = align_up_64(arena_cursor, 16u) +
+                       pair_word_count_64 * sizeof(uint32_t);
+  dense_end = align_up_64(dense_end, 16u) +
+              static_cast<uint64_t>(length) * sizeof(int32_t);
+  dense_end = align_up_64(dense_end, 16u) +
+              static_cast<uint64_t>(length) * sizeof(uint8_t);
+  const bool use_dense_pair_bitset = dense_end <= kInitialArenaBytes;
+  uint32_t* evaluated_pairs = nullptr;
+  if (use_dense_pair_bitset) {
+    evaluated_pairs = allocate_items<uint32_t>(pair_word_count_64);
+    if (!evaluated_pairs) return -2;
+    memset(evaluated_pairs, 0,
+           static_cast<size_t>(pair_word_count_64) * sizeof(uint32_t));
+  }
   DeterministicRandom random{random_seed};
   for (int row = 0; row < count; ++row) {
     heap_push(heap, row, 0.0, row, 1);
@@ -426,7 +494,8 @@ EMSCRIPTEN_KEEPALIVE int cluster_refine_euclidean_knn(
     for (int rank = 0; rank < seed_neighbor_count; ++rank) {
       const int candidate = seed_indices[seed_offset + rank];
       if (candidate < 0 || candidate >= count ||
-          !mark_unordered_pair(evaluated_pairs, count, row, candidate)) {
+          (use_dense_pair_bitset &&
+           !mark_unordered_pair(evaluated_pairs, count, row, candidate))) {
         continue;
       }
       const double distance = euclidean(embeddings + row * dim,
@@ -436,7 +505,8 @@ EMSCRIPTEN_KEEPALIVE int cluster_refine_euclidean_knn(
     }
     for (int sample = 0; sample < 4; ++sample) {
       const int candidate = static_cast<int>(floor(random.next() * count));
-      if (!mark_unordered_pair(evaluated_pairs, count, row, candidate)) {
+      if ((use_dense_pair_bitset &&
+           !mark_unordered_pair(evaluated_pairs, count, row, candidate))) {
         continue;
       }
       const double distance = euclidean(embeddings + row * dim,
@@ -448,17 +518,33 @@ EMSCRIPTEN_KEEPALIVE int cluster_refine_euclidean_knn(
 
   int32_t* snapshot_indices = allocate_items<int32_t>(length);
   uint8_t* snapshot_flags = allocate_items<uint8_t>(length);
-  if (!snapshot_indices || !snapshot_flags) return -2;
+  uint32_t* candidate_stamps = use_dense_pair_bitset
+                                   ? nullptr
+                                   : allocate_items<uint32_t>(count);
+  if (!snapshot_indices || !snapshot_flags ||
+      (!use_dense_pair_bitset && !candidate_stamps)) {
+    return -2;
+  }
   const int convergence_limit =
       static_cast<int>(floor(0.001 * neighbor_count * count)) > 1
           ? static_cast<int>(floor(0.001 * neighbor_count * count))
           : 1;
   for (int iteration = 0; iteration < 6; ++iteration) {
-    memcpy(snapshot_indices, output_indices, length * sizeof(int32_t));
-    memcpy(snapshot_flags, output_is_new, length * sizeof(uint8_t));
-    memset(output_is_new, 0, length * sizeof(uint8_t));
+    memcpy(snapshot_indices, output_indices,
+           static_cast<size_t>(length) * sizeof(int32_t));
+    memcpy(snapshot_flags, output_is_new,
+           static_cast<size_t>(length) * sizeof(uint8_t));
+    memset(output_is_new, 0,
+           static_cast<size_t>(length) * sizeof(uint8_t));
+    if (candidate_stamps) {
+      // Clearing once per pass gives each row a distinct (iteration, row)
+      // stamp without constraining the supported row count to a packed stamp.
+      memset(candidate_stamps, 0,
+             static_cast<size_t>(count) * sizeof(uint32_t));
+    }
     int changes = 0;
     for (int row = 0; row < count; ++row) {
+      const uint32_t candidate_stamp = static_cast<uint32_t>(row) + 1u;
       const int row_offset = row * neighbor_count;
       for (int rank = 0; rank < neighbor_count; ++rank) {
         const int pivot_offset = row_offset + rank;
@@ -474,13 +560,20 @@ EMSCRIPTEN_KEEPALIVE int cluster_refine_euclidean_knn(
               (!pivot_is_new && snapshot_flags[candidate_offset] == 0)) {
             continue;
           }
-          // Every distance attempt updates both endpoint heaps, and a heap's
-          // maximum retained distance can only decrease. Once an unordered
-          // pair has been attempted, every later attempt in either direction
-          // is therefore guaranteed to return zero. This remains true across
-          // snapshot iterations as well as within one row.
-          if (!mark_unordered_pair(evaluated_pairs, count, row, candidate)) {
-            continue;
+          if (use_dense_pair_bitset) {
+            // Every distance attempt updates both endpoint heaps, and a heap's
+            // maximum retained distance can only decrease. Once an unordered
+            // pair has been attempted, every later attempt in either direction
+            // is therefore guaranteed to return zero. This remains true across
+            // snapshot iterations as well as within one row.
+            if (!mark_unordered_pair(evaluated_pairs, count, row, candidate)) {
+              continue;
+            }
+          } else {
+            // The scalable path is the exact predecessor algorithm: suppress
+            // duplicate candidates only within this snapshot pass and row.
+            if (candidate_stamps[candidate] == candidate_stamp) continue;
+            candidate_stamps[candidate] = candidate_stamp;
           }
           const double distance = euclidean(embeddings + row * dim,
                                             embeddings + candidate * dim, dim);
@@ -521,7 +614,9 @@ EMSCRIPTEN_KEEPALIVE int cluster_exact_euclidean_knn(
     const float* values, int count, int dim, int neighbor_count,
     int32_t* output_indices, float* output_similarities) {
   if (!values || !output_indices || !output_similarities || count < 1 ||
-      dim < 1 || neighbor_count < 1 || neighbor_count >= count) {
+      dim < 1 || neighbor_count < 1 || neighbor_count >= count ||
+      !product_fits_int(count, dim) ||
+      !product_fits_int(count, neighbor_count)) {
     return -1;
   }
   const int length = count * neighbor_count;

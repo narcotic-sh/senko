@@ -157,7 +157,7 @@ retaining their experimental code. The earlier dense, transit, and FCM A/B
 results remain documented in the raw runtime README and retained artifacts.
 
 Long-file UMAP now performs row normalization and deterministic 64-neighbor
-seed discovery as one warmed operation in the fixed clustering WASM arena. On
+seed discovery as one warmed operation in the clustering WASM arena. On
 the 5,713-row reference fixture, seed construction fell from 395.021 ms to
 179.750 ms while returning byte-identical indices and similarities. Refinement
 now records each evaluated unordered row pair in a 2,039,544-byte bitset. Its
@@ -206,11 +206,12 @@ and its native labels scatter. The evidence therefore favors eight meaningful
 speakers. Senko does not add fixture-specific label or count forcing to obtain
 that result; the browser retains the native postprocessing semantics.
 
-The clustering pair bitset adds 2 MiB to the fixed WASM heap while the LSTM
-input-affine arena adds 19,300,352 bytes to exact GPU ownership. Known CPU
+For these reference fixtures, the clustering pair bitset adds 2 MiB to the
+initial WASM heap while the LSTM input-affine arena adds 19,300,352 bytes to
+exact GPU ownership. Known CPU
 peaks remain small:
 
-| Fixture | Known CPU peak | Explicit GPU-buffer peak | Fixed WASM heaps | Isolated page + worker diagnostic |
+| Fixture | Known CPU peak | Explicit GPU-buffer peak | WASM heaps | Isolated page + worker diagnostic |
 | --- | ---: | ---: | ---: | ---: |
 | `test_audio_short.wav` | 7,351,392 B | 84,001,024 B | 12,058,624 B | not sampled at this checkpoint |
 | `test_audio.wav` | 9,822,920 B | 84,001,024 B | 12,058,624 B | 14,430,058 B post-run-1 baseline |
@@ -224,9 +225,9 @@ held and streamed without making a file-sized copy; it is therefore reported
 separately from `knownCpuPeakBytes`. The long run's largest named CPU working
 allocation is 5,116,104 bytes for clustering.
 
-Production's fixed ownership is 9,822,920 bytes at the known long-file CPU
+Production's reference-file ownership is 9,822,920 bytes at the known CPU
 peak, 84,001,024 bytes of explicit GPU buffers, and 12,058,624 bytes across the
-fixed WASM heaps. The GPU total is exactly 44,145,664 bytes for B8 VAD plus
+WASM heaps. The GPU total is exactly 44,145,664 bytes for B8 VAD plus
 39,855,360 bytes for B16 CAM++. The external zero-copy audio `Blob` is
 118,273,444 bytes. The retained-memory protocol below measured the comparable
 post-GC page-agent baseline near 14.43 MB; Chrome's coarse page samples and the
@@ -261,7 +262,7 @@ FP16 production path.
 | `test_audio.wav` | 16.650–16.760 s | 132,535,040 B | 9 speakers, 136 segments | 0.998660/0.998744 speech IoU; 0.988457/0.988393 mapped agreement |
 
 The long page-scoped run measured 25,146,688 bytes for the isolated Senko page
-and dedicated worker at completion, alongside 12,058,624 fixed WASM bytes and
+and dedicated worker at completion, alongside 12,058,624 WASM bytes and
 9,815,976 bytes of known CPU working state. The input Blob remained externally
 backed. A two-run short-file retained-memory diagnostic grew by only 73,864
 bytes from post-run 1 to post-run 2, within the coarse measurement noise. The
@@ -298,7 +299,7 @@ receive its path in the output.
 Standard output is one concise JSON record. `wallMs` is the real end-to-end
 worker wall clock; `stageAttributedTotalMs` can be larger because FBank and
 CAM++ overlap. `logicalMemory` contains Senko's exact/lower-bound accounting for
-owned CPU buffers, GPU buffers, the fixed WASM heap, and named allocations. The
+owned CPU buffers, GPU buffers, the current WASM heaps, and named allocations. The
 full segment list is intentionally omitted. Use `--raw-result <path>` to also
 save the unmodified completion-time result; its byte length and SHA-256 are
 always recorded.

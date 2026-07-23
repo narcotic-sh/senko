@@ -88,4 +88,48 @@ describe("sparse hierarchy", () => {
       0, 0, 0, 1, 1, 1,
     ]);
   });
+
+  it("handles a 48,000-row deeply nested condensed hierarchy", () => {
+    const count = 48_000;
+    const graph = makeDeepPairChain(count);
+
+    const labels = clusterSparseGraph(graph, count, 1, 2);
+
+    expect(labels).toHaveLength(count);
+    expect(new Set(labels)).toEqual(new Set([0, 1]));
+    expect(labels.subarray(0, count - 2).every((label) => label === 0)).toBe(
+      true,
+    );
+    expect([...labels.subarray(count - 2)]).toEqual([1, 1]);
+  });
 });
+
+function makeDeepPairChain(count: number): KnnGraph {
+  const neighborCount = 2;
+  const indices = new Int32Array(count * neighborCount);
+  const similarities = new Float32Array(indices.length);
+  const pairCount = count / 2;
+
+  for (let row = 0; row < count; row += 1) {
+    const offset = row * neighborCount;
+    indices[offset] = row;
+    similarities[offset] = 1;
+    const pair = Math.floor(row / 2);
+    if ((row & 1) === 0) {
+      indices[offset + 1] = row + 1;
+      similarities[offset + 1] = 1 - 0.09;
+    } else if (pair === 0) {
+      indices[offset + 1] = row - 1;
+      similarities[offset + 1] = 1 - 0.09;
+    } else {
+      indices[offset + 1] = row - 2;
+      const bridgeDistance =
+        pair === pairCount - 1
+          ? 1
+          : 0.091 + (0.008 * pair) / (pairCount - 1);
+      similarities[offset + 1] = 1 - bridgeDistance;
+    }
+  }
+
+  return { indices, similarities, neighborCount };
+}

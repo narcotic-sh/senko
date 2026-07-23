@@ -12,11 +12,20 @@ import {
 } from "./types";
 
 let compiledModule: Promise<WebAssembly.Module> | undefined;
+const clusteringWasmImports = {
+  env: {
+    emscripten_notify_memory_growth(memoryIndex: number): void {
+      // The wrapper creates fresh typed-array views after every reserve.
+      void memoryIndex;
+    },
+  },
+} satisfies WebAssembly.Imports;
 
 interface ClusteringWasmExports extends WebAssembly.Exports {
   readonly memory: WebAssembly.Memory;
   readonly _initialize: () => void;
   readonly cluster_reset: () => void;
+  readonly cluster_reserve: (requiredBytes: number) => number;
   readonly cluster_alloc: (bytes: number, alignment: number) => number;
   readonly cluster_heap_base: () => number;
   readonly cluster_heap_capacity: () => number;
@@ -61,16 +70,22 @@ interface ClusteringWasmExports extends WebAssembly.Exports {
   ) => number;
 }
 
-/** Fixed-heap SIMD WebAssembly backend for clustering's numeric hotspots. */
+/** Reusable SIMD WebAssembly backend for clustering's numeric hotspots. */
 export class WasmClusteringKernels implements ClusteringNumericKernels {
   private exports: ClusteringWasmExports | undefined;
   private peakArenaUsedBytes = 0;
   private peakReturnedJsBytes = 0;
-  private readonly heapBytes: number;
-  private readonly arenaCapacityBytes: number;
+  private lastHeapBytes = 0;
+  private lastArenaCapacityBytes = 0;
+  private lastRefinementMode:
+    | "dense-pair-bitset"
+    | "row-stamps"
+    | undefined;
 
   private constructor(exports: ClusteringWasmExports) {
     exports._initialize();
+    this.exports = exports;
+    this.reserveArena(exports, INITIAL_ARENA_BYTES);
     const heapBytes = exports.memory.buffer.byteLength;
     const arenaBase = exports.cluster_heap_base();
     const arenaCapacityBytes = exports.cluster_heap_capacity();
@@ -81,20 +96,24 @@ export class WasmClusteringKernels implements ClusteringNumericKernels {
     ) {
       throw new Error("Clustering WASM scratch arena is outside linear memory");
     }
-    this.exports = exports;
-    this.heapBytes = heapBytes;
-    this.arenaCapacityBytes = arenaCapacityBytes;
+    this.lastArenaCapacityBytes = arenaCapacityBytes;
   }
 
   static async create(): Promise<WasmClusteringKernels> {
     compiledModule ??= WebAssembly.compileStreaming(fetch(clusteringWasmUrl));
-    const instance = await WebAssembly.instantiate(await compiledModule, {});
+    const instance = await WebAssembly.instantiate(
+      await compiledModule,
+      clusteringWasmImports,
+    );
     return WasmClusteringKernels.fromInstance(instance);
   }
 
   /** Instantiate supplied bytes, primarily for Node/Vitest verification. */
   static async fromBytes(bytes: BufferSource): Promise<WasmClusteringKernels> {
-    const instantiated = await WebAssembly.instantiate(bytes, {});
+    const instantiated = await WebAssembly.instantiate(
+      bytes,
+      clusteringWasmImports,
+    );
     const instance =
       instantiated instanceof WebAssembly.Instance
         ? instantiated
@@ -103,11 +122,20 @@ export class WasmClusteringKernels implements ClusteringNumericKernels {
   }
 
   get memoryStats(): ClusteringKernelMemoryStats {
+    const arenaCapacityBytes =
+      this.exports?.cluster_heap_capacity() ?? this.lastArenaCapacityBytes;
+    const heapBytes =
+      this.exports?.memory.buffer.byteLength ?? this.lastHeapBytes;
+    this.lastHeapBytes = heapBytes;
+    this.lastArenaCapacityBytes = arenaCapacityBytes;
     return {
-      heapBytes: this.heapBytes,
-      arenaCapacityBytes: this.arenaCapacityBytes,
+      heapBytes,
+      arenaCapacityBytes,
       peakArenaUsedBytes: this.peakArenaUsedBytes,
       peakReturnedJsBytes: this.peakReturnedJsBytes,
+      ...(this.lastRefinementMode === undefined
+        ? {}
+        : { lastRefinementMode: this.lastRefinementMode }),
     };
   }
 
@@ -151,7 +179,7 @@ export class WasmClusteringKernels implements ClusteringNumericKernels {
     dim: number,
   ): Float32Array {
     requireMatrix("embeddings", embeddings, count, dim);
-    const exports = this.beginOperation();
+    const exports = this.beginOperation(matrixArenaBytes(count, dim));
     const valuesPointer = this.copyFloat32(exports, embeddings);
     this.requireSuccess(
       "normalize rows",
@@ -176,7 +204,9 @@ export class WasmClusteringKernels implements ClusteringNumericKernels {
     if (neighborCount === 0) {
       return emptyKnnGraph();
     }
-    const exports = this.beginOperation();
+    const exports = this.beginOperation(
+      approximateCosineArenaBytes(count, dim, neighborCount, options),
+    );
     const valuesPointer = this.copyFloat32(exports, normalized);
     return this.buildApproximateCosineKnnInCurrentArena(
       exports,
@@ -199,7 +229,9 @@ export class WasmClusteringKernels implements ClusteringNumericKernels {
     if (neighborCount === 0) {
       return emptyKnnGraph();
     }
-    const exports = this.beginOperation();
+    const exports = this.beginOperation(
+      approximateCosineArenaBytes(count, dim, neighborCount, options),
+    );
     const valuesPointer = this.copyFloat32(exports, embeddings);
     this.requireSuccess(
       "normalize rows",
@@ -224,7 +256,11 @@ export class WasmClusteringKernels implements ClusteringNumericKernels {
     neighborCount: number,
     options: ResolvedClusteringOptions,
   ): NumericKnnGraph {
-    const outputLength = count * neighborCount;
+    const outputLength = checkedElementCount(
+      "approximate k-NN output",
+      count,
+      neighborCount,
+    );
     const indicesPointer = this.allocate(
       exports,
       outputLength * Int32Array.BYTES_PER_ELEMENT,
@@ -276,22 +312,27 @@ export class WasmClusteringKernels implements ClusteringNumericKernels {
     randomSeed: number,
   ): NumericNeighborHeap {
     requireMatrix("embeddings", embeddings, count, dim);
-    requireLength("seed indices", seedIndices, count * seedNeighborCount);
-    const requiredArenaBytes = refinementArenaBytes(
+    const seedLength = checkedElementCount(
+      "seed indices",
+      count,
+      seedNeighborCount,
+    );
+    requireLength("seed indices", seedIndices, seedLength);
+    const arenaPlan = refinementArenaPlan(
       count,
       dim,
       seedNeighborCount,
       neighborCount,
     );
-    if (requiredArenaBytes > this.arenaCapacityBytes) {
-      throw new RangeError(
-        `Clustering WASM Euclidean refinement needs ${requiredArenaBytes} scratch bytes for ${count} rows; fixed arena capacity is ${this.arenaCapacityBytes}`,
-      );
-    }
-    const exports = this.beginOperation();
+    this.lastRefinementMode = arenaPlan.mode;
+    const exports = this.beginOperation(arenaPlan.requiredBytes);
     const embeddingsPointer = this.copyFloat32(exports, embeddings);
     const seedPointer = this.copyInt32(exports, seedIndices);
-    const outputLength = count * neighborCount;
+    const outputLength = checkedElementCount(
+      "neighbor-refinement output",
+      count,
+      neighborCount,
+    );
     const indicesPointer = this.allocate(
       exports,
       outputLength * Int32Array.BYTES_PER_ELEMENT,
@@ -351,9 +392,15 @@ export class WasmClusteringKernels implements ClusteringNumericKernels {
     if (neighborCount === 0) {
       return emptyKnnGraph();
     }
-    const exports = this.beginOperation();
+    const exports = this.beginOperation(
+      exactEuclideanArenaBytes(count, dim, neighborCount),
+    );
     const valuesPointer = this.copyFloat32(exports, values);
-    const outputLength = count * neighborCount;
+    const outputLength = checkedElementCount(
+      "exact k-NN output",
+      count,
+      neighborCount,
+    );
     const indicesPointer = this.allocate(
       exports,
       outputLength * Int32Array.BYTES_PER_ELEMENT,
@@ -392,6 +439,10 @@ export class WasmClusteringKernels implements ClusteringNumericKernels {
   }
 
   dispose(): void {
+    if (this.exports !== undefined) {
+      this.lastHeapBytes = this.exports.memory.buffer.byteLength;
+      this.lastArenaCapacityBytes = this.exports.cluster_heap_capacity();
+    }
     this.exports = undefined;
   }
 
@@ -403,10 +454,45 @@ export class WasmClusteringKernels implements ClusteringNumericKernels {
     );
   }
 
-  private beginOperation(): ClusteringWasmExports {
+  private beginOperation(requiredArenaBytes: number): ClusteringWasmExports {
     const exports = this.requireExports();
+    this.reserveArena(exports, requiredArenaBytes);
     exports.cluster_reset();
     return exports;
+  }
+
+  private reserveArena(
+    exports: ClusteringWasmExports,
+    requiredArenaBytes: number,
+  ): void {
+    if (
+      !Number.isSafeInteger(requiredArenaBytes) ||
+      requiredArenaBytes < 0 ||
+      requiredArenaBytes > UINT32_MAX
+    ) {
+      throw new RangeError(
+        `Clustering WASM scratch requirement ${requiredArenaBytes} is outside the wasm32 address range`,
+      );
+    }
+    if (requiredArenaBytes > exports.cluster_heap_capacity()) {
+      const status = exports.cluster_reserve(requiredArenaBytes);
+      if (status !== 1) {
+        throw new RangeError(
+          `Clustering WASM could not reserve ${requiredArenaBytes} scratch bytes`,
+        );
+      }
+    }
+    const arenaBase = exports.cluster_heap_base();
+    const arenaCapacityBytes = exports.cluster_heap_capacity();
+    if (
+      arenaBase <= 0 ||
+      arenaCapacityBytes < requiredArenaBytes ||
+      arenaBase + arenaCapacityBytes > exports.memory.buffer.byteLength
+    ) {
+      throw new Error("Clustering WASM scratch arena is outside linear memory");
+    }
+    this.lastHeapBytes = exports.memory.buffer.byteLength;
+    this.lastArenaCapacityBytes = arenaCapacityBytes;
   }
 
   private requireExports(): ClusteringWasmExports {
@@ -424,7 +510,7 @@ export class WasmClusteringKernels implements ClusteringNumericKernels {
     const pointer = exports.cluster_alloc(bytes, alignment);
     if (pointer === 0) {
       throw new RangeError(
-        `Clustering WASM fixed scratch arena exhausted while allocating ${bytes} bytes`,
+        `Clustering WASM scratch arena exhausted while allocating ${bytes} bytes`,
       );
     }
     return pointer;
@@ -549,7 +635,7 @@ function requireMatrix(
   count: number,
   dim: number,
 ): void {
-  requireLength(name, values, count * dim);
+  requireLength(name, values, checkedElementCount(name, count, dim));
 }
 
 function requireLength(
@@ -564,25 +650,200 @@ function requireLength(
   }
 }
 
+function checkedElementCount(
+  name: string,
+  ...dimensions: readonly number[]
+): number {
+  let result = 1n;
+  for (const dimension of dimensions) {
+    if (
+      !Number.isSafeInteger(dimension) ||
+      dimension < 0 ||
+      dimension > INT32_MAX
+    ) {
+      throw new RangeError(
+        `${name} dimension ${dimension} is outside the signed wasm32 range`,
+      );
+    }
+    result *= BigInt(dimension);
+    if (result > BigInt(INT32_MAX)) {
+      throw new RangeError(
+        `${name} element count exceeds the signed wasm32 index range`,
+      );
+    }
+  }
+  return Number(result);
+}
+
+class ArenaSizer {
+  private cursor: bigint;
+
+  constructor(cursor = 0n) {
+    this.cursor = cursor;
+  }
+
+  copy(): ArenaSizer {
+    return new ArenaSizer(this.cursor);
+  }
+
+  add(
+    elementCount: bigint,
+    elementBytes: bigint,
+    alignment = 16n,
+  ): void {
+    const bytes = elementCount * elementBytes;
+    if (bytes < 0n || bytes > UINT32_MAX_BIGINT) {
+      throw new RangeError(
+        `Clustering WASM allocation of ${bytes} bytes is outside the wasm32 address range`,
+      );
+    }
+    this.cursor = alignBigInt(this.cursor, alignment) + bytes;
+    if (this.cursor > UINT32_MAX_BIGINT) {
+      throw new RangeError(
+        `Clustering WASM scratch requirement ${this.cursor} is outside the wasm32 address range`,
+      );
+    }
+  }
+
+  bytes(): number {
+    return Number(this.cursor);
+  }
+}
+
+function alignBigInt(value: bigint, alignment: bigint): bigint {
+  return (value + alignment - 1n) & ~(alignment - 1n);
+}
+
+function matrixArenaBytes(count: number, dim: number): number {
+  const sizer = new ArenaSizer();
+  sizer.add(BigInt(count) * BigInt(dim), 4n, 4n);
+  return sizer.bytes();
+}
+
+function approximateCosineArenaBytes(
+  count: number,
+  dim: number,
+  neighborCount: number,
+  options: ResolvedClusteringOptions,
+): number {
+  checkedElementCount("approximate k-NN output", count, neighborCount);
+  checkedElementCount(
+    "approximate hash planes",
+    options.hashTableCount,
+    options.hashBits,
+    dim,
+  );
+  checkedElementCount(
+    "approximate signatures",
+    count,
+    options.hashTableCount,
+  );
+  const numericBucketCount = 2 ** options.hashBits;
+  checkedElementCount(
+    "approximate hash buckets",
+    options.hashTableCount,
+    numericBucketCount,
+  );
+  checkedElementCount(
+    "approximate hash bucket offsets",
+    options.hashTableCount,
+    numericBucketCount + 1,
+  );
+  const n = BigInt(count);
+  const d = BigInt(dim);
+  const neighbors = BigInt(neighborCount);
+  const tables = BigInt(options.hashTableCount);
+  const bits = BigInt(options.hashBits);
+  const bucketSampleLimit = BigInt(options.bucketSampleLimit);
+  const temporalRadius = BigInt(options.temporalNeighborRadius);
+  const bucketCount = 1n << bits;
+  const planeCount = tables * bits;
+  const candidateCapacity =
+    tables * bucketSampleLimit * 2n + temporalRadius * 2n < n
+      ? tables * bucketSampleLimit * 2n + temporalRadius * 2n
+      : n;
+
+  const sizer = new ArenaSizer();
+  // Wrapper allocations use their natural typed-array alignment.
+  sizer.add(n * d, 4n, 4n);
+  sizer.add(n * neighbors, 4n, 4n);
+  sizer.add(n * neighbors, 4n, 4n);
+  // Kernel scratch allocations are deliberately 16-byte aligned.
+  sizer.add(planeCount * d, 1n);
+  sizer.add(n * tables, 2n);
+  sizer.add(tables * bucketCount, 4n);
+  sizer.add(tables * (bucketCount + 1n), 4n);
+  sizer.add(tables * n, 4n);
+  sizer.add(n, 4n);
+  sizer.add(candidateCapacity, 4n);
+  return sizer.bytes();
+}
+
+interface RefinementArenaPlan {
+  readonly mode: "dense-pair-bitset" | "row-stamps";
+  readonly requiredBytes: number;
+}
+
 /** Exact wrapper-plus-kernel high-water mark for Euclidean refinement. */
-function refinementArenaBytes(
+function refinementArenaPlan(
   count: number,
   dim: number,
   seedNeighborCount: number,
   neighborCount: number,
-): number {
+): RefinementArenaPlan {
+  checkedElementCount(
+    "neighbor-refinement output",
+    count,
+    neighborCount,
+  );
   const n = BigInt(count);
   const d = BigInt(dim);
   const seed = BigInt(seedNeighborCount);
   const neighbors = BigInt(neighborCount);
-  const align16 = (bytes: bigint): bigint => (bytes + 15n) & ~15n;
-  const wrapperBytes = n * (4n * d + 4n * seed + 9n * neighbors);
+
+  const wrapper = new ArenaSizer();
+  wrapper.add(n * d, 4n, 4n);
+  wrapper.add(n * seed, 4n, 4n);
+  wrapper.add(n * neighbors, 4n, 4n);
+  wrapper.add(n * neighbors, 4n, 4n);
+  wrapper.add(n * neighbors, 1n, 1n);
+
   const pairCount = (n * (n - 1n)) / 2n;
-  const pairBitsetBytes = 4n * ((pairCount + 31n) / 32n);
-  const afterBitset = align16(wrapperBytes) + pairBitsetBytes;
-  const afterSnapshotIndices = align16(afterBitset) + 4n * n * neighbors;
-  return Number(align16(afterSnapshotIndices) + n * neighbors);
+  const dense = wrapper.copy();
+  dense.add((pairCount + 31n) / 32n, 4n);
+  dense.add(n * neighbors, 4n);
+  dense.add(n * neighbors, 1n);
+  if (dense.bytes() <= INITIAL_ARENA_BYTES) {
+    return { mode: "dense-pair-bitset", requiredBytes: dense.bytes() };
+  }
+
+  const scalable = wrapper.copy();
+  scalable.add(n * neighbors, 4n);
+  scalable.add(n * neighbors, 1n);
+  scalable.add(n, 4n);
+  return { mode: "row-stamps", requiredBytes: scalable.bytes() };
 }
+
+function exactEuclideanArenaBytes(
+  count: number,
+  dim: number,
+  neighborCount: number,
+): number {
+  checkedElementCount("exact k-NN output", count, neighborCount);
+  const n = BigInt(count);
+  const d = BigInt(dim);
+  const neighbors = BigInt(neighborCount);
+  const sizer = new ArenaSizer();
+  sizer.add(n * d, 4n, 4n);
+  sizer.add(n * neighbors, 4n, 4n);
+  sizer.add(n * neighbors, 4n, 4n);
+  return sizer.bytes();
+}
+
+const INT32_MAX = 0x7fff_ffff;
+const UINT32_MAX = 0xffff_ffff;
+const UINT32_MAX_BIGINT = 0xffff_ffffn;
+const INITIAL_ARENA_BYTES = 10 * 1024 * 1024;
 
 function emptyKnnGraph(): NumericKnnGraph {
   return {

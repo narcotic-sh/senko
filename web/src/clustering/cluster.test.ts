@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 
-import { clusterEmbeddings } from "./cluster";
+import {
+  clusterEmbeddings,
+  estimatePostUmapPeakWorkingBytes,
+} from "./cluster";
 import {
   mergeSimilarCentroids,
   normalizeLabels,
@@ -55,6 +58,11 @@ describe("clusterEmbeddings", () => {
     expect(first!.peakTemporaryBytes).toBeGreaterThan(first!.outputBytes);
     expect(first!.peakWorkingBytes).toBe(second!.peakWorkingBytes);
     expect(first!.graphEdgeCount).toBe(second!.graphEdgeCount);
+  });
+
+  it("accounts the post-UMAP exact graph and hierarchy high-water mark", () => {
+    expect(estimatePostUmapPeakWorkingBytes(5_713, 10, 40)).toBe(6_020_848);
+    expect(estimatePostUmapPeakWorkingBytes(47_999, 10, 40)).toBe(48_645_136);
   });
 
   it("separates interleaved speakers that share a common embedding direction", () => {

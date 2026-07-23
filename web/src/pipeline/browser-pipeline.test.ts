@@ -396,6 +396,37 @@ describe("runBrowserPipeline", () => {
     expect(result.memory.knownGpuBufferBytes).toBe(84_001_024);
   });
 
+  it("refreshes growable clustering WASM ownership after clustering", async () => {
+    let clusteringHeapBytes = 9 * 1024 * 1024;
+    const clusteringKernels = {
+      get memoryStats() {
+        return {
+          heapBytes: clusteringHeapBytes,
+          arenaCapacityBytes: clusteringHeapBytes - 1024 * 1024,
+          peakArenaUsedBytes: 0,
+          peakReturnedJsBytes: 0,
+        };
+      },
+    } as ClusteringNumericKernels;
+
+    const result = await runBrowserPipeline(
+      wavBlob(2),
+      modelsWithSpeech(),
+      DEFAULT_PIPELINE_OPTIONS,
+      {
+        createFbank: async () => new DisposableTestFbank(),
+        clusteringKernels,
+        onStageStarted(stage) {
+          if (stage === "clustering") {
+            clusteringHeapBytes = 64 * 1024 * 1024;
+          }
+        },
+      },
+    );
+
+    expect(result.memory.wasmHeapBytes).toBe(64.5 * 1024 * 1024);
+  });
+
   it("extracts the next FBank batch while CAM++ is in flight using distinct bounded buffers", async () => {
     const vad = new AllSpeechVad();
     const embedding = new DeferredFirstEmbedding();

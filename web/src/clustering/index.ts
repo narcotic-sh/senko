@@ -1,4 +1,7 @@
-export { clusterEmbeddings } from "./cluster";
+export {
+  clusterEmbeddings,
+  estimatePostUmapPeakWorkingBytes,
+} from "./cluster";
 export {
   buildPrunedCosineLaplacian,
   clusterEmbeddingsSpectral,
