@@ -47,7 +47,7 @@ enum PlanSection : std::uint32_t {
 
 /*
  * The byte offsets below are part of the JS/Wasm ABI. Immutable fields are
- * written by the coordinator before workers start. The five final words are
+ * written by the coordinator before workers start. The six final words are
  * accessed atomically by Wasm and JavaScript.
  */
 struct alignas(8) RunHeader {
@@ -78,7 +78,9 @@ struct alignas(8) RunHeader {
   std::uint32_t cancelled;                          // 112
   std::int32_t status;                              // 116
   std::uint32_t completed_epochs;                   // 120
-  std::uint32_t reserved2;                          // 124
+  // Dynamic row scheduler. The final barrier arrival resets this to zero
+  // before releasing workers into the next epoch.
+  std::uint32_t next_row;                           // 124
 };
 
 static_assert(sizeof(RunHeader) == 128);

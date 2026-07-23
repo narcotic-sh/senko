@@ -9,6 +9,7 @@ const CONTROL_WORD_OFFSET = 104;
 const CONTROL_CANCELLED = 2;
 const CONTROL_STATUS = 3;
 const CONTROL_COMPLETED_EPOCHS = 4;
+const CONTROL_NEXT_ROW = 5;
 const SUCCESS_STATUS = 1;
 const CANCELLED_STATUS = -2;
 const MINIMUM_SHARED_BYTES = 16 * 1024 * 1024;
@@ -29,6 +30,7 @@ type FakeBehavior =
   | "stale-then-success"
   | "fail-first"
   | "incomplete"
+  | "unfinished-schedule"
   | "non-finite"
   | "bad-status";
 
@@ -138,6 +140,10 @@ class FakeWorkerController {
     queueMicrotask(() => {
       if (this.behavior === "incomplete") {
         this.writeSuccessfulControl(request, -1);
+        this.complete(worker, request, SUCCESS_STATUS);
+      } else if (this.behavior === "unfinished-schedule") {
+        this.writeSuccessfulControl(request);
+        Atomics.store(this.control(request), CONTROL_NEXT_ROW, 16);
         this.complete(worker, request, SUCCESS_STATUS);
       } else if (this.behavior === "non-finite") {
         this.writeSuccessfulControl(request);
@@ -463,6 +469,7 @@ describe("ThreadedUmapLayoutPool", () => {
   it.each([
     ["worker status", "bad-status", /workers \[-3, -3\]/],
     ["completed epochs", "incomplete", /4\/5 epochs/],
+    ["unfinished row schedule", "unfinished-schedule", /next row 16/],
     ["finite output", "non-finite", /not finite/],
   ] as const)(
     "rejects and breaks on invalid %s",

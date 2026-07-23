@@ -32,6 +32,10 @@ namespace {
 constexpr size_t kAlignment = 16;
 constexpr float kRpEpsilon = 1.0e-8f;
 constexpr int kCandidateBlockSize = 16384;
+// Keep the quadratic optimization bounded. This covers the one-hour fixture
+// (2,039,544 bytes) and inputs through 8,192 rows; larger inputs retain the
+// predecessor's linear-memory candidate traversal.
+constexpr size_t kMaximumPairBitsetBytes = 4u * 1024u * 1024u;
 constexpr uint64_t kUint32Mask = 0xffff'ffffULL;
 constexpr int64_t kRandomIntLow = -2147483647LL;
 constexpr uint64_t kRandomIntRangeMax = 4294967292ULL;
@@ -107,6 +111,43 @@ bool ValidShape(int count, int dimension, int neighbor_count) {
 
 bool IsWorkspaceAligned(const void* workspace) {
   return (reinterpret_cast<uintptr_t>(workspace) & (kAlignment - 1)) == 0;
+}
+
+constexpr size_t PairBitsetWordCount(int count) {
+  if (count <= 1) return 0;
+  const uint64_t pair_count =
+      static_cast<uint64_t>(count) * static_cast<uint64_t>(count - 1) / 2u;
+  const uint64_t word_count = (pair_count + 31u) / 32u;
+  if (word_count >
+          static_cast<uint64_t>(std::numeric_limits<size_t>::max()) ||
+      word_count * sizeof(uint32_t) > kMaximumPairBitsetBytes) {
+    return 0;
+  }
+  return static_cast<size_t>(word_count);
+}
+
+static_assert(PairBitsetWordCount(8192) != 0);
+static_assert(PairBitsetWordCount(8193) == 0);
+
+bool ShouldEvaluateUnorderedPair(uint32_t* evaluated_pairs, int count,
+                                 int left, int right) {
+  // Preserve PyNNDescent's self-comparison behavior. For distinct endpoints,
+  // every attempt pushes the same distance into both heaps. Heap thresholds
+  // only decrease, so a repeated pair can never produce an update after its
+  // first attempt, even in a later snapshot iteration.
+  if (!evaluated_pairs || left == right) return true;
+  const uint64_t lower =
+      static_cast<uint64_t>(left < right ? left : right);
+  const uint64_t upper =
+      static_cast<uint64_t>(left < right ? right : left);
+  const uint64_t pair_index =
+      lower * (static_cast<uint64_t>(count) * 2u - lower - 1u) / 2u +
+      upper - lower - 1u;
+  const size_t word = static_cast<size_t>(pair_index >> 5u);
+  const uint32_t mask = 1u << static_cast<uint32_t>(pair_index & 31u);
+  if ((evaluated_pairs[word] & mask) != 0u) return false;
+  evaluated_pairs[word] |= mask;
+  return true;
 }
 
 float SumSquares(const float* values, int dimension) {
@@ -418,6 +459,7 @@ struct AngularTreeContext {
   int32_t* partition_scratch;
   uint8_t* sides;
   float* hyperplane;
+  uint32_t* evaluated_pairs;
   TauState* random;
 };
 
@@ -427,6 +469,10 @@ void ProcessLeaf(AngularTreeContext* context, int begin, int end) {
     for (int right_position = left_position + 1; right_position < end;
          ++right_position) {
       const int right = context->tree_indices[right_position];
+      if (!ShouldEvaluateUnorderedPair(context->evaluated_pairs,
+                                       context->count, left, right)) {
+        continue;
+      }
       const float distance = AlternativeCosineDistance(
           context->values, context->norms_squared, context->dimension, left,
           right);
@@ -624,10 +670,11 @@ void BuildCandidates(int count, int neighbor_count, int max_candidates,
 }
 
 int ProcessCandidateBlock(
-    const float* values, const float* norms_squared, int dimension,
+    const float* values, const float* norms_squared, int count, int dimension,
     int neighbor_count, int max_candidates, int block_begin, int block_end,
     const int32_t* new_indices, const int32_t* old_indices,
-    const float* threshold_snapshot, int32_t* graph_indices,
+    const float* threshold_snapshot, uint32_t* evaluated_pairs,
+    int32_t* graph_indices,
     float* graph_distances, uint8_t* graph_flags) {
   int changes = 0;
   for (int row = block_begin; row < block_end; ++row) {
@@ -642,6 +689,9 @@ int ProcessCandidateBlock(
            right_position < max_candidates; ++right_position) {
         const int right = new_indices[candidate_offset + right_position];
         if (right < 0) continue;
+        if (!ShouldEvaluateUnorderedPair(evaluated_pairs, count, left, right)) {
+          continue;
+        }
         const float distance = AlternativeCosineDistance(
             values, norms_squared, dimension, left, right);
         if (distance <=
@@ -662,6 +712,9 @@ int ProcessCandidateBlock(
            ++right_position) {
         const int right = old_indices[candidate_offset + right_position];
         if (right < 0) continue;
+        if (!ShouldEvaluateUnorderedPair(evaluated_pairs, count, left, right)) {
+          continue;
+        }
         const float distance = AlternativeCosineDistance(
             values, norms_squared, dimension, left, right);
         if (distance <=
@@ -738,6 +791,7 @@ size_t ApproximateWorkspaceBytes(int count, int dimension, int neighbor_count,
   const size_t rows = static_cast<size_t>(count);
   size_t graph_length = 0;
   size_t candidate_length = 0;
+  const size_t pair_bitset_word_count = PairBitsetWordCount(count);
   if (!CheckedMultiply(rows, static_cast<size_t>(neighbor_count),
                        &graph_length) ||
       !CheckedMultiply(rows, static_cast<size_t>(options.max_candidates),
@@ -755,7 +809,9 @@ size_t ApproximateWorkspaceBytes(int count, int dimension, int neighbor_count,
       !AddArrayBytes(&result, rows, sizeof(int32_t)) ||
       !AddArrayBytes(&result, rows, sizeof(int32_t)) ||
       !AddArrayBytes(&result, rows, sizeof(uint8_t)) ||
-      !AddArrayBytes(&result, static_cast<size_t>(dimension), sizeof(float))) {
+      !AddArrayBytes(&result, static_cast<size_t>(dimension), sizeof(float)) ||
+      (pair_bitset_word_count != 0 &&
+       !AddArrayBytes(&result, pair_bitset_word_count, sizeof(uint32_t)))) {
     return 0;
   }
   return result;
@@ -849,10 +905,19 @@ int ApproximateCosineKnn(const float* values, int count, int dimension,
   uint8_t* sides = allocator.Allocate<uint8_t>(rows);
   float* hyperplane =
       allocator.Allocate<float>(static_cast<size_t>(dimension));
+  const size_t pair_bitset_word_count = PairBitsetWordCount(count);
+  uint32_t* evaluated_pairs =
+      pair_bitset_word_count == 0
+          ? nullptr
+          : allocator.Allocate<uint32_t>(pair_bitset_word_count);
   if (!graph_flags || !norms_squared || !new_indices || !new_priorities ||
       !old_indices || !old_priorities || !threshold_snapshot ||
-      !tree_indices || !partition_scratch || !sides || !hyperplane) {
+      !tree_indices || !partition_scratch || !sides || !hyperplane ||
+      (pair_bitset_word_count != 0 && !evaluated_pairs)) {
     return kInsufficientWorkspace;
+  }
+  if (evaluated_pairs) {
+    std::fill_n(evaluated_pairs, pair_bitset_word_count, uint32_t{0});
   }
 
   std::fill_n(output_indices, graph_length, -1);
@@ -895,6 +960,7 @@ int ApproximateCosineKnn(const float* values, int count, int dimension,
         partition_scratch,
         sides,
         hyperplane,
+        evaluated_pairs,
         &tree_random,
     };
     const int status = BuildAngularTree(&tree_context, 0, count, 0);
@@ -921,10 +987,10 @@ int ApproximateCosineKnn(const float* values, int count, int dimension,
       }
       const int block_end = std::min(count, block_begin + kCandidateBlockSize);
       changes += ProcessCandidateBlock(
-          values, norms_squared, dimension, neighbor_count,
+          values, norms_squared, count, dimension, neighbor_count,
           options.max_candidates, block_begin, block_end, new_indices,
-          old_indices, threshold_snapshot, output_indices, output_distances,
-          graph_flags);
+          old_indices, threshold_snapshot, evaluated_pairs, output_indices,
+          output_distances, graph_flags);
     }
     if (changes <= convergence_limit) break;
   }

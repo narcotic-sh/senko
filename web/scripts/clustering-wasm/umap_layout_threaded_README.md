@@ -14,8 +14,8 @@ the threaded optimizer remains a separate module.
   16-accumulator reduction shape;
 - float64 sample clocks, alpha, `a`, `b`, gamma, and negative-sample rate;
 - UMAP's per-head tau RNG state and signed modulo behavior;
-- row-major CSR edge order, `move_other=true`, and contiguous static edge
-  shards;
+- row-major CSR edge order, `move_other=true`, and one worker at a time owning
+  every edge and RNG update for a claimed head row;
 - the UMAP 0.5.12 alpha quirk: epochs zero and one both use alpha 1;
 - worker-zero initialization of all clocks/RNG state, followed by a barrier;
 - one barrier after every epoch, matching the implicit barrier around Numba's
@@ -55,11 +55,14 @@ per-instance, so the coordinator assigns each exported `__stack_pointer` a
 disjoint 64 KiB stack. The module's math tables use Emscripten's atomic
 once-initializer and are safe when several instances start concurrently.
 
-The real kernel executes all 500 epochs in one call. Workers block with
-`memory.atomic.wait32`; the final arrival advances the generation and calls
-`memory.atomic.notify`. There is no per-epoch JavaScript messaging. The parent
-pipeline worker stays responsive because only nested leaves enter the blocking
-call.
+The real kernel executes all 500 epochs in one call. Each epoch uses an atomic
+cursor to distribute 16-row chunks dynamically. Keeping chunks row-aligned
+preserves each head's edge and RNG order while allowing faster CPU cores to
+claim more work instead of waiting behind a fixed shard. Workers then block
+with `memory.atomic.wait32`; the final arrival resets the row cursor, advances
+the generation, and calls `memory.atomic.notify`. There is no per-epoch
+JavaScript messaging. The parent pipeline worker stays responsive because only
+nested leaves enter the blocking call.
 
 Cancellation sets the shared cancellation word and notifies the generation.
 The kernel checks cancellation every 1,024 edge slots and at every barrier;
@@ -154,3 +157,22 @@ noise; seeded downstream ARI was 0.99960, 1.0, and 0.99919.
 Pair-distance error is expected to be non-monotonic because it measures one
 stochastic Hogwild trajectory against a deterministic seeded trajectory. The
 downstream partition metrics are the correctness gate that matters to Senko.
+
+## Dynamic row scheduling promotion
+
+The production scheduler now distributes row-aligned 16-row chunks rather
+than assigning permanent equal-edge shards. On an already warm target M3,
+three adjacent fresh-process Node trials moved the median from 6,335 ms for
+the static binary to 5,835 ms for the dynamic binary, a 7.9% reduction. The
+single-worker projection retained the exact predecessor hash
+`b3b7a57f…927c2a`. Three stochastic eight-worker outputs retained seven
+clusters and no noise with seeded downstream ARI from 0.99839 to 0.99899.
+
+In the first production-browser acceptance containing both dynamic scheduling
+and the independently exact PyNNDescent pair deduplication, layout measured
+3,380.05 ms and whole clustering measured 5,513.93 ms. The adjacent
+pre-change run measured 4,412.30 ms and 7,953.42 ms respectively. Whole worker
+wall moved from 17,276.48 to 14,588.16 ms despite the thermally variable
+conditions, and the promoted result passed the offline reference gate with
+seven speakers, 132 segments, 99.9927% speech IoU, and 99.9771% mapped-speaker
+agreement at 10 ms.

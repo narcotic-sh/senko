@@ -150,6 +150,7 @@ export function readRunControl(memory, plan) {
     cancelled: Atomics.load(words, 2),
     status: Atomics.load(words, 3),
     completedEpochs: Atomics.load(words, 4),
+    nextRow: Atomics.load(words, 5),
   };
 }
 

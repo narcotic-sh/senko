@@ -42,6 +42,15 @@ function parseOutputPath() {
     : resolve(process.cwd(), flag.slice("--output=".length));
 }
 
+function parseWasmPath() {
+  const flag = process.argv.find((argument) =>
+    argument.startsWith("--wasm="),
+  );
+  return flag === undefined
+    ? resolve(scriptDirectory, "umap_layout_threaded.wasm")
+    : resolve(process.cwd(), flag.slice("--wasm=".length));
+}
+
 function once(worker, expectedType) {
   return new Promise((resolvePromise, rejectPromise) => {
     const onMessage = (message) => {
@@ -113,9 +122,10 @@ function sampledPairDistanceRelativeError(
 
 const workerCount = parseWorkerCount();
 const outputPath = parseOutputPath();
+const wasmPath = parseWasmPath();
 const [wasmBytes, embedding, head, tail, epochsPerSample, rngSeed, reference] =
   await Promise.all([
-    readFile(resolve(scriptDirectory, "umap_layout_threaded.wasm")),
+    readFile(wasmPath),
     loadTypedArray("umap-layout-initial-embedding.f32", Float32Array),
     loadTypedArray("umap-layout-head.i32", Int32Array),
     loadTypedArray("umap-layout-tail.i32", Int32Array),

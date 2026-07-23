@@ -85,8 +85,10 @@ describe("native UMAP cosine-neighbor parity", () => {
         expect(metrics.exactIndexFraction).toBeGreaterThan(0.9998);
         expect(metrics.meanRecallAtK).toBeGreaterThan(0.9999);
         expect(metrics.maximumSharedDistanceError).toBeLessThan(1e-5);
+        // Includes the bounded 2,039,544-byte unordered-pair bitset used to
+        // avoid exactly redundant distance evaluations at this fixture size.
         expect(kernels.memoryStats.peakArenaUsedBytes).toBeLessThan(
-          13 * 1024 * 1024,
+          15 * 1024 * 1024,
         );
       } finally {
         kernels.dispose();

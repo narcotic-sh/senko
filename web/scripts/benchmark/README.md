@@ -114,6 +114,17 @@ centroid post-processing. The threaded layout's CSR ABI cut its eight-hour
 shared allocation from 125,698,048 to 91,815,936 bytes with byte-identical
 one-worker output and no material eight-worker slowdown.
 
+The first post-snapshot clustering optimization checkpoint is intentionally
+reported as an adjacent warm-machine A/B rather than a new cooled median.
+Exact persistent PyNNDescent pair deduplication plus dynamic row scheduling
+moved worker wall from 17.276480 to 14.588160 seconds and clustering from
+7.953425 to 5.513930 seconds. Within clustering, neighbor search moved from
+1.634440 to 0.574550 seconds and layout from 4.412300 to 3.380050 seconds.
+The candidate returned seven speakers and exactly 132 segments, passing the
+offline gate with 99.9927% speech IoU and 99.9771% mapped agreement at 10 ms.
+Ordinary WASM high-water increased by 2,031,616 bytes while shared layout
+memory and explicit GPU buffers remained unchanged.
+
 ## Historical browser-specific clustering checkpoint (2026-07-22)
 
 These numbers are the latest cooled checkpoint on the target M3 Mac, not a

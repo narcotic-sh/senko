@@ -113,6 +113,24 @@ SENKO_RUN_UMAP_SPECTRAL_LONG_PARITY=1 \
   pnpm vitest run scripts/clustering-wasm/umap-spectral-parity.test.ts
 ```
 
+The native-parity PyNNDescent path also retains one bit per unordered pair
+while that bitset fits within a strict 4 MiB cap. The bitset begins with
+bidirectional angular-tree leaf comparisons and persists through every
+candidate-refinement iteration. This is exact: once a fixed pair distance has
+been offered to both endpoint heaps, their maximum retained distances can only
+decrease, so repeating that pair cannot produce another update. Self
+comparisons and one-sided random initialization retain their original
+behavior.
+
+For 5,713 rows, the bitset adds 2,039,544 bytes and moves native UMAP neighbor
+workspace from 5,810,960 to 7,850,504 bytes. Six alternating native `-O3`
+fixture trials moved the median from 1,221.33 to 427.56 ms (65.0%) while the
+seeded index and distance arrays remained byte-identical to the predecessor.
+Five fresh-process WASM parity trials measured 515–570 ms with unchanged
+native-reference metrics. Inputs of 8,193 rows and above omit this quadratic
+scratch, so the 43,804-row long fixture retains its previous 44,549,440-byte
+neighbor workspace.
+
 Inputs are copied directly from their existing typed arrays into the arena; the
 wrapper does not create an extra JS staging copy. Output arrays are copied once
 into JS because the next operation resets the arena. The fused seed path avoids

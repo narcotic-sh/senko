@@ -20,6 +20,7 @@ const CONTROL_GENERATION = 1;
 const CONTROL_CANCELLED = 2;
 const CONTROL_STATUS = 3;
 const CONTROL_COMPLETED_EPOCHS = 4;
+const CONTROL_NEXT_ROW = 5;
 
 const PLAN_SECTION_COUNT = 10;
 
@@ -934,17 +935,19 @@ export class ThreadedUmapLayoutPool {
     );
     const arrived = Atomics.load(control, CONTROL_ARRIVED);
     const cancelled = Atomics.load(control, CONTROL_CANCELLED);
+    const nextRow = Atomics.load(control, CONTROL_NEXT_ROW);
     if (
       job.workerStatuses.some((workerStatus) => workerStatus !== SUCCESS_STATUS) ||
       status !== SUCCESS_STATUS ||
       completedEpochs !== job.expectedEpochs ||
       arrived !== 0 ||
-      cancelled !== 0
+      cancelled !== 0 ||
+      nextRow !== 0
     ) {
       const error = new Error(
         `Threaded UMAP layout returned status ${status}, ` +
           `${completedEpochs}/${job.expectedEpochs} epochs, ` +
-          `workers [${job.workerStatuses.join(", ")}]`,
+          `workers [${job.workerStatuses.join(", ")}], next row ${nextRow}`,
       );
       this.breakPool(error);
       this.finalizeRejectedJob(job, error);
