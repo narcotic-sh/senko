@@ -717,9 +717,17 @@ EMSCRIPTEN_KEEPALIVE int cluster_umap_fuzzy_graph(
   return 1;
 }
 
+EMSCRIPTEN_KEEPALIVE uint32_t cluster_umap_spectral_workspace_bytes(
+    int count, int edge_count, int dimension) {
+  senko::umap_spectral::Options options;
+  const size_t bytes = senko::umap_spectral::workspace_bytes(
+      count, edge_count, dimension, options);
+  return bytes <= UINT32_MAX ? static_cast<uint32_t>(bytes) : 0;
+}
+
 EMSCRIPTEN_KEEPALIVE int cluster_umap_spectral(
     const int32_t* row_offsets, const int32_t* column_indices,
-    const float* values, int count, int edge_count, int dimension,
+    float* values, int count, int edge_count, int dimension,
     double* output_vectors, double* output_eigenvalues,
     int32_t* output_integer_stats, double* output_numeric_stats,
     uint32_t* output_peak_working_bytes) {
@@ -728,11 +736,17 @@ EMSCRIPTEN_KEEPALIVE int cluster_umap_spectral(
     return -1;
   }
   senko::umap_spectral::Options options;
+  const uint32_t workspace_size =
+      cluster_umap_spectral_workspace_bytes(count, edge_count, dimension);
+  if (workspace_size == 0) return -1;
+  void* const workspace = allocate_bytes(workspace_size, 16u);
+  if (!workspace) return -2;
   senko::umap_spectral::Stats stats;
   const senko::umap_spectral::Status status =
       senko::umap_spectral::initialize_connected_graph(
           row_offsets, column_indices, values, count, edge_count, dimension,
-          output_vectors, output_eigenvalues, options, &stats);
+          output_vectors, output_eigenvalues, workspace, workspace_size,
+          options, &stats);
   if (status != senko::umap_spectral::Status::kSuccess) {
     return static_cast<int>(status);
   }

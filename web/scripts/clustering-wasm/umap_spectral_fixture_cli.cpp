@@ -112,12 +112,22 @@ int main(int argc, char** argv) {
   std::vector<double> eigenvalues(static_cast<std::size_t>(dim));
   senko::umap_spectral::Options options;
   options.maximum_basis_size = basis;
+  const std::size_t workspace_bytes = senko::umap_spectral::workspace_bytes(
+      count, static_cast<std::int32_t>(columns.size()), dim, options);
+  if (workspace_bytes == 0) {
+    std::cerr << "invalid spectral workspace dimensions\n";
+    return 2;
+  }
+  std::vector<std::uint64_t> workspace(
+      (workspace_bytes + sizeof(std::uint64_t) - 1) /
+      sizeof(std::uint64_t));
   senko::umap_spectral::Stats stats;
   const auto started = std::chrono::steady_clock::now();
   const auto status = senko::umap_spectral::initialize_connected_graph(
       offsets.data(), columns.data(), weights.data(), count,
       static_cast<std::int32_t>(columns.size()), dim, vectors.data(),
-      eigenvalues.data(), options, &stats);
+      eigenvalues.data(), workspace.data(),
+      workspace.size() * sizeof(std::uint64_t), options, &stats);
   const double elapsed_ms =
       std::chrono::duration<double, std::milli>(
           std::chrono::steady_clock::now() - started)

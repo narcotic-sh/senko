@@ -137,6 +137,11 @@ interface ClusteringWasmExports extends WebAssembly.Exports {
     outputValues: number,
     outputEntryCount: number,
   ) => number;
+  readonly cluster_umap_spectral_workspace_bytes: (
+    count: number,
+    edgeCount: number,
+    dimension: number,
+  ) => number;
   readonly cluster_umap_spectral: (
     rowOffsets: number,
     columnIndices: number,
@@ -839,8 +844,22 @@ export class WasmClusteringKernels implements ClusteringNumericKernels {
       count,
       dimension,
     );
+    const exports = this.requireExports();
+    const workspaceBytes = exports.cluster_umap_spectral_workspace_bytes(
+      count,
+      edgeCount,
+      dimension,
+    );
+    if (workspaceBytes === 0) {
+      throw new RangeError("native UMAP spectral dimensions are unsupported");
+    }
     const operationExports = this.beginOperation(
-      nativeUmapSpectralArenaBytes(count, dimension, edgeCount),
+      nativeUmapSpectralArenaBytes(
+        count,
+        dimension,
+        edgeCount,
+        workspaceBytes,
+      ),
     );
     const rowOffsetsPointer = this.copyInt32(
       operationExports,
@@ -1707,6 +1726,7 @@ function nativeUmapSpectralArenaBytes(
   count: number,
   dimension: number,
   edgeCount: number,
+  workspaceBytes: number,
 ): number {
   const outputLength = checkedElementCount(
     "native UMAP spectral output",
@@ -1714,6 +1734,15 @@ function nativeUmapSpectralArenaBytes(
     dimension,
   );
   checkedElementCount("native UMAP spectral edges", edgeCount);
+  if (
+    !Number.isSafeInteger(workspaceBytes) ||
+    workspaceBytes <= 0 ||
+    workspaceBytes > UINT32_MAX
+  ) {
+    throw new RangeError(
+      `native UMAP spectral workspace ${workspaceBytes} is outside the wasm32 address range`,
+    );
+  }
   const sizer = new ArenaSizer();
   sizer.add(BigInt(count + 1), 4n, 4n);
   sizer.add(BigInt(edgeCount), 4n, 4n);
@@ -1723,6 +1752,7 @@ function nativeUmapSpectralArenaBytes(
   sizer.add(4n, 4n, 4n);
   sizer.add(3n, 8n, 8n);
   sizer.add(1n, 4n, 4n);
+  sizer.add(BigInt(workspaceBytes), 1n, 16n);
   return sizer.bytes();
 }
 

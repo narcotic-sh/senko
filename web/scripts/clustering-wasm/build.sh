@@ -27,7 +27,7 @@ mkdir -p "$(dirname "$output")"
   -s INITIAL_MEMORY=11534336 \
   -s MAXIMUM_MEMORY=2147483648 \
   -s STACK_SIZE=65536 \
-  -s EXPORTED_FUNCTIONS='["_cluster_reset","_cluster_reserve","_cluster_alloc","_cluster_heap_base","_cluster_heap_capacity","_cluster_heap_used","_cluster_normalize_rows","_cluster_approximate_cosine_knn","_cluster_refine_euclidean_knn","_cluster_exact_euclidean_knn","_cluster_umap_cosine_knn_workspace_bytes","_cluster_umap_cosine_knn","_cluster_umap_fuzzy_workspace_bytes","_cluster_umap_fuzzy_max_entries","_cluster_umap_fuzzy_graph","_cluster_umap_spectral","_cluster_umap_initialization_workspace_bytes","_cluster_umap_initialize_layout","_cluster_umap_layout_workspace_bytes","_cluster_umap_optimize_layout_serial","_cluster_hdbscan_workspace_bytes","_cluster_hdbscan_f64_semantics","_cluster_hdbscan_f64_diagnostics"]' \
+  -s EXPORTED_FUNCTIONS='["_cluster_reset","_cluster_reserve","_cluster_alloc","_cluster_heap_base","_cluster_heap_capacity","_cluster_heap_used","_cluster_normalize_rows","_cluster_approximate_cosine_knn","_cluster_refine_euclidean_knn","_cluster_exact_euclidean_knn","_cluster_umap_cosine_knn_workspace_bytes","_cluster_umap_cosine_knn","_cluster_umap_fuzzy_workspace_bytes","_cluster_umap_fuzzy_max_entries","_cluster_umap_fuzzy_graph","_cluster_umap_spectral_workspace_bytes","_cluster_umap_spectral","_cluster_umap_initialization_workspace_bytes","_cluster_umap_initialize_layout","_cluster_umap_layout_workspace_bytes","_cluster_umap_optimize_layout_serial","_cluster_hdbscan_workspace_bytes","_cluster_hdbscan_f64_semantics","_cluster_hdbscan_f64_diagnostics"]' \
   -Wl,--strip-all \
   -o "$output"
 

@@ -84,6 +84,34 @@ alongside model initialization, before user audio is processed.
 - Returned JS refinement arrays: 1,028,340 bytes at fixture shape.
 - Returned JS exact-graph arrays: 1,828,160 bytes at fixture shape.
 
+The gated native-parity UMAP spectral solver also uses this arena exclusively.
+Its graph values are normalized in place, and its Lanczos basis, restart
+basis, compact eigensystem, residual vectors, and connectivity scratch all
+come from one explicitly sized workspace. There are no `std::vector` or
+allocator-owned pages above the arena.
+
+At 5,713 rows, spectral scratch fell from 7,764,801 to 6,077,948 bytes while
+the sampled pair-distance error remains `2.0111783696124703e-5`. At the
+43,804-row long fixture, scratch fell from 54,612,124 to 42,492,944 bytes. The
+complete long spectral operation uses 86,384,480 arena bytes, so it fits
+inside the preceding k-NN reservation of 92,209,152 bytes. In a modeled
+k-NN-then-spectral run, WASM heap high-water fell from 146,407,424 to
+92,340,224 bytes (51.6 MiB) with identical convergence statistics. Native
+one-hour and long outputs are byte-for-byte identical to the pre-refactor
+solver. The long WASM vector hash remains
+`377e541ab2a2fae9bc46d4f2a7af621c5c169321a5146da0a62251c90cffddb8`,
+and the test requires the post-spectral heap to equal the immediately
+post-k-NN-reserve heap exactly. Adjacent long native timings were 5,168.60 ms
+before versus 5,180.31 ms after.
+
+Run both spectral acceptance fixtures explicitly with:
+
+```sh
+SENKO_RUN_UMAP_SPECTRAL_PARITY=1 \
+SENKO_RUN_UMAP_SPECTRAL_LONG_PARITY=1 \
+  pnpm vitest run scripts/clustering-wasm/umap-spectral-parity.test.ts
+```
+
 Inputs are copied directly from their existing typed arrays into the arena; the
 wrapper does not create an extra JS staging copy. Output arrays are copied once
 into JS because the next operation resets the arena. The fused seed path avoids

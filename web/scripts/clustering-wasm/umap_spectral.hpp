@@ -69,6 +69,21 @@ struct Stats {
 };
 
 /*
+ * Return the scratch bytes required by initialize_connected_graph, or zero
+ * when the dimensions/options are invalid or overflow size_t. The workspace
+ * must be aligned to at least alignof(double).
+ *
+ * All restart and eigensolver temporaries live in this workspace. Combined
+ * with in-place normalization of the arena-owned graph values, the complete
+ * long-recording spectral operation remains below the earlier k-NN arena
+ * high-water mark.
+ */
+std::size_t workspace_bytes(std::int32_t count,
+                            std::int32_t edge_count,
+                            std::int32_t dim,
+                            const Options& options);
+
+/*
  * Compute dim non-trivial normalized-Laplacian eigenvectors.
  *
  * output_vectors is row-major [count, dim], matching UMAP's spectral_layout
@@ -78,16 +93,22 @@ struct Stats {
  * Eigenvector signs are canonicalized by making the largest-magnitude entry
  * in each column non-negative. ARPACK does not specify signs, and UMAP's
  * Euclidean objective is invariant to a sign flip before noise is added.
+ *
+ * weights is normalized in place. Browser callers already pass an arena-owned
+ * copy, so reusing it avoids retaining a second edge_count-sized Float32
+ * buffer throughout the eigensolve.
  */
 Status initialize_connected_graph(
     const std::int32_t* row_offsets,
     const std::int32_t* columns,
-    const float* weights,
+    float* weights,
     std::int32_t count,
     std::int32_t edge_count,
     std::int32_t dim,
     double* output_vectors,
     double* output_eigenvalues,
+    void* workspace,
+    std::size_t workspace_size,
     const Options& options,
     Stats* stats);
 

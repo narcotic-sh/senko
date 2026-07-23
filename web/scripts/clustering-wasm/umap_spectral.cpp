@@ -5,14 +5,20 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
-#include <numeric>
 #include <utility>
-#include <vector>
 
 namespace senko::umap_spectral {
 namespace {
 
 constexpr double kBreakdownTolerance = 1.0e-14;
+
+bool checked_add(std::size_t left, std::size_t right, std::size_t* result) {
+  if (right > std::numeric_limits<std::size_t>::max() - left) {
+    return false;
+  }
+  *result = left + right;
+  return true;
+}
 
 bool checked_product(std::size_t left, std::size_t right, std::size_t* result) {
   if (left != 0 && right > std::numeric_limits<std::size_t>::max() / left) {
@@ -22,22 +28,170 @@ bool checked_product(std::size_t left, std::size_t right, std::size_t* result) {
   return true;
 }
 
-std::int32_t find_root(std::vector<std::int32_t>& parents,
-                       std::int32_t vertex) {
-  std::int32_t root = vertex;
-  while (parents[static_cast<std::size_t>(root)] != root) {
-    root = parents[static_cast<std::size_t>(root)];
+class ScratchArena {
+ public:
+  ScratchArena(void* workspace, std::size_t size)
+      : bytes_(static_cast<std::uint8_t*>(workspace)), size_(size) {}
+
+  template <typename T>
+  T* allocate(std::size_t count) {
+    std::size_t byte_count = 0;
+    if (!checked_product(count, sizeof(T), &byte_count)) {
+      valid_ = false;
+      return nullptr;
+    }
+    const std::size_t alignment = alignof(T);
+    if (cursor_ > std::numeric_limits<std::size_t>::max() - (alignment - 1)) {
+      valid_ = false;
+      return nullptr;
+    }
+    const std::size_t start = (cursor_ + alignment - 1) & ~(alignment - 1);
+    std::size_t end = 0;
+    if (!checked_add(start, byte_count, &end) || end > size_) {
+      valid_ = false;
+      return nullptr;
+    }
+    cursor_ = end;
+    return reinterpret_cast<T*>(bytes_ + start);
   }
-  while (parents[static_cast<std::size_t>(vertex)] != vertex) {
-    const std::int32_t next = parents[static_cast<std::size_t>(vertex)];
-    parents[static_cast<std::size_t>(vertex)] = root;
+
+  bool valid() const { return valid_; }
+  std::size_t used() const { return cursor_; }
+
+ private:
+  std::uint8_t* bytes_;
+  std::size_t size_;
+  std::size_t cursor_ = 0;
+  bool valid_ = true;
+};
+
+class ScratchSizer {
+ public:
+  template <typename T>
+  bool add(std::size_t count) {
+    std::size_t byte_count = 0;
+    if (!checked_product(count, sizeof(T), &byte_count) ||
+        cursor_ > std::numeric_limits<std::size_t>::max() -
+                      (alignof(T) - 1)) {
+      valid_ = false;
+      return false;
+    }
+    const std::size_t start =
+        (cursor_ + alignof(T) - 1) & ~(alignof(T) - 1);
+    if (!checked_add(start, byte_count, &cursor_)) {
+      valid_ = false;
+      return false;
+    }
+    return true;
+  }
+
+  bool valid() const { return valid_; }
+  std::size_t bytes() const { return valid_ ? cursor_ : 0; }
+
+ private:
+  std::size_t cursor_ = 0;
+  bool valid_ = true;
+};
+
+struct ResolvedOptions {
+  std::int32_t requested = 0;
+  std::int32_t basis_size = 0;
+  std::int32_t retained = 0;
+  std::int32_t maximum_restarts = 0;
+};
+
+bool resolve_options(std::int32_t count,
+                     std::int32_t edge_count,
+                     std::int32_t dim,
+                     const Options& options,
+                     ResolvedOptions* result) {
+  if (count < 3 || edge_count < 1 || dim < 1 || dim > count - 2 ||
+      !std::isfinite(options.tolerance) || options.tolerance <= 0.0 ||
+      options.maximum_basis_size < 0 || options.retained_ritz_vectors < 0 ||
+      options.maximum_restarts < 0) {
+    return false;
+  }
+  const std::int64_t requested = static_cast<std::int64_t>(dim) + 1;
+  const std::int64_t automatic_basis = 2 * requested + 38;
+  result->requested = static_cast<std::int32_t>(requested);
+  result->basis_size = static_cast<std::int32_t>(
+      std::min<std::int64_t>(
+          count, options.maximum_basis_size == 0
+                     ? automatic_basis
+                     : std::max<std::int64_t>(options.maximum_basis_size,
+                                              requested + 1)));
+  if (result->basis_size <= result->requested) {
+    return false;
+  }
+  const std::int64_t requested_retained =
+      options.retained_ritz_vectors == 0
+          ? requested + 11
+          : static_cast<std::int64_t>(options.retained_ritz_vectors);
+  result->retained = static_cast<std::int32_t>(
+      std::min<std::int64_t>(requested_retained, result->basis_size - 2));
+  result->maximum_restarts =
+      result->retained >= result->requested ? options.maximum_restarts : 0;
+  return true;
+}
+
+std::size_t graph_workspace_bytes(std::int32_t count) {
+  ScratchSizer sizer;
+  sizer.add<float>(static_cast<std::size_t>(count));
+  sizer.add<float>(static_cast<std::size_t>(count));
+  sizer.add<std::int32_t>(static_cast<std::size_t>(count));
+  sizer.add<std::uint8_t>(static_cast<std::size_t>(count));
+  return sizer.bytes();
+}
+
+std::size_t solver_workspace_bytes(std::int32_t count,
+                                   const ResolvedOptions& resolved) {
+  std::size_t basis_elements = 0;
+  std::size_t projected_elements = 0;
+  if (!checked_product(static_cast<std::size_t>(count),
+                       static_cast<std::size_t>(resolved.basis_size),
+                       &basis_elements) ||
+      !checked_product(static_cast<std::size_t>(resolved.basis_size),
+                       static_cast<std::size_t>(resolved.basis_size),
+                       &projected_elements)) {
+    return 0;
+  }
+  ScratchSizer sizer;
+  sizer.add<float>(basis_elements);
+  sizer.add<double>(static_cast<std::size_t>(count));
+  sizer.add<double>(static_cast<std::size_t>(count));
+  sizer.add<double>(static_cast<std::size_t>(count));
+  sizer.add<double>(projected_elements);
+  sizer.add<double>(projected_elements);
+  sizer.add<double>(projected_elements);
+  sizer.add<double>(static_cast<std::size_t>(resolved.basis_size));
+  sizer.add<std::int32_t>(static_cast<std::size_t>(resolved.basis_size));
+  if (resolved.maximum_restarts > 0) {
+    std::size_t restart_elements = 0;
+    if (!checked_product(static_cast<std::size_t>(count),
+                         static_cast<std::size_t>(resolved.retained + 1),
+                         &restart_elements)) {
+      return 0;
+    }
+    sizer.add<float>(restart_elements);
+  }
+  return sizer.bytes();
+}
+
+std::int32_t find_root(std::int32_t* parents, std::int32_t vertex) {
+  std::int32_t root = vertex;
+  while (parents[root] != root) {
+    root = parents[root];
+  }
+  while (parents[vertex] != vertex) {
+    const std::int32_t next = parents[vertex];
+    parents[vertex] = root;
     vertex = next;
   }
   return root;
 }
 
-void unite(std::vector<std::int32_t>& parents,
-           std::vector<std::uint8_t>& ranks,
+void unite(std::int32_t* parents,
+           std::uint8_t* ranks,
            std::int32_t left,
            std::int32_t right) {
   left = find_root(parents, left);
@@ -45,36 +199,42 @@ void unite(std::vector<std::int32_t>& parents,
   if (left == right) {
     return;
   }
-  if (ranks[static_cast<std::size_t>(left)] <
-      ranks[static_cast<std::size_t>(right)]) {
+  if (ranks[left] < ranks[right]) {
     std::swap(left, right);
   }
-  parents[static_cast<std::size_t>(right)] = left;
-  if (ranks[static_cast<std::size_t>(left)] ==
-      ranks[static_cast<std::size_t>(right)]) {
-    ++ranks[static_cast<std::size_t>(left)];
+  parents[right] = left;
+  if (ranks[left] == ranks[right]) {
+    ++ranks[left];
   }
 }
 
-struct NormalizedGraph {
-  std::vector<float> values;
-  std::size_t working_bytes = 0;
-};
-
 Status build_normalized_graph(const std::int32_t* row_offsets,
                               const std::int32_t* columns,
-                              const float* weights,
+                              float* weights,
                               std::int32_t count,
                               std::int32_t edge_count,
-                              NormalizedGraph* result) {
+                              void* workspace,
+                              std::size_t workspace_size) {
   if (row_offsets[0] != 0 || row_offsets[count] != edge_count) {
     return Status::kInvalidGraph;
   }
 
-  std::vector<float> degree(static_cast<std::size_t>(count), 0.0f);
-  std::vector<std::int32_t> parents(static_cast<std::size_t>(count));
-  std::vector<std::uint8_t> ranks(static_cast<std::size_t>(count), 0);
-  std::iota(parents.begin(), parents.end(), 0);
+  ScratchArena scratch(workspace, workspace_size);
+  float* const degree = scratch.allocate<float>(static_cast<std::size_t>(count));
+  float* const inverse_sqrt_degree =
+      scratch.allocate<float>(static_cast<std::size_t>(count));
+  std::int32_t* const parents =
+      scratch.allocate<std::int32_t>(static_cast<std::size_t>(count));
+  std::uint8_t* const ranks =
+      scratch.allocate<std::uint8_t>(static_cast<std::size_t>(count));
+  if (!scratch.valid()) {
+    return Status::kInvalidArgument;
+  }
+  std::fill_n(degree, count, 0.0f);
+  std::fill_n(ranks, count, static_cast<std::uint8_t>(0));
+  for (std::int32_t row = 0; row < count; ++row) {
+    parents[row] = row;
+  }
 
   for (std::int32_t row = 0; row < count; ++row) {
     const std::int32_t begin = row_offsets[row];
@@ -93,7 +253,7 @@ Status build_normalized_graph(const std::int32_t* row_offsets,
        * scipy.sparse graph.sum(axis=0) accumulates the float32 graph into a
        * float32 result. Keep the same rounding point before sqrt.
        */
-      degree[static_cast<std::size_t>(column)] += weight;
+      degree[column] += weight;
       if (weight > 0.0f) {
         unite(parents, ranks, row, column);
       }
@@ -102,8 +262,7 @@ Status build_normalized_graph(const std::int32_t* row_offsets,
 
   const std::int32_t first_root = find_root(parents, 0);
   for (std::int32_t row = 0; row < count; ++row) {
-    if (!(degree[static_cast<std::size_t>(row)] > 0.0f) ||
-        !std::isfinite(degree[static_cast<std::size_t>(row)])) {
+    if (!(degree[row] > 0.0f) || !std::isfinite(degree[row])) {
       return Status::kInvalidGraph;
     }
     if (find_root(parents, row) != first_root) {
@@ -111,16 +270,12 @@ Status build_normalized_graph(const std::int32_t* row_offsets,
     }
   }
 
-  std::vector<float> inverse_sqrt_degree(static_cast<std::size_t>(count));
   for (std::int32_t row = 0; row < count; ++row) {
-    inverse_sqrt_degree[static_cast<std::size_t>(row)] =
-        1.0f / std::sqrt(degree[static_cast<std::size_t>(row)]);
+    inverse_sqrt_degree[row] = 1.0f / std::sqrt(degree[row]);
   }
 
-  result->values.resize(static_cast<std::size_t>(edge_count));
   for (std::int32_t row = 0; row < count; ++row) {
-    const float row_scale =
-        inverse_sqrt_degree[static_cast<std::size_t>(row)];
+    const float row_scale = inverse_sqrt_degree[row];
     for (std::int32_t edge = row_offsets[row]; edge < row_offsets[row + 1];
          ++edge) {
       /*
@@ -129,23 +284,15 @@ Status build_normalized_graph(const std::int32_t* row_offsets,
        * the expression into a differently rounded three-factor product.
        */
       const float row_scaled = row_scale * weights[edge];
-      result->values[static_cast<std::size_t>(edge)] =
-          row_scaled *
-          inverse_sqrt_degree[static_cast<std::size_t>(columns[edge])];
+      weights[edge] = row_scaled * inverse_sqrt_degree[columns[edge]];
     }
   }
-  result->working_bytes =
-      degree.size() * sizeof(float) +
-      inverse_sqrt_degree.size() * sizeof(float) +
-      parents.size() * sizeof(std::int32_t) +
-      ranks.size() * sizeof(std::uint8_t) +
-      result->values.size() * sizeof(float);
   return Status::kSuccess;
 }
 
 void apply_laplacian(const std::int32_t* row_offsets,
                      const std::int32_t* columns,
-                     const std::vector<float>& normalized_weights,
+                     const float* normalized_weights,
                      std::int32_t count,
                      const double* input,
                      double* output) {
@@ -154,8 +301,7 @@ void apply_laplacian(const std::int32_t* row_offsets,
     for (std::int32_t edge = row_offsets[row]; edge < row_offsets[row + 1];
          ++edge) {
       value -=
-          static_cast<double>(
-              normalized_weights[static_cast<std::size_t>(edge)]) *
+          static_cast<double>(normalized_weights[edge]) *
           input[columns[edge]];
     }
     output[row] = value;
@@ -164,7 +310,7 @@ void apply_laplacian(const std::int32_t* row_offsets,
 
 void apply_laplacian_mixed(const std::int32_t* row_offsets,
                            const std::int32_t* columns,
-                           const std::vector<float>& normalized_weights,
+                           const float* normalized_weights,
                            std::int32_t count,
                            const float* input,
                            double* output) {
@@ -173,8 +319,7 @@ void apply_laplacian_mixed(const std::int32_t* row_offsets,
     for (std::int32_t edge = row_offsets[row]; edge < row_offsets[row + 1];
          ++edge) {
       value -=
-          static_cast<double>(
-              normalized_weights[static_cast<std::size_t>(edge)]) *
+          static_cast<double>(normalized_weights[edge]) *
           static_cast<double>(input[columns[edge]]);
     }
     output[row] = value;
@@ -212,14 +357,13 @@ void subtract_scaled_mixed(double* target,
  * than purely tridiagonal. At Senko's default basis size (160), this dense
  * float64 solve is small compared with sparse matvec and reorthogonalization.
  */
-bool diagonalize_symmetric(const std::vector<double>& input,
+bool diagonalize_symmetric(double* matrix,
                            std::int32_t size,
-                           std::vector<double>* eigenvalues,
-                           std::vector<double>* eigenvectors) {
-  std::vector<double> matrix = input;
-  eigenvectors->assign(static_cast<std::size_t>(size) * size, 0.0);
+                           double* eigenvalues,
+                           double* eigenvectors) {
+  std::fill_n(eigenvectors, static_cast<std::size_t>(size) * size, 0.0);
   for (std::int32_t index = 0; index < size; ++index) {
-    (*eigenvectors)[static_cast<std::size_t>(index) * size + index] = 1.0;
+    eigenvectors[static_cast<std::size_t>(index) * size + index] = 1.0;
   }
 
   bool converged = false;
@@ -288,12 +432,10 @@ bool diagonalize_symmetric(const std::vector<double>& input,
               static_cast<std::size_t>(row) * size + left;
           const std::size_t vector_right =
               static_cast<std::size_t>(row) * size + right;
-          const double value_left = (*eigenvectors)[vector_left];
-          const double value_right = (*eigenvectors)[vector_right];
-          (*eigenvectors)[vector_left] =
-              cosine * value_left - sine * value_right;
-          (*eigenvectors)[vector_right] =
-              sine * value_left + cosine * value_right;
+          const double value_left = eigenvectors[vector_left];
+          const double value_right = eigenvectors[vector_right];
+          eigenvectors[vector_left] = cosine * value_left - sine * value_right;
+          eigenvectors[vector_right] = sine * value_left + cosine * value_right;
         }
       }
     }
@@ -305,9 +447,8 @@ bool diagonalize_symmetric(const std::vector<double>& input,
   if (!converged) {
     return false;
   }
-  eigenvalues->resize(static_cast<std::size_t>(size));
   for (std::int32_t index = 0; index < size; ++index) {
-    (*eigenvalues)[static_cast<std::size_t>(index)] =
+    eigenvalues[index] =
         matrix[static_cast<std::size_t>(index) * size + index];
   }
   return true;
@@ -316,32 +457,30 @@ bool diagonalize_symmetric(const std::vector<double>& input,
 std::int32_t extend_krylov_basis(
     const std::int32_t* row_offsets,
     const std::int32_t* columns,
-    const std::vector<float>& normalized_weights,
+    const float* normalized_weights,
     std::int32_t count,
     std::int32_t maximum_basis_size,
     std::int32_t initial_columns,
-    std::vector<float>* basis,
-    std::vector<double>* projected,
-    std::vector<double>* candidate) {
+    float* basis,
+    double* projected,
+    double* candidate) {
   std::int32_t completed = initial_columns;
   while (completed < maximum_basis_size) {
     const std::int32_t source_column = completed - 1;
     const float* source =
-        basis->data() + static_cast<std::size_t>(source_column) * count;
+        basis + static_cast<std::size_t>(source_column) * count;
     apply_laplacian_mixed(row_offsets, columns, normalized_weights, count,
-                          source, candidate->data());
+                          source, candidate);
 
     for (std::int32_t prior = 0; prior < completed; ++prior) {
       const float* prior_vector =
-          basis->data() + static_cast<std::size_t>(prior) * count;
-      const double projection =
-          dot_mixed(prior_vector, candidate->data(), count);
-      (*projected)[static_cast<std::size_t>(prior) * maximum_basis_size +
-                   source_column] = projection;
-      (*projected)[static_cast<std::size_t>(source_column) *
-                       maximum_basis_size +
-                   prior] = projection;
-      subtract_scaled_mixed(candidate->data(), prior_vector, projection, count);
+          basis + static_cast<std::size_t>(prior) * count;
+      const double projection = dot_mixed(prior_vector, candidate, count);
+      projected[static_cast<std::size_t>(prior) * maximum_basis_size +
+                source_column] = projection;
+      projected[static_cast<std::size_t>(source_column) * maximum_basis_size +
+                prior] = projection;
+      subtract_scaled_mixed(candidate, prior_vector, projection, count);
     }
     /*
      * A correction pass keeps a float32-retained basis orthogonal enough for
@@ -350,60 +489,55 @@ std::int32_t extend_krylov_basis(
      */
     for (std::int32_t prior = 0; prior < completed; ++prior) {
       const float* prior_vector =
-          basis->data() + static_cast<std::size_t>(prior) * count;
-      const double correction =
-          dot_mixed(prior_vector, candidate->data(), count);
-      (*projected)[static_cast<std::size_t>(prior) * maximum_basis_size +
-                   source_column] += correction;
-      (*projected)[static_cast<std::size_t>(source_column) *
-                       maximum_basis_size +
-                   prior] += correction;
-      subtract_scaled_mixed(candidate->data(), prior_vector, correction, count);
+          basis + static_cast<std::size_t>(prior) * count;
+      const double correction = dot_mixed(prior_vector, candidate, count);
+      projected[static_cast<std::size_t>(prior) * maximum_basis_size +
+                source_column] += correction;
+      projected[static_cast<std::size_t>(source_column) * maximum_basis_size +
+                prior] += correction;
+      subtract_scaled_mixed(candidate, prior_vector, correction, count);
     }
 
-    const double norm =
-        std::sqrt(squared_norm(candidate->data(), count));
+    const double norm = std::sqrt(squared_norm(candidate, count));
     if (!std::isfinite(norm) || !(norm > kBreakdownTolerance)) {
       break;
     }
     float* next =
-        basis->data() + static_cast<std::size_t>(completed) * count;
+        basis + static_cast<std::size_t>(completed) * count;
     const double inverse_norm = 1.0 / norm;
     for (std::int32_t row = 0; row < count; ++row) {
       next[row] = static_cast<float>(
-          (*candidate)[static_cast<std::size_t>(row)] * inverse_norm);
+          candidate[row] * inverse_norm);
     }
-    (*projected)[static_cast<std::size_t>(source_column) *
-                     maximum_basis_size +
-                 completed] = norm;
-    (*projected)[static_cast<std::size_t>(completed) * maximum_basis_size +
-                 source_column] = norm;
+    projected[static_cast<std::size_t>(source_column) * maximum_basis_size +
+              completed] = norm;
+    projected[static_cast<std::size_t>(completed) * maximum_basis_size +
+              source_column] = norm;
     ++completed;
   }
 
   if (completed > 0) {
     const std::int32_t last = completed - 1;
     const float* source =
-        basis->data() + static_cast<std::size_t>(last) * count;
+        basis + static_cast<std::size_t>(last) * count;
     apply_laplacian_mixed(row_offsets, columns, normalized_weights, count,
-                          source, candidate->data());
+                          source, candidate);
     for (std::int32_t prior = 0; prior < completed; ++prior) {
       const double projection = dot_mixed(
-          basis->data() + static_cast<std::size_t>(prior) * count,
-          candidate->data(), count);
-      (*projected)[static_cast<std::size_t>(prior) * maximum_basis_size +
-                   last] = projection;
-      (*projected)[static_cast<std::size_t>(last) * maximum_basis_size +
-                   prior] = projection;
+          basis + static_cast<std::size_t>(prior) * count, candidate, count);
+      projected[static_cast<std::size_t>(prior) * maximum_basis_size + last] =
+          projection;
+      projected[static_cast<std::size_t>(last) * maximum_basis_size + prior] =
+          projection;
     }
   }
   return completed;
 }
 
-void reconstruct_ritz_vector(const std::vector<float>& basis,
+void reconstruct_ritz_vector(const float* basis,
                              std::int32_t count,
                              std::int32_t basis_size,
-                             const std::vector<double>& small_vectors,
+                             const double* small_vectors,
                              std::int32_t small_column,
                              double* output) {
   std::fill_n(output, count, 0.0);
@@ -416,7 +550,7 @@ void reconstruct_ritz_vector(const std::vector<float>& basis,
       continue;
     }
     const float* source =
-        basis.data() + static_cast<std::size_t>(basis_column) * count;
+        basis + static_cast<std::size_t>(basis_column) * count;
     for (std::int32_t row = 0; row < count; ++row) {
       output[row] += static_cast<double>(source[row]) * scale;
     }
@@ -449,70 +583,103 @@ void canonicalize_sign(double* vectors,
 
 }  // namespace
 
+std::size_t workspace_bytes(std::int32_t count,
+                            std::int32_t edge_count,
+                            std::int32_t dim,
+                            const Options& options) {
+  ResolvedOptions resolved;
+  if (!resolve_options(count, edge_count, dim, options, &resolved)) {
+    return 0;
+  }
+  const std::size_t graph_bytes = graph_workspace_bytes(count);
+  const std::size_t solver_bytes = solver_workspace_bytes(count, resolved);
+  if (graph_bytes == 0 || solver_bytes == 0) {
+    return 0;
+  }
+  return std::max(graph_bytes, solver_bytes);
+}
+
 Status initialize_connected_graph(const std::int32_t* row_offsets,
                                   const std::int32_t* columns,
-                                  const float* weights,
+                                  float* weights,
                                   std::int32_t count,
                                   std::int32_t edge_count,
                                   std::int32_t dim,
                                   double* output_vectors,
                                   double* output_eigenvalues,
+                                  void* workspace,
+                                  std::size_t workspace_size,
                                   const Options& options,
                                   Stats* stats) {
   if (stats != nullptr) {
     *stats = {};
   }
+  ResolvedOptions resolved;
+  const std::size_t required_workspace =
+      workspace_bytes(count, edge_count, dim, options);
   if (row_offsets == nullptr || columns == nullptr || weights == nullptr ||
-      output_vectors == nullptr || count < 3 || edge_count < 1 || dim < 1 ||
-      dim > count - 2 || !std::isfinite(options.tolerance) ||
-      options.tolerance <= 0.0 || options.maximum_basis_size < 0 ||
-      options.retained_ritz_vectors < 0 || options.maximum_restarts < 0) {
-    return Status::kInvalidArgument;
-  }
-
-  const std::int32_t requested = dim + 1;
-  const std::int32_t automatic_basis = 2 * requested + 38;
-  const std::int32_t basis_size =
-      std::min(count,
-               options.maximum_basis_size == 0
-                   ? automatic_basis
-                   : std::max(options.maximum_basis_size, requested + 1));
-  if (basis_size <= requested) {
+      output_vectors == nullptr || workspace == nullptr ||
+      required_workspace == 0 || workspace_size < required_workspace ||
+      reinterpret_cast<std::uintptr_t>(workspace) % alignof(double) != 0 ||
+      !resolve_options(count, edge_count, dim, options, &resolved)) {
     return Status::kInvalidArgument;
   }
 
   std::size_t basis_elements = 0;
-  if (!checked_product(static_cast<std::size_t>(count),
-                       static_cast<std::size_t>(basis_size),
-                       &basis_elements)) {
+  std::size_t projected_elements = 0;
+  if (!checked_product(
+          static_cast<std::size_t>(count),
+          static_cast<std::size_t>(resolved.basis_size), &basis_elements) ||
+      !checked_product(
+          static_cast<std::size_t>(resolved.basis_size),
+          static_cast<std::size_t>(resolved.basis_size),
+          &projected_elements)) {
     return Status::kInvalidArgument;
   }
-  const std::int32_t requested_retained =
-      options.retained_ritz_vectors == 0 ? requested + 11
-                                         : options.retained_ritz_vectors;
-  const std::int32_t retained =
-      std::min(requested_retained, basis_size - 2);
-  const std::int32_t maximum_restarts =
-      retained >= requested ? options.maximum_restarts : 0;
 
-  NormalizedGraph graph;
   const Status graph_status = build_normalized_graph(
-      row_offsets, columns, weights, count, edge_count, &graph);
+      row_offsets, columns, weights, count, edge_count, workspace,
+      workspace_size);
   if (graph_status != Status::kSuccess) {
     return graph_status;
   }
 
-  std::vector<float> basis(basis_elements, 0.0f);
-  std::vector<double> candidate(static_cast<std::size_t>(count), 0.0);
-  std::vector<double> residual_product(static_cast<std::size_t>(count), 0.0);
-  std::vector<double> restart_direction(static_cast<std::size_t>(count), 0.0);
-  std::vector<double> projected(static_cast<std::size_t>(basis_size) *
-                                    basis_size,
-                                0.0);
+  ScratchArena scratch(workspace, workspace_size);
+  float* const basis = scratch.allocate<float>(basis_elements);
+  double* const candidate =
+      scratch.allocate<double>(static_cast<std::size_t>(count));
+  double* const residual_product =
+      scratch.allocate<double>(static_cast<std::size_t>(count));
+  double* const restart_direction =
+      scratch.allocate<double>(static_cast<std::size_t>(count));
+  double* const projected = scratch.allocate<double>(projected_elements);
+  double* const compact_projected =
+      scratch.allocate<double>(projected_elements);
+  double* const small_vectors = scratch.allocate<double>(projected_elements);
+  double* const small_values = scratch.allocate<double>(
+      static_cast<std::size_t>(resolved.basis_size));
+  std::int32_t* const order = scratch.allocate<std::int32_t>(
+      static_cast<std::size_t>(resolved.basis_size));
+  float* restart_basis = nullptr;
+  if (resolved.maximum_restarts > 0) {
+    std::size_t restart_elements = 0;
+    if (!checked_product(
+            static_cast<std::size_t>(count),
+            static_cast<std::size_t>(resolved.retained + 1),
+            &restart_elements)) {
+      return Status::kInvalidArgument;
+    }
+    restart_basis = scratch.allocate<float>(restart_elements);
+  }
+  if (!scratch.valid()) {
+    return Status::kInvalidArgument;
+  }
+  std::fill_n(basis, basis_elements, 0.0f);
+  std::fill_n(projected, projected_elements, 0.0);
 
   const float initial_value =
       static_cast<float>(1.0 / std::sqrt(static_cast<double>(count)));
-  std::fill_n(basis.data(), count, initial_value);
+  std::fill_n(basis, count, initial_value);
 
   std::int32_t initial_columns = 1;
   std::int32_t actual_basis_size = 0;
@@ -521,59 +688,57 @@ Status initialize_connected_graph(const std::int32_t* row_offsets,
   double maximum_residual = std::numeric_limits<double>::infinity();
   double smallest_eigenvalue = 0.0;
   double largest_returned_eigenvalue = 0.0;
-  std::size_t maximum_restart_basis_bytes = 0;
-  std::size_t maximum_compact_eigen_bytes = 0;
 
-  for (std::int32_t cycle = 0; cycle <= maximum_restarts; ++cycle) {
+  for (std::int32_t cycle = 0; cycle <= resolved.maximum_restarts; ++cycle) {
     actual_basis_size = extend_krylov_basis(
-        row_offsets, columns, graph.values, count, basis_size, initial_columns,
-        &basis, &projected, &candidate);
-    if (actual_basis_size < requested) {
+        row_offsets, columns, weights, count, resolved.basis_size,
+        initial_columns, basis, projected, candidate);
+    if (actual_basis_size < resolved.requested) {
       return Status::kNumericalFailure;
     }
 
-    std::vector<double> compact_projected(
-        static_cast<std::size_t>(actual_basis_size) * actual_basis_size);
     for (std::int32_t row = 0; row < actual_basis_size; ++row) {
       for (std::int32_t column = 0; column < actual_basis_size; ++column) {
         compact_projected[static_cast<std::size_t>(row) *
                               actual_basis_size +
                           column] =
-            projected[static_cast<std::size_t>(row) * basis_size + column];
+            projected[static_cast<std::size_t>(row) *
+                          resolved.basis_size +
+                      column];
       }
     }
-    std::vector<double> small_values;
-    std::vector<double> small_vectors;
     if (!diagonalize_symmetric(compact_projected, actual_basis_size,
-                               &small_values, &small_vectors)) {
+                               small_values, small_vectors)) {
       return Status::kNumericalFailure;
     }
-    maximum_compact_eigen_bytes =
-        std::max(maximum_compact_eigen_bytes,
-                 compact_projected.size() * sizeof(double) * 2 +
-                     small_vectors.size() * sizeof(double) +
-                     small_values.size() * sizeof(double));
 
-    std::vector<std::int32_t> order(
-        static_cast<std::size_t>(actual_basis_size));
-    std::iota(order.begin(), order.end(), 0);
-    std::stable_sort(order.begin(), order.end(),
-                     [&](std::int32_t left, std::int32_t right) {
-                       return small_values[static_cast<std::size_t>(left)] <
-                              small_values[static_cast<std::size_t>(right)];
-                     });
+    /*
+     * Stable insertion sort is allocation-free. At the fixed maximum of 160
+     * entries it is negligible next to a sparse matvec, and the strict
+     * comparison preserves stable_sort's tie ordering.
+     */
+    for (std::int32_t index = 0; index < actual_basis_size; ++index) {
+      order[index] = index;
+    }
+    for (std::int32_t index = 1; index < actual_basis_size; ++index) {
+      const std::int32_t value = order[index];
+      std::int32_t position = index;
+      while (position > 0 &&
+             small_values[value] < small_values[order[position - 1]]) {
+        order[position] = order[position - 1];
+        --position;
+      }
+      order[position] = value;
+    }
 
     const bool can_restart =
-        cycle < maximum_restarts && retained >= requested &&
-        retained < actual_basis_size;
+        cycle < resolved.maximum_restarts &&
+        resolved.retained >= resolved.requested &&
+        resolved.retained < actual_basis_size;
     const std::int32_t evaluated =
-        can_restart ? retained : requested;
-    std::vector<float> restart_basis;
-    if (can_restart) {
-      restart_basis.resize(static_cast<std::size_t>(count) * (retained + 1));
-      maximum_restart_basis_bytes =
-          std::max(maximum_restart_basis_bytes,
-                   restart_basis.size() * sizeof(float));
+        can_restart ? resolved.retained : resolved.requested;
+    if (can_restart && restart_basis == nullptr) {
+      return Status::kInvalidArgument;
     }
 
     converged = 0;
@@ -581,20 +746,16 @@ Status initialize_connected_graph(const std::int32_t* row_offsets,
     double largest_restart_residual = -1.0;
     for (std::int32_t output_column = 0; output_column < evaluated;
          ++output_column) {
-      const std::int32_t small_column =
-          order[static_cast<std::size_t>(output_column)];
+      const std::int32_t small_column = order[output_column];
       reconstruct_ritz_vector(basis, count, actual_basis_size, small_vectors,
-                              small_column, candidate.data());
-      const double eigenvalue =
-          small_values[static_cast<std::size_t>(small_column)];
-      apply_laplacian(row_offsets, columns, graph.values, count,
-                      candidate.data(), residual_product.data());
+                              small_column, candidate);
+      const double eigenvalue = small_values[small_column];
+      apply_laplacian(row_offsets, columns, weights, count, candidate,
+                      residual_product);
       double squared_residual = 0.0;
       for (std::int32_t row = 0; row < count; ++row) {
-        residual_product[static_cast<std::size_t>(row)] -=
-            eigenvalue * candidate[static_cast<std::size_t>(row)];
-        const double value =
-            residual_product[static_cast<std::size_t>(row)];
+        residual_product[row] -= eigenvalue * candidate[row];
+        const double value = residual_product[row];
         squared_residual += value * value;
       }
       const double residual = std::sqrt(squared_residual);
@@ -602,7 +763,7 @@ Status initialize_connected_graph(const std::int32_t* row_offsets,
         return Status::kNumericalFailure;
       }
 
-      if (output_column < requested) {
+      if (output_column < resolved.requested) {
         maximum_residual = std::max(maximum_residual, residual);
         if (residual <= options.tolerance) {
           ++converged;
@@ -613,14 +774,13 @@ Status initialize_connected_graph(const std::int32_t* row_offsets,
           const std::int32_t target_column = output_column - 1;
           for (std::int32_t row = 0; row < count; ++row) {
             output_vectors[static_cast<std::size_t>(row) * dim +
-                           target_column] =
-                candidate[static_cast<std::size_t>(row)];
+                           target_column] = candidate[row];
           }
           canonicalize_sign(output_vectors, count, dim, target_column);
           if (output_eigenvalues != nullptr) {
             output_eigenvalues[target_column] = eigenvalue;
           }
-          if (output_column == requested - 1) {
+          if (output_column == resolved.requested - 1) {
             largest_returned_eigenvalue = eigenvalue;
           }
         }
@@ -628,21 +788,18 @@ Status initialize_connected_graph(const std::int32_t* row_offsets,
 
       if (can_restart) {
         float* restart_column =
-            restart_basis.data() +
-            static_cast<std::size_t>(output_column) * count;
+            restart_basis + static_cast<std::size_t>(output_column) * count;
         for (std::int32_t row = 0; row < count; ++row) {
-          restart_column[row] = static_cast<float>(
-              candidate[static_cast<std::size_t>(row)]);
+          restart_column[row] = static_cast<float>(candidate[row]);
         }
         if (squared_residual > largest_restart_residual) {
           largest_restart_residual = squared_residual;
-          std::copy(residual_product.begin(), residual_product.end(),
-                    restart_direction.begin());
+          std::copy_n(residual_product, count, restart_direction);
         }
       }
     }
 
-    if (converged == requested || !can_restart) {
+    if (converged == resolved.requested || !can_restart) {
       break;
     }
 
@@ -653,69 +810,55 @@ Status initialize_connected_graph(const std::int32_t* row_offsets,
      * vector.
      */
     for (std::int32_t pass = 0; pass < 2; ++pass) {
-      for (std::int32_t prior = 0; prior < retained; ++prior) {
+      for (std::int32_t prior = 0; prior < resolved.retained; ++prior) {
         const float* prior_vector =
-            restart_basis.data() +
-            static_cast<std::size_t>(prior) * count;
+            restart_basis + static_cast<std::size_t>(prior) * count;
         const double projection =
-            dot_mixed(prior_vector, restart_direction.data(), count);
-        subtract_scaled_mixed(restart_direction.data(), prior_vector,
-                              projection, count);
+            dot_mixed(prior_vector, restart_direction, count);
+        subtract_scaled_mixed(restart_direction, prior_vector, projection,
+                              count);
       }
     }
-    const double restart_norm =
-        std::sqrt(squared_norm(restart_direction.data(), count));
+    const double restart_norm = std::sqrt(squared_norm(restart_direction,
+                                                       count));
     if (!std::isfinite(restart_norm) ||
         !(restart_norm > kBreakdownTolerance)) {
       return Status::kNumericalFailure;
     }
     float* restart_column =
-        restart_basis.data() + static_cast<std::size_t>(retained) * count;
+        restart_basis + static_cast<std::size_t>(resolved.retained) * count;
     const double inverse_restart_norm = 1.0 / restart_norm;
     for (std::int32_t row = 0; row < count; ++row) {
       restart_column[row] = static_cast<float>(
-          restart_direction[static_cast<std::size_t>(row)] *
-          inverse_restart_norm);
+          restart_direction[row] * inverse_restart_norm);
     }
 
-    /*
-     * Free the old full basis before growing the retained vectors back to the
-     * configured capacity. The live transition is one full basis plus the
-     * compact retained basis, not two full bases.
-     */
-    std::vector<float>().swap(basis);
-    basis.assign(basis_elements, 0.0f);
-    std::copy(restart_basis.begin(), restart_basis.end(), basis.begin());
-    std::fill(projected.begin(), projected.end(), 0.0);
-    for (std::int32_t index = 0; index < retained; ++index) {
-      const std::int32_t small_column =
-          order[static_cast<std::size_t>(index)];
-      projected[static_cast<std::size_t>(index) * basis_size + index] =
-          small_values[static_cast<std::size_t>(small_column)];
+    std::fill_n(basis, basis_elements, 0.0f);
+    std::copy_n(
+        restart_basis,
+        static_cast<std::size_t>(count) * (resolved.retained + 1), basis);
+    std::fill_n(projected, projected_elements, 0.0);
+    for (std::int32_t index = 0; index < resolved.retained; ++index) {
+      const std::int32_t small_column = order[index];
+      projected[static_cast<std::size_t>(index) * resolved.basis_size +
+                index] = small_values[small_column];
     }
-    initial_columns = retained + 1;
+    initial_columns = resolved.retained + 1;
     ++restart_count;
   }
 
   if (stats != nullptr) {
-    stats->requested_eigenpairs = requested;
+    stats->requested_eigenpairs = resolved.requested;
     stats->basis_size = actual_basis_size;
     stats->restart_count = restart_count;
     stats->converged_eigenpairs = converged;
     stats->maximum_residual = maximum_residual;
     stats->smallest_eigenvalue = smallest_eigenvalue;
     stats->largest_returned_eigenvalue = largest_returned_eigenvalue;
-    stats->peak_working_bytes =
-        graph.working_bytes + basis.size() * sizeof(float) +
-        maximum_restart_basis_bytes +
-        candidate.size() * sizeof(double) +
-        residual_product.size() * sizeof(double) +
-        restart_direction.size() * sizeof(double) +
-        projected.size() * sizeof(double) + maximum_compact_eigen_bytes +
-        static_cast<std::size_t>(basis_size) * sizeof(std::int32_t);
+    stats->peak_working_bytes = required_workspace;
   }
 
-  if (converged != requested && !options.accept_unconverged) {
+  if (converged != resolved.requested && !options.accept_unconverged) {
     return Status::kDidNotConverge;
   }
   return Status::kSuccess;
