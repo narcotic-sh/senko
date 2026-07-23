@@ -68,6 +68,30 @@ interface ClusteringWasmExports extends WebAssembly.Exports {
     outputIndices: number,
     outputSimilarities: number,
   ) => number;
+  readonly cluster_hdbscan_workspace_bytes: (
+    count: number,
+    dim: number,
+    minSamples: number,
+    minClusterSize: number,
+  ) => number;
+  readonly cluster_hdbscan_f64_semantics: (
+    projection: number,
+    count: number,
+    dim: number,
+    minSamples: number,
+    minClusterSize: number,
+    outputLabels: number,
+  ) => number;
+  readonly cluster_hdbscan_f64_diagnostics: (
+    projection: number,
+    count: number,
+    dim: number,
+    minSamples: number,
+    minClusterSize: number,
+    outputLabels: number,
+    outputCoreDistances: number,
+    outputMstRows: number,
+  ) => number;
 }
 
 /** Reusable SIMD WebAssembly backend for clustering's numeric hotspots. */
@@ -438,6 +462,143 @@ export class WasmClusteringKernels implements ClusteringNumericKernels {
     };
   }
 
+  /**
+   * Native-compatible HDBSCAN 0.8.44 Float64 hierarchy semantics. The exact
+   * KD-tree/Boruvka provider is still parity-gated and is not selected by the
+   * production pipeline until the native UMAP path is ready.
+   */
+  clusterHdbscanF64Semantics(
+    projection: Float32Array,
+    count: number,
+    dim: number,
+    minSamples: number,
+    minClusterSize: number,
+  ): Int32Array {
+    requireMatrix("HDBSCAN projection", projection, count, dim);
+    const exports = this.requireExports();
+    const workspaceBytes = exports.cluster_hdbscan_workspace_bytes(
+      count,
+      dim,
+      minSamples,
+      minClusterSize,
+    );
+    if (workspaceBytes === 0) {
+      throw new RangeError("HDBSCAN dimensions or parameters are unsupported");
+    }
+    const arenaBytes = hdbscanArenaBytes(
+      count,
+      dim,
+      workspaceBytes,
+    );
+    const operationExports = this.beginOperation(arenaBytes);
+    const projectionPointer = this.copyFloat32(
+      operationExports,
+      projection,
+    );
+    const labelsPointer = this.allocate(
+      operationExports,
+      count * Int32Array.BYTES_PER_ELEMENT,
+      Int32Array.BYTES_PER_ELEMENT,
+    );
+    this.requireSuccess(
+      "HDBSCAN Float64 semantics",
+      operationExports.cluster_hdbscan_f64_semantics(
+        projectionPointer,
+        count,
+        dim,
+        minSamples,
+        minClusterSize,
+        labelsPointer,
+      ),
+      operationExports,
+    );
+    this.observeReturnedJsBytes(count * Int32Array.BYTES_PER_ELEMENT);
+    return this.copyInt32Result(operationExports, labelsPointer, count);
+  }
+
+  /** Return raw numeric stages for gated differential tests. */
+  diagnoseHdbscanF64Semantics(
+    projection: Float32Array,
+    count: number,
+    dim: number,
+    minSamples: number,
+    minClusterSize: number,
+  ): {
+    readonly labels: Int32Array;
+    readonly coreDistances: Float64Array;
+    readonly mstRows: Float64Array;
+  } {
+    requireMatrix("HDBSCAN projection", projection, count, dim);
+    const exports = this.requireExports();
+    const workspaceBytes = exports.cluster_hdbscan_workspace_bytes(
+      count,
+      dim,
+      minSamples,
+      minClusterSize,
+    );
+    if (workspaceBytes === 0) {
+      throw new RangeError("HDBSCAN dimensions or parameters are unsupported");
+    }
+    const mstElementCount = checkedElementCount(
+      "HDBSCAN diagnostic MST",
+      count - 1,
+      3,
+    );
+    const operationExports = this.beginOperation(
+      hdbscanDiagnosticArenaBytes(count, dim, workspaceBytes),
+    );
+    const projectionPointer = this.copyFloat32(
+      operationExports,
+      projection,
+    );
+    const labelsPointer = this.allocate(
+      operationExports,
+      count * Int32Array.BYTES_PER_ELEMENT,
+      Int32Array.BYTES_PER_ELEMENT,
+    );
+    const coreDistancesPointer = this.allocate(
+      operationExports,
+      count * Float64Array.BYTES_PER_ELEMENT,
+      Float64Array.BYTES_PER_ELEMENT,
+    );
+    const mstPointer = this.allocate(
+      operationExports,
+      mstElementCount * Float64Array.BYTES_PER_ELEMENT,
+      Float64Array.BYTES_PER_ELEMENT,
+    );
+    this.requireSuccess(
+      "HDBSCAN Float64 diagnostics",
+      operationExports.cluster_hdbscan_f64_diagnostics(
+        projectionPointer,
+        count,
+        dim,
+        minSamples,
+        minClusterSize,
+        labelsPointer,
+        coreDistancesPointer,
+        mstPointer,
+      ),
+      operationExports,
+    );
+    const returnedBytes =
+      count * Int32Array.BYTES_PER_ELEMENT +
+      (count + mstElementCount) * Float64Array.BYTES_PER_ELEMENT;
+    this.observeReturnedJsBytes(returnedBytes);
+    return {
+      labels: this.copyInt32Result(operationExports, labelsPointer, count),
+      coreDistances: this.copyFloat64Result(
+        operationExports,
+        coreDistancesPointer,
+        count,
+      ),
+      mstRows: this.copyFloat64Result(
+        operationExports,
+        mstPointer,
+        mstElementCount,
+      ),
+    };
+  }
+
   dispose(): void {
     if (this.exports !== undefined) {
       this.lastHeapBytes = this.exports.memory.buffer.byteLength;
@@ -558,6 +719,14 @@ export class WasmClusteringKernels implements ClusteringNumericKernels {
     return checkedInt32View(exports.memory, pointer, length).slice();
   }
 
+  private copyFloat64Result(
+    exports: ClusteringWasmExports,
+    pointer: number,
+    length: number,
+  ): Float64Array {
+    return checkedFloat64View(exports.memory, pointer, length).slice();
+  }
+
   private copyUint8Result(
     exports: ClusteringWasmExports,
     pointer: number,
@@ -601,6 +770,15 @@ function checkedInt32View(
 ): Int32Array {
   checkedRange(memory, pointer, length, Int32Array.BYTES_PER_ELEMENT);
   return new Int32Array(memory.buffer, pointer, length);
+}
+
+function checkedFloat64View(
+  memory: WebAssembly.Memory,
+  pointer: number,
+  length: number,
+): Float64Array {
+  checkedRange(memory, pointer, length, Float64Array.BYTES_PER_ELEMENT);
+  return new Float64Array(memory.buffer, pointer, length);
 }
 
 function checkedUint8View(
@@ -717,6 +895,59 @@ function alignBigInt(value: bigint, alignment: bigint): bigint {
 function matrixArenaBytes(count: number, dim: number): number {
   const sizer = new ArenaSizer();
   sizer.add(BigInt(count) * BigInt(dim), 4n, 4n);
+  return sizer.bytes();
+}
+
+function hdbscanArenaBytes(
+  count: number,
+  dim: number,
+  workspaceBytes: number,
+): number {
+  checkedElementCount("HDBSCAN projection", count, dim);
+  checkedElementCount("HDBSCAN labels", count);
+  if (
+    !Number.isSafeInteger(workspaceBytes) ||
+    workspaceBytes <= 0 ||
+    workspaceBytes > UINT32_MAX
+  ) {
+    throw new RangeError(
+      `HDBSCAN workspace ${workspaceBytes} is outside the wasm32 address range`,
+    );
+  }
+  const sizer = new ArenaSizer();
+  sizer.add(BigInt(count) * BigInt(dim), 4n, 4n);
+  sizer.add(BigInt(count), 4n, 4n);
+  sizer.add(BigInt(workspaceBytes), 1n, 16n);
+  return sizer.bytes();
+}
+
+function hdbscanDiagnosticArenaBytes(
+  count: number,
+  dim: number,
+  workspaceBytes: number,
+): number {
+  checkedElementCount("HDBSCAN projection", count, dim);
+  checkedElementCount("HDBSCAN labels", count);
+  const mstElementCount = checkedElementCount(
+    "HDBSCAN diagnostic MST",
+    count - 1,
+    3,
+  );
+  if (
+    !Number.isSafeInteger(workspaceBytes) ||
+    workspaceBytes <= 0 ||
+    workspaceBytes > UINT32_MAX
+  ) {
+    throw new RangeError(
+      `HDBSCAN workspace ${workspaceBytes} is outside the wasm32 address range`,
+    );
+  }
+  const sizer = new ArenaSizer();
+  sizer.add(BigInt(count) * BigInt(dim), 4n, 4n);
+  sizer.add(BigInt(count), 4n, 4n);
+  sizer.add(BigInt(count), 8n, 8n);
+  sizer.add(BigInt(mstElementCount), 8n, 8n);
+  sizer.add(BigInt(workspaceBytes), 1n, 16n);
   return sizer.bytes();
 }
 

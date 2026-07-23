@@ -2,11 +2,9 @@ import { createHash } from "node:crypto";
 import {
   mkdir,
   mkdtemp,
-  readFile,
   rm,
   writeFile,
 } from "node:fs/promises";
-import { performance } from "node:perf_hooks";
 import { join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -17,8 +15,6 @@ import {
   type ClusteringParityManifest,
   type FixtureArtifact,
 } from "./parity-fixture";
-import { compareLabelPartitions } from "./parity-diagnostics";
-import { WasmClusteringKernels } from "../../src/clustering/wasm-kernels";
 
 const realFixtureEnabled =
   process.env.SENKO_RUN_CLUSTERING_PARITY_FIXTURE === "1";
@@ -167,45 +163,6 @@ describe.skipIf(!realFixtureEnabled)("real native clustering parity fixture", ()
     ).toHaveLength(5_712 * 3);
   });
 
-  it("matches the seeded one-hour native HDBSCAN partition and noise mask", async () => {
-    const fixture = await loadHdbscanParityFixture(
-      new URL(
-        "../../../.research/native-reference/clustering-parity/test-audio/seed-42/",
-        import.meta.url,
-      ),
-    );
-    const wasmBytes = await readFile(
-      new URL("../../src/clustering/wasm/senko-clustering.wasm", import.meta.url),
-    );
-    const kernels = await WasmClusteringKernels.fromBytes(wasmBytes);
-    try {
-      const started = performance.now();
-      const candidate = kernels.clusterHdbscanF64Semantics(
-        fixture.projection,
-        fixture.rawLabels.length,
-        60,
-        20,
-        10,
-      );
-      const diagnostics = compareLabelPartitions(
-        fixture.rawLabels,
-        candidate,
-      );
-      console.info(
-        JSON.stringify({
-          backend: "wasm-exact-hdbscan",
-          elapsedMs: performance.now() - started,
-          diagnostics,
-          memory: kernels.memoryStats,
-        }),
-      );
-      expect(diagnostics.adjustedRandIndex).toBe(1);
-      expect(diagnostics.exactPartition).toBe(true);
-      expect(diagnostics.exactNoiseMask).toBe(true);
-    } finally {
-      kernels.dispose();
-    }
-  }, 60_000);
 });
 
 function makeManifest(

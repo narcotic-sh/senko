@@ -5,6 +5,8 @@
 
 #include <emscripten/emscripten.h>
 
+#include "hdbscan.hpp"
+
 namespace {
 
 constexpr uint32_t kInitialArenaBytes = 10u * 1024u * 1024u;
@@ -636,6 +638,40 @@ EMSCRIPTEN_KEEPALIVE int cluster_exact_euclidean_knn(
     }
   }
   return 1;
+}
+
+EMSCRIPTEN_KEEPALIVE uint32_t cluster_hdbscan_workspace_bytes(
+    int count, int dimension, int min_samples, int min_cluster_size) {
+  return senko_hdbscan::workspace_bytes(count, dimension, min_samples,
+                                        min_cluster_size);
+}
+
+EMSCRIPTEN_KEEPALIVE int cluster_hdbscan_f64_semantics(
+    const float* projection, int count, int dimension, int min_samples,
+    int min_cluster_size, int32_t* labels) {
+  const uint32_t workspace_size = senko_hdbscan::workspace_bytes(
+      count, dimension, min_samples, min_cluster_size);
+  if (workspace_size == 0) return -1;
+  void* const workspace = allocate_bytes(workspace_size, 16u);
+  if (!workspace) return -2;
+  return senko_hdbscan::run_f64_semantics(
+      projection, count, dimension, min_samples, min_cluster_size, labels,
+      workspace, workspace_size);
+}
+
+EMSCRIPTEN_KEEPALIVE int cluster_hdbscan_f64_diagnostics(
+    const float* projection, int count, int dimension, int min_samples,
+    int min_cluster_size, int32_t* labels, double* core_distances,
+    double* mst_rows) {
+  if (!core_distances || !mst_rows) return -1;
+  const uint32_t workspace_size = senko_hdbscan::workspace_bytes(
+      count, dimension, min_samples, min_cluster_size);
+  if (workspace_size == 0) return -1;
+  void* const workspace = allocate_bytes(workspace_size, 16u);
+  if (!workspace) return -2;
+  return senko_hdbscan::run_f64_semantics_diagnostic(
+      projection, count, dimension, min_samples, min_cluster_size, labels,
+      core_distances, mst_rows, workspace, workspace_size);
 }
 
 }  // extern "C"

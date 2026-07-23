@@ -84,6 +84,46 @@ describe("WasmClusteringKernels", () => {
     }
   });
 
+  it("matches native HDBSCAN semantics on a two-cluster noise fixture", async () => {
+    const kernels = await createKernels();
+    const projection = new Float32Array([
+      -0.15, 0.08,
+      -0.08, -0.04,
+      0.02, 0.12,
+      0.09, -0.1,
+      0.16, 0.03,
+      -0.02, -0.16,
+      9.85, 10.08,
+      9.92, 9.96,
+      10.02, 10.12,
+      10.09, 9.9,
+      10.16, 10.03,
+      9.98, 9.84,
+      50, -40,
+    ]);
+    try {
+      const labels = kernels.clusterHdbscanF64Semantics(
+        projection,
+        13,
+        2,
+        2,
+        3,
+      );
+      expect(labels[12]).toBe(-1);
+      expect(labels[0]).not.toBe(-1);
+      expect(labels[6]).not.toBe(-1);
+      expect(labels[0]).not.toBe(labels[6]);
+      expect([...labels.subarray(0, 6)]).toEqual(
+        Array.from({ length: 6 }, () => labels[0]),
+      );
+      expect([...labels.subarray(6, 12)]).toEqual(
+        Array.from({ length: 6 }, () => labels[6]),
+      );
+    } finally {
+      kernels.dispose();
+    }
+  });
+
   it("starts with the compact eleven-megabyte heap and rejects use after disposal", async () => {
     const kernels = await createKernels();
     kernels.normalizeRows(deterministicMatrix(32, 16), 32, 16);
