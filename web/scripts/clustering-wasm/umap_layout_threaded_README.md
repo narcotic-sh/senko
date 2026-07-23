@@ -1,10 +1,10 @@
 # Native-parity threaded UMAP layout
 
 This directory contains a validated standalone implementation of UMAP
-0.5.12's parallel Euclidean layout optimizer. It is intentionally **not wired
-into production yet**. The ordinary clustering module owns a growable,
+0.5.12's parallel Euclidean layout optimizer. It is the production layout
+backend for long recordings. The ordinary clustering module owns a growable,
 non-shared arena; WebAssembly memories are declared shared at compile time, so
-the threaded optimizer must remain a separate module.
+the threaded optimizer remains a separate module.
 
 ## What is preserved
 
@@ -14,7 +14,7 @@ the threaded optimizer must remain a separate module.
   16-accumulator reduction shape;
 - float64 sample clocks, alpha, `a`, `b`, gamma, and negative-sample rate;
 - UMAP's per-head tau RNG state and signed modulo behavior;
-- row-major COO edge order, `move_other=true`, and contiguous static edge
+- row-major CSR edge order, `move_other=true`, and contiguous static edge
   shards;
 - the UMAP 0.5.12 alpha quirk: epochs zero and one both use alpha 1;
 - worker-zero initialization of all clocks/RNG state, followed by a barrier;
@@ -28,7 +28,7 @@ parallel result is stochastic, just like unseeded native Senko.
 
 ## Execution architecture
 
-The 13,861-byte standalone Wasm has exactly one import, `env.memory`. It does
+The 14,027-byte standalone Wasm has exactly one import, `env.memory`. It does
 not use Emscripten's pthread runtime or generated JavaScript glue. The build
 uses:
 
@@ -48,7 +48,7 @@ The flexible import type lets the coordinator allocate an exact run-sized
 memory, but each actual job supplies `initial === maximum`. Fixed job memory
 avoids stale typed-array views and makes peak memory explicit.
 
-The pipeline worker should compile the module once and keep a small nested
+The pipeline worker compiles the module once and keeps a small nested
 module-worker pool alive. Every leaf instantiates the same cloned
 `WebAssembly.Module` against the same memory. Wasm mutable globals are
 per-instance, so the coordinator assigns each exported `__stack_pointer` a
@@ -81,25 +81,16 @@ allocates a fixed memory of `kTotalBytes`. `RunHeader` documents the complete
 
 For the one-hour fixture (5,713 vertices, 351,946 edges, 60 dimensions), all
 worker counts fit the 16 MiB minimum. The layout memory includes its output,
-COO inputs, float64 clocks, RNG state, synchronization header, and disjoint
+CSR inputs, float64 clocks, RNG state, synchronization header, and disjoint
 stacks.
 
-At the captured long shape (43,804 vertices and roughly 2.836 million edges),
-the current plan is about 119.6 MiB with four stacks or 119.9 MiB with eight.
-This is duration-linear but still much smaller than materializing a dense
-graph. Do not simultaneously reserve the serial layout workspace in the main
-clustering Wasm when this path is integrated.
-
-There are safe follow-up memory reductions if long-file peak becomes
-important:
-
-- derive `epochs_per_negative_sample` on each positive update: about 98 MiB;
-- replace repeated `head[edge]` with CSR row offsets: about 87.3 MiB;
-- retain graph weights and derive sample epochs only when active: about
-  76.5 MiB.
-
-These estimates are for four workers and need a speed/parity gate before
-promotion. They do not reduce the one-hour 16 MiB allocation.
+At the captured long shape (43,804 vertices and 2,836,232 retained edges), ABI
+v2 uses 91,553,792 bytes with four workers or 91,815,936 bytes with eight. The
+preceding COO plan used 125,435,904 and 125,698,048 bytes respectively. CSR
+row offsets and exact on-demand derivation of
+`epochs_per_negative_sample` therefore save 32.31 MiB without changing the
+one-hour 16 MiB allocation. Memory remains duration-linear and far below a
+dense graph.
 
 ## Reproduction
 
@@ -154,6 +145,11 @@ The 8-worker median is 4,066 ms, about 4.0x faster than warm serial Wasm and
 close to native unseeded parallel UMAP's measured 3.53 seconds. Against the
 actual unseeded offline Senko partition, the three 8-worker trials scored ARI
 0.999530, 0.999600, and 0.999930. HDBSCAN added 274–287 ms per trial.
+
+ABI v2 was revalidated with a byte-identical one-worker projection hash
+(`b3b7a57f…927c2a`) and warmed eight-worker times of 3,871, 3,810, and
+4,255 ms (3,871 ms median). All three runs retained seven clusters with no
+noise; seeded downstream ARI was 0.99960, 1.0, and 0.99919.
 
 Pair-distance error is expected to be non-monotonic because it measures one
 stochastic Hogwild trajectory against a deterministic seeded trajectory. The

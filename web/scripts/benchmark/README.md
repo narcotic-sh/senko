@@ -83,7 +83,38 @@ devices before the run. Both remain resident across runs. Avoid other GPU-heavy
 work during acceptance because another app can still contend for the M3 GPU
 even though it cannot enter Senko's memory accounting.
 
-## Current measured snapshot (2026-07-22)
+## Current native-parity snapshot (2026-07-22)
+
+These are isolated Chrome 150 production-build runs on the target M3. VAD,
+FBank, and CAM++ overlap, so stage times must not be summed to derive wall
+time. Only the canonical one-hour row is a timing acceptance; the other two
+are correctness diagnostics over the same production artifact.
+
+| Fixture | Worker wall | VAD | FBank | CAM++ | Clustering | Postprocess | Result |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| `test_audio_short.wav` | **1.522200 s** | 0.354905 s | 0.391690 s | 1.253450 s | 0.202090 s | 0.001830 s | 4 speakers, 49 segments |
+| `test_audio.wav` | **15.708715 s** | 2.554340 s | 2.885770 s | 8.876305 s | 6.762460 s | 0.003780 s | 7 speakers, 131 segments |
+| `test_audio_long.wav` | **166.726970 s** | 21.822615 s | 36.716525 s | 121.058300 s | 45.013010 s | 0.013085 s | 6 speakers, 1,084 segments |
+
+The one-hour run passed the offline gate with 99.9696% speech IoU and 99.9153%
+mapped-speaker agreement at 10 ms; its segment delta was -1. The 31,054-second
+(8 h 37 min) stress run matched the offline six-speaker partition, removing
+the former phantom seventh speaker. It reached 99.9550% speech IoU and 99.9055%
+mapped agreement at 10 ms, with a +7 segment delta.
+
+Logical memory accounting for short/one-hour/eight-hour was respectively
+7,351,392 / 14,481,956 / 111,145,788 known CPU bytes, plus 12,058,624 /
+29,491,200 / 184,942,592 bytes of ordinary and shared WASM high-water. Explicit
+GPU buffers remained 84,001,024 bytes in every run. The 8.6-hour fixture is a
+stress case, not a hard 200 MB combined-memory gate.
+
+Native clustering uses offline Senko's 40-neighbor, 60-dimensional UMAP,
+500/200 epoch policy, unseeded stochastic behavior, HDBSCAN 20/10, and exact
+centroid post-processing. The threaded layout's CSR ABI cut its eight-hour
+shared allocation from 125,698,048 to 91,815,936 bytes with byte-identical
+one-worker output and no material eight-worker slowdown.
+
+## Historical browser-specific clustering checkpoint (2026-07-22)
 
 These numbers are the latest cooled checkpoint on the target M3 Mac, not a
 promise that every run will reproduce the same wall time. VAD, FBank, and
@@ -97,7 +128,9 @@ offline-correctness gate and produced the same merged-segment payload.
 | `test_audio_short.wav` | **1.487360 s** | 0.356200 s | 0.395445 s | 1.222820 s | 0.199085 s | 0.001735 s | 4 speakers, 49 segments |
 | `test_audio.wav` | **9.922655 s** | 2.448150 s | 2.924735 s | 8.736230 s | 1.104210 s | 0.003465 s | 9 speakers, 137 segments |
 
-The long median is 5.077 seconds below the 15-second stretch target and
+This section records the replaced deterministic browser-specific clustering
+path and is retained as optimization history; it is not the current production
+correctness path. Its long median was 5.077 seconds below the 15-second stretch target and
 0.077 seconds below the aspirational 10-second target. The production CAM++
 graph now combines `tile4-fold` FCM, `direct-tile8-wg96` initial TDNN,
 `direct-tile4-wg128` dense bottlenecks, and `chunk512` pointwise transits. The

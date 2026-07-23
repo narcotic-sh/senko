@@ -84,7 +84,8 @@ alongside model initialization, before user audio is processed.
 - Returned JS refinement arrays: 1,028,340 bytes at fixture shape.
 - Returned JS exact-graph arrays: 1,828,160 bytes at fixture shape.
 
-The gated native-parity UMAP spectral solver also uses this arena exclusively.
+The production native-parity UMAP spectral solver also uses this arena
+exclusively.
 Its graph values are normalized in place, and its Lanczos basis, restart
 basis, compact eigensystem, residual vectors, and connectivity scratch all
 come from one explicitly sized workspace. There are no `std::vector` or

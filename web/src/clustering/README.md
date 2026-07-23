@@ -1,8 +1,9 @@
-# Browser clustering baseline
+# Browser clustering implementations
 
-`clusterEmbeddings` is a deterministic, worker-friendly implementation of
-Senko's long-recording clustering stage. It preserves the density hierarchy and
-post-processing behavior without materializing an `N x N` matrix:
+`clusterEmbeddings` is the retained deterministic browser-specific baseline.
+Production long recordings use the native-parity implementation described
+below. The baseline preserves the density hierarchy and post-processing
+behavior without materializing an `N x N` matrix:
 
 1. Project the 192-dimensional CAM++ embeddings to 10 dimensions with a
    specialized typed-array UMAP: 20 neighbors, minimum distance 0, 50 epochs,
@@ -73,20 +74,30 @@ Senko's `CommonClustering` orchestration.
 See [`scripts/clustering-wasm/README.md`](../../scripts/clustering-wasm/README.md)
 for the reproducible benchmark and adaptive-memory accounting.
 
-## Native-parity replacement (gated)
+## Production native-parity path
 
-`native-umap.ts` assembles the exact offline parameters behind a diagnostic
-gate: cosine k-NN 40, 60 output dimensions, spectral initialization, 500
+`native-umap.ts` assembles the offline Senko parameters used in production:
+cosine k-NN 40, 60 output dimensions, spectral initialization, 500
 epochs through 10,000 embeddings (otherwise 200), native `a`/`b`, HDBSCAN
 20/10, minor-cluster reassignment, and repeated centroid merging at 0.875.
 Its WASM stages independently cover PyNNDescent, fuzzy-union CSR, the
 normalized-Laplacian eigenspace, legacy NumPy RNG/noise, UMAP layout, and
 native approximate-Borůvka HDBSCAN.
 
-The serial assembled path is a correctness oracle and no-thread fallback, not
-the production selector: it takes about 23 seconds for clustering alone on the
-5,713-row fixture. It retains seven native clusters with ARI 0.99959 (one
-assignment differs). Production promotion waits for the same logic running in
-the prewarmed shared-memory worker pool to pass this end-to-end gate. The
-query-independent differential tests live under `scripts/clustering-wasm` and
-are opt-in through their `SENKO_RUN_*_PARITY` environment variables.
+The 500/200-epoch Hogwild layout runs in a persistent eight-worker shared-WASM
+pool. ABI v2 passes CSR row offsets rather than a repeated COO head array and
+derives the negative-sample period exactly on active updates. This reduces the
+43,804-row layout allocation from 125,698,048 to 91,815,936 bytes while the
+one-hour shape remains at the 16 MiB minimum.
+
+The serial assembled path remains a correctness oracle, not a production
+fallback. Query-independent differential tests live under
+`scripts/clustering-wasm` and are opt-in through their `SENKO_RUN_*_PARITY`
+environment variables. Final isolated-Chrome acceptance produced:
+
+- `test_audio_short.wav`: unchanged spectral branch, 4 speakers/49 segments,
+  with exact mapped agreement to offline Senko.
+- `test_audio.wav`: 7 speakers/131 segments, 99.915% mapped agreement at
+  10 ms, and a 15.709-second full-pipeline wall time.
+- `test_audio_long.wav` (31,054 seconds): 6 speakers/1,084 segments versus
+  offline Senko's 6/1,077, with 99.906% mapped agreement at 10 ms.
