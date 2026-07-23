@@ -163,6 +163,31 @@ segment/accounting changes, not a new retained allocation. The 43,804-row
 spectral fixture moved from 7.667 to 4.678 seconds with the same 61/61
 convergence and three restarts.
 
+### Native-path prewarm checkpoint (2026-07-23)
+
+Worker initialization now tiers the production approximate-PyNNDescent, fuzzy
+CSR, block-8 spectral, and KD-Borůvka HDBSCAN paths with bounded deterministic
+fixtures. The complete clustering warmup takes about 256 ms, stays inside the
+existing 10 MiB ordinary arena, and starts as soon as clustering resources are
+ready so it can overlap WebGPU model loading.
+
+Three independent cooled production runs completed in **11.400560,
+11.515520, and 11.614870 seconds** (median **11.515520 seconds**), improving
+the preceding 12.413145-second median by **0.897625 seconds (7.2%)**. The
+median-wall run spent 2.646475 seconds in clustering: 0.363780 seconds in
+neighbor search, 0.023340 seconds in fuzzy-graph construction, 0.291255
+seconds in spectral initialization, 0.013505 seconds in layout
+initialization, 1.651915 seconds in layout, and 0.282070 seconds in HDBSCAN.
+It returned seven speakers and 131 segments, passing the offline gate with
+99.9696% speech IoU and 99.9489% mapped-speaker agreement at 10 ms; its
+segment delta was -1.
+
+Peak accounting remained unchanged: 14,481,924 known CPU bytes, 31,522,816
+ordinary/shared WASM bytes, and 84,001,024 explicit GPU-buffer bytes. A
+production-build short-file regression completed in 1.503745 seconds with the
+same four speakers and 49 segments as offline Senko, 100% mapped-speaker
+agreement, and 99.9960% speech IoU at 10 ms.
+
 ## Historical browser-specific clustering checkpoint (2026-07-22)
 
 These numbers are the latest cooled checkpoint on the target M3 Mac, not a
