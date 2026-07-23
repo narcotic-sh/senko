@@ -147,6 +147,22 @@ IoU and 99.9771% mapped-speaker agreement at 10 ms. Its wall time remained
 nearly level because the overlapping CAM++ stage varied from 9.079780 to
 9.460500 seconds. Every tracked memory value remained unchanged.
 
+The final accepted spectral optimization projects eight adjacent Krylov basis
+columns together while retaining two reorthogonalization passes and
+modified-Gram-Schmidt ordering between blocks. Three independent final
+production runs completed in **12.401880, 12.413145, and 12.779335 seconds**
+(median **12.413145 seconds**). The median-wall run spent 3.365575 seconds in
+clustering: 0.535040 seconds in neighbor search, 0.684095 seconds in spectral
+initialization, 1.759600 seconds in layout, and 0.312740 seconds in HDBSCAN.
+It returned seven speakers and 132 segments, passing the offline gate with
+99.9927% speech IoU and 99.9771% mapped-speaker agreement at 10 ms. Known CPU
+peak was 14,482,020 bytes, ordinary/shared WASM high-water 31,522,816 bytes,
+explicit GPU buffers 84,001,024 bytes, and clustering working memory 9,775,204
+bytes. The sub-kilobyte differences between stochastic runs are result-sized
+segment/accounting changes, not a new retained allocation. The 43,804-row
+spectral fixture moved from 7.667 to 4.678 seconds with the same 61/61
+convergence and three restarts.
+
 ## Historical browser-specific clustering checkpoint (2026-07-22)
 
 These numbers are the latest cooled checkpoint on the target M3 Mac, not a

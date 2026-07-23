@@ -382,6 +382,113 @@ void subtract_scaled_mixed(double* target,
 }
 
 /*
+ * Block modified Gram-Schmidt: each small group of basis columns is projected
+ * together, then subtracted as one linear combination.  This preserves the
+ * MGS ordering between groups while avoiding a complete candidate-vector pass
+ * for every individual basis column.
+ */
+constexpr std::int32_t kOrthogonalizationBlock = 8;
+
+void orthogonalize_blocked(const float* basis,
+                           double* candidate,
+                           double* projected,
+                           std::int32_t count,
+                           std::int32_t completed,
+                           std::int32_t maximum_basis_size,
+                           std::int32_t source_column) {
+  for (std::int32_t pass = 0; pass < 2; ++pass) {
+    std::int32_t first = 0;
+    for (; first + kOrthogonalizationBlock <= completed;
+         first += kOrthogonalizationBlock) {
+      const float* const basis0 =
+          basis + static_cast<std::size_t>(first) * count;
+      const float* const basis1 = basis0 + count;
+      const float* const basis2 = basis1 + count;
+      const float* const basis3 = basis2 + count;
+      const float* const basis4 = basis3 + count;
+      const float* const basis5 = basis4 + count;
+      const float* const basis6 = basis5 + count;
+      const float* const basis7 = basis6 + count;
+      double projection0 = 0.0;
+      double projection1 = 0.0;
+      double projection2 = 0.0;
+      double projection3 = 0.0;
+      double projection4 = 0.0;
+      double projection5 = 0.0;
+      double projection6 = 0.0;
+      double projection7 = 0.0;
+#pragma clang loop vectorize(enable) interleave(enable)
+      for (std::int32_t row = 0; row < count; ++row) {
+        const double candidate_value = candidate[row];
+        projection0 += static_cast<double>(basis0[row]) * candidate_value;
+        projection1 += static_cast<double>(basis1[row]) * candidate_value;
+        projection2 += static_cast<double>(basis2[row]) * candidate_value;
+        projection3 += static_cast<double>(basis3[row]) * candidate_value;
+        projection4 += static_cast<double>(basis4[row]) * candidate_value;
+        projection5 += static_cast<double>(basis5[row]) * candidate_value;
+        projection6 += static_cast<double>(basis6[row]) * candidate_value;
+        projection7 += static_cast<double>(basis7[row]) * candidate_value;
+      }
+      const double projection[kOrthogonalizationBlock] = {
+          projection0, projection1, projection2, projection3,
+          projection4, projection5, projection6, projection7,
+      };
+      for (std::int32_t offset = 0; offset < kOrthogonalizationBlock;
+           ++offset) {
+        const std::int32_t prior = first + offset;
+        double& upper =
+            projected[static_cast<std::size_t>(prior) * maximum_basis_size +
+                      source_column];
+        double& lower =
+            projected[static_cast<std::size_t>(source_column) *
+                          maximum_basis_size +
+                      prior];
+        if (pass == 0) {
+          upper = projection[offset];
+          lower = projection[offset];
+        } else {
+          upper += projection[offset];
+          lower += projection[offset];
+        }
+      }
+#pragma clang loop vectorize(enable) interleave(enable)
+      for (std::int32_t row = 0; row < count; ++row) {
+        const double correction =
+            (((projection0 * static_cast<double>(basis0[row]) +
+               projection1 * static_cast<double>(basis1[row])) +
+              (projection2 * static_cast<double>(basis2[row]) +
+               projection3 * static_cast<double>(basis3[row]))) +
+             ((projection4 * static_cast<double>(basis4[row]) +
+               projection5 * static_cast<double>(basis5[row])) +
+              (projection6 * static_cast<double>(basis6[row]) +
+               projection7 * static_cast<double>(basis7[row]))));
+        candidate[row] -= correction;
+      }
+    }
+    for (; first < completed; ++first) {
+      const float* const prior_vector =
+          basis + static_cast<std::size_t>(first) * count;
+      const double projection = dot_mixed(prior_vector, candidate, count);
+      double& upper =
+          projected[static_cast<std::size_t>(first) * maximum_basis_size +
+                    source_column];
+      double& lower =
+          projected[static_cast<std::size_t>(source_column) *
+                        maximum_basis_size +
+                    first];
+      if (pass == 0) {
+        upper = projection;
+        lower = projection;
+      } else {
+        upper += projection;
+        lower += projection;
+      }
+      subtract_scaled_mixed(candidate, prior_vector, projection, count);
+    }
+  }
+}
+
+/*
  * Cyclic Jacobi diagonalization of the compact Rayleigh-Ritz problem.
  * Thick restart makes the projected matrix arrowhead-plus-tridiagonal rather
  * than purely tridiagonal. At Senko's default basis size (160), this dense
@@ -502,31 +609,8 @@ std::int32_t extend_krylov_basis(
     apply_laplacian_mixed(row_offsets, columns, normalized_weights, count,
                           source, candidate);
 
-    for (std::int32_t prior = 0; prior < completed; ++prior) {
-      const float* prior_vector =
-          basis + static_cast<std::size_t>(prior) * count;
-      const double projection = dot_mixed(prior_vector, candidate, count);
-      projected[static_cast<std::size_t>(prior) * maximum_basis_size +
-                source_column] = projection;
-      projected[static_cast<std::size_t>(source_column) * maximum_basis_size +
-                prior] = projection;
-      subtract_scaled_mixed(candidate, prior_vector, projection, count);
-    }
-    /*
-     * A correction pass keeps a float32-retained basis orthogonal enough for
-     * the float64 Rayleigh-Ritz solve. Accumulate the tiny corrections into
-     * the projected column rather than discarding them.
-     */
-    for (std::int32_t prior = 0; prior < completed; ++prior) {
-      const float* prior_vector =
-          basis + static_cast<std::size_t>(prior) * count;
-      const double correction = dot_mixed(prior_vector, candidate, count);
-      projected[static_cast<std::size_t>(prior) * maximum_basis_size +
-                source_column] += correction;
-      projected[static_cast<std::size_t>(source_column) * maximum_basis_size +
-                prior] += correction;
-      subtract_scaled_mixed(candidate, prior_vector, correction, count);
-    }
+    orthogonalize_blocked(basis, candidate, projected, count, completed,
+                          maximum_basis_size, source_column);
 
     const double norm = std::sqrt(squared_norm(candidate, count));
     if (!std::isfinite(norm) || !(norm > kBreakdownTolerance)) {

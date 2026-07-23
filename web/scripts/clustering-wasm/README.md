@@ -129,6 +129,32 @@ delta was `1.179e-8`; seeded and unseeded downstream runs both retained seven
 clusters and no noise. The accepted long vector hash is now
 `1f57911bb06c1990672b737ba9c6245805ecb1af69c91b6199a8c5e851933582`.
 
+Two-pass Krylov reorthogonalization now projects eight adjacent float32 basis
+columns together before subtracting their combined float64 correction. It
+retains modified Gram-Schmidt ordering between blocks and reorthogonalizes
+with the same two-pass policy, while removing most full candidate-vector
+passes. In an interleaved persistent-instance matrix, explicit block-8 was
+faster than
+block-4, generic block-8, and block-16: the one-hour median moved from 404.15
+to 280.43 ms. Three fresh-process one-call medians, which model production's
+first spectral invocation, moved from 1,045.6 to 713.4 ms. The 43,804-row
+fresh-module solve moved from 7.667 to 4.678 seconds. It retained 61/61
+eigenpairs and the same two/three restart counts; maximum residuals improved
+slightly, and the long candidate-versus-predecessor pair-distance error was
+`1.624e-8`. Workspace, heap high-water, and returned-array sizes are
+unchanged. The accepted long vector hash is
+`e54d2a13e5f8c7d756e739ac2d5bf7b874964283c1126e486347cc35cc900322`.
+
+Two larger architectural alternatives were prototyped and rejected. A
+persistent one-workgroup WebGPU Krylov kernel took 828.4 ms with optional
+subgroup reductions for the extension core alone, before float64
+Rayleigh-Ritz, residual checks, and restart construction. A persistent
+shared-WASM worker design found a best additive ceiling of about 162 ms saved,
+but required four cores to spin continuously; wait/notify synchronization
+regressed as worker count increased. Neither can beat the complete block-8
+single-thread WASM stage by enough to justify its complexity, portability, or
+thermal cost.
+
 Run both spectral acceptance fixtures explicitly with:
 
 ```sh

@@ -13,12 +13,12 @@ const parityIt =
   process.env.SENKO_RUN_UMAP_SPECTRAL_PARITY === "1" ? it : it.skip;
 const longParityIt =
   process.env.SENKO_RUN_UMAP_SPECTRAL_LONG_PARITY === "1" ? it : it.skip;
-// Deterministic output after SIMD-vectorizing the f64 reductions and unrolling
-// the two irregular Laplacian row sums across four accumulators. Both grouping
-// changes affect only tiny numerical details; the long-fixture eigenspace and
-// downstream clustering are separately gated against their predecessors.
+// Deterministic output after SIMD-vectorizing the f64 reductions, unrolling
+// the irregular Laplacian row sums, and projecting eight Krylov basis columns
+// per block. The grouping changes affect only tiny numerical details; the
+// long-fixture eigenspace and downstream clustering are separately gated.
 const OPTIMIZED_REDUCTIONS_LONG_VECTOR_SHA256 =
-  "1f57911bb06c1990672b737ba9c6245805ecb1af69c91b6199a8c5e851933582";
+  "e54d2a13e5f8c7d756e739ac2d5bf7b874964283c1126e486347cc35cc900322";
 
 describe("native UMAP spectral-initialization parity", () => {
   parityIt(
