@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width" />
+    <title>Native-parity threaded UMAP layout</title>
+    <style>
+      body {
+        background: #111;
+        color: #eee;
+        font: 14px/1.45 ui-monospace, monospace;
+        margin: 2rem;
+      }
+      pre {
+        white-space: pre-wrap;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Native-parity threaded UMAP layout</h1>
+    <pre id="output">Starting…</pre>
+    <script type="module">
+      import { WasmClusteringKernels } from "../../src/clustering/wasm-kernels.ts";
+      import { compareLabelPartitions } from "./parity-diagnostics.ts";
+
+      const FIXTURE_URL =
+        "http://127.0.0.1:5173/@fs/Users/hamza/Documents/NS/senko/.research/native-reference/clustering-parity/test-audio/seed-42/";
+      const UNSEEDED_FIXTURE_URL =
+        "http://127.0.0.1:5173/@fs/Users/hamza/Documents/NS/senko/.research/native-reference/clustering-parity/test-audio/unseeded/";
+      const poolUrl = new URL(
+        "./umap_layout_threaded_browser_pool.worker.js",
+        import.meta.url,
+      );
+      const clusteringWasmUrl = new URL(
+        "../../src/clustering/wasm/senko-clustering.wasm",
+        import.meta.url,
+      );
+      const output = document.querySelector("#output");
+
+      async function fetchTypedArray(url, Constructor) {
+        const response = await fetch(url);
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status} fetching ${url}`);
+        }
+        return new Constructor(await response.arrayBuffer());
+      }
+
+      function runPool(pool, workerCount, repeatCount) {
+        return new Promise((resolve, reject) => {
+          const onMessage = (event) => {
+            if (event.data?.type === "complete") {
+              cleanup();
+              resolve(event.data.result);
+            } else if (event.data?.type === "error") {
+              cleanup();
+              reject(new Error(event.data.error));
+            }
+          };
+          const onError = (event) => {
+            cleanup();
+            reject(event.error ?? new Error(event.message));
+          };
+          const cleanup = () => {
+            pool.removeEventListener("message", onMessage);
+            pool.removeEventListener("error", onError);
+          };
+          pool.addEventListener("message", onMessage);
+          pool.addEventListener("error", onError);
+          pool.postMessage({
+            type: "run",
+            fixtureUrl: FIXTURE_URL,
+            workerCount,
+            repeatCount,
+          });
+        });
+      }
+
+      function pairDistanceError(reference, candidate) {
+        const count = 5_713;
+        const dimension = 60;
+        const sampleCount = 8_192;
+        let state = 0x243f6a88;
+        let numerator = 0;
+        let denominator = 0;
+        for (let sample = 0; sample < sampleCount; sample += 1) {
+          state =
+            (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
+          const left = state % count;
+          state =
+            (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
+          let right = state % count;
+          if (right === left) right = (right + 1) % count;
+          let referenceSquared = 0;
+          let candidateSquared = 0;
+          for (let column = 0; column < dimension; column += 1) {
+            const referenceDifference =
+              reference[left * dimension + column] -
+              reference[right * dimension + column];
+            const candidateDifference =
+              candidate[left * dimension + column] -
+              candidate[right * dimension + column];
+            referenceSquared +=
+              referenceDifference * referenceDifference;
+            candidateSquared +=
+              candidateDifference * candidateDifference;
+          }
+          const referenceDistance = Math.sqrt(referenceSquared);
+          const difference =
+            Math.sqrt(candidateSquared) - referenceDistance;
+          numerator += difference * difference;
+          denominator += referenceDistance * referenceDistance;
+        }
+        return Math.sqrt(numerator / denominator);
+      }
+
+      const report = {
+        crossOriginIsolated,
+        sharedArrayBuffer: typeof SharedArrayBuffer !== "undefined",
+        hardwareConcurrency: navigator.hardwareConcurrency,
+        userAgent: navigator.userAgent,
+        results: [],
+      };
+      const pool = new Worker(poolUrl, { type: "module" });
+      let hdbscan;
+      try {
+        if (!crossOriginIsolated) {
+          throw new Error("The page is not cross-origin isolated");
+        }
+        const [
+          referenceProjection,
+          seededRawLabels,
+          seededCommonLabels,
+          unseededRawLabels,
+          unseededCommonLabels,
+          clusteringWasm,
+        ] = await Promise.all([
+          fetchTypedArray(
+            new URL("umap-projection.f32", FIXTURE_URL),
+            Float32Array,
+          ),
+          fetchTypedArray(
+            new URL("hdbscan-raw-labels.i32", FIXTURE_URL),
+            Int32Array,
+          ),
+          fetchTypedArray(
+            new URL("common-labels.i32", FIXTURE_URL),
+            Int32Array,
+          ),
+          fetchTypedArray(
+            new URL("hdbscan-raw-labels.i32", UNSEEDED_FIXTURE_URL),
+            Int32Array,
+          ),
+          fetchTypedArray(
+            new URL("common-labels.i32", UNSEEDED_FIXTURE_URL),
+            Int32Array,
+          ),
+          fetch(clusteringWasmUrl).then((response) =>
+            response.arrayBuffer(),
+          ),
+        ]);
+        hdbscan = await WasmClusteringKernels.fromBytes(clusteringWasm);
+
+        for (const workerCount of [1, 2, 4, 8]) {
+          const repeatCount = workerCount === 1 ? 2 : workerCount === 8 ? 3 : 1;
+          const result = await runPool(
+            pool,
+            workerCount,
+            repeatCount,
+          );
+          const trials = result.trials.map((trial, trialIndex) => {
+            const hdbscanStartedAt = performance.now();
+            const labels = hdbscan.clusterHdbscanF64Semantics(
+              trial.projection,
+              5_713,
+              60,
+              20,
+              10,
+            );
+            return {
+              trialIndex,
+              durationMs: trial.durationMs,
+              slowestWorkerMs: trial.slowestWorkerMs,
+              statuses: trial.statuses,
+              control: trial.control,
+              pairDistanceError: pairDistanceError(
+                referenceProjection,
+                trial.projection,
+              ),
+              hdbscanElapsedMs:
+                performance.now() - hdbscanStartedAt,
+              seededRawPartition: compareLabelPartitions(
+                seededRawLabels,
+                labels,
+              ),
+              seededCommonPartition: compareLabelPartitions(
+                seededCommonLabels,
+                labels,
+              ),
+              unseededRawPartition: compareLabelPartitions(
+                unseededRawLabels,
+                labels,
+              ),
+              unseededCommonPartition: compareLabelPartitions(
+                unseededCommonLabels,
+                labels,
+              ),
+            };
+          });
+          report.results.push({
+            workerCount,
+            sharedMemoryBytes: result.sharedMemoryBytes,
+            trials,
+          });
+          output.textContent = JSON.stringify(report, null, 2);
+        }
+        report.hdbscanMemory = hdbscan.memoryStats;
+        report.ok = true;
+      } catch (error) {
+        report.ok = false;
+        report.error =
+          error instanceof Error ? error.stack : String(error);
+      } finally {
+        hdbscan?.dispose();
+        pool.terminate();
+      }
+      globalThis.__umapLayoutThreadedResult = report;
+      output.textContent = JSON.stringify(report, null, 2);
+    </script>
+  </body>
+</html>
