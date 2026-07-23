@@ -23,9 +23,17 @@ export async function loadWorkerResources<
   loadModels: () => Promise<Models>,
   loadClustering: () => Promise<Clustering>,
 ): Promise<LoadedWorkerResources<Models, Clustering>> {
+  let loadedClustering: Clustering | undefined;
+  const loadAndWarmClustering = Promise.resolve()
+    .then(loadClustering)
+    .then(async (clustering) => {
+      loadedClustering = clustering;
+      await clustering.warmup();
+      return clustering;
+    });
   const [modelsResult, clusteringResult] = await Promise.allSettled([
     Promise.resolve().then(loadModels),
-    Promise.resolve().then(loadClustering),
+    loadAndWarmClustering,
   ] as const);
 
   if (modelsResult.status === "rejected" || clusteringResult.status === "rejected") {
@@ -35,7 +43,7 @@ export async function loadWorkerResources<
     disposeQuietly(
       clusteringResult.status === "fulfilled"
         ? clusteringResult.value
-        : undefined,
+        : loadedClustering,
     );
     throw modelsResult.status === "rejected"
       ? modelsResult.reason
@@ -44,17 +52,10 @@ export async function loadWorkerResources<
         : new Error("Worker resource loading failed");
   }
 
-  try {
-    await clusteringResult.value.warmup();
-    return {
-      models: modelsResult.value,
-      clustering: clusteringResult.value,
-    };
-  } catch (error) {
-    await releaseQuietly(modelsResult.value);
-    disposeQuietly(clusteringResult.value);
-    throw error;
-  }
+  return {
+    models: modelsResult.value,
+    clustering: clusteringResult.value,
+  };
 }
 
 async function releaseQuietly(

@@ -52,7 +52,7 @@ describe("loadWorkerResources", () => {
     expect(models.release).toHaveBeenCalledOnce();
   });
 
-  it("disposes loaded clustering kernels when model loading fails", async () => {
+  it("warms and disposes loaded clustering kernels when model loading fails", async () => {
     const clustering = clusteringResources();
     const failure = new Error("models failed");
 
@@ -64,7 +64,7 @@ describe("loadWorkerResources", () => {
         async () => clustering,
       ),
     ).rejects.toBe(failure);
-    expect(clustering.warmup).not.toHaveBeenCalled();
+    expect(clustering.warmup).toHaveBeenCalledOnce();
     expect(clustering.dispose).toHaveBeenCalledOnce();
   });
 
@@ -107,6 +107,36 @@ describe("loadWorkerResources", () => {
     expect(settled).toBe(false);
 
     releaseWarmup();
+    await expect(loading).resolves.toEqual({ models, clustering });
+  });
+
+  it("warms clustering while model loading is still in progress", async () => {
+    const models = modelResources();
+    const clustering = asyncClusteringResources();
+    let releaseModels!: () => void;
+    let reportWarmupStarted!: () => void;
+    const modelsGate = new Promise<void>((resolve) => {
+      releaseModels = resolve;
+    });
+    const warmupStarted = new Promise<void>((resolve) => {
+      reportWarmupStarted = resolve;
+    });
+    clustering.warmup.mockImplementation(async () => {
+      reportWarmupStarted();
+    });
+
+    const loading = loadWorkerResources(
+      async () => {
+        await modelsGate;
+        return models;
+      },
+      async () => clustering,
+    );
+    await warmupStarted;
+    expect(clustering.warmup).toHaveBeenCalledOnce();
+    expect(models.release).not.toHaveBeenCalled();
+
+    releaseModels();
     await expect(loading).resolves.toEqual({ models, clustering });
   });
 

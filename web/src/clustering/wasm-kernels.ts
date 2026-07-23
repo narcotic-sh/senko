@@ -215,6 +215,7 @@ interface ClusteringWasmExports extends WebAssembly.Exports {
 /** Reusable SIMD WebAssembly backend for clustering's numeric hotspots. */
 export class WasmClusteringKernels implements ClusteringNumericKernels {
   private exports: ClusteringWasmExports | undefined;
+  private warmed = false;
   private peakArenaUsedBytes = 0;
   private peakReturnedJsBytes = 0;
   private lastHeapBytes = 0;
@@ -283,15 +284,18 @@ export class WasmClusteringKernels implements ClusteringNumericKernels {
 
   /** Exercise production kernels so V8 tiers them before the first recording. */
   warmup(): void {
+    this.requireExports();
+    if (this.warmed) return;
+    this.warmBrowserSpecificKernels();
+    this.warmNativeParityKernels();
+    this.warmed = true;
+  }
+
+  private warmBrowserSpecificKernels(): void {
     const count = 512;
     const dim = 192;
     const seedNeighborCount = 64;
-    const values = new Float32Array(count * dim);
-    let state = 0x243f6a88;
-    for (let index = 0; index < values.length; index += 1) {
-      state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
-      values[index] = ((state >>> 8) / 0x01000000) * 2 - 1;
-    }
+    const values = deterministicWarmupMatrix(count, dim, 0x243f6a88);
     const seed = this.buildNormalizedApproximateCosineKnn(
       values,
       count,
@@ -313,6 +317,52 @@ export class WasmClusteringKernels implements ClusteringNumericKernels {
 
     const projection = values.subarray(0, count * 10);
     this.buildExactEuclideanKnn(projection, count, 10, 40);
+  }
+
+  private warmNativeParityKernels(): void {
+    // 4,096 is the first row count that enters native UMAP's approximate
+    // angular-tree / NNDescent branch. Eight dimensions keep initialization
+    // bounded while tiering the same dynamic-dimension functions used by the
+    // 192-dimensional production input.
+    const approximateCount = 4_096;
+    const approximateDimension = 8;
+    this.buildNativeUmapCosineKnn(
+      deterministicWarmupMatrix(
+        approximateCount,
+        approximateDimension,
+        0x5bf0_3635,
+      ),
+      approximateCount,
+      approximateDimension,
+      40,
+      0x6d2b_79f5,
+    );
+
+    const fuzzy = nativeFuzzyWarmupKnn();
+    this.buildNativeUmapFuzzyGraph(fuzzy, FUZZY_WARMUP_COUNT);
+
+    const spectral = nativeSpectralWarmupGraph();
+    this.initializeNativeUmapSpectral(
+      spectral,
+      SPECTRAL_WARMUP_COUNT,
+      60,
+    );
+
+    // 1,024 is the first shape that selects the native approximate
+    // KD-Boruvka provider instead of the small exact-Prim path.
+    const hdbscanCount = 1_024;
+    const hdbscanDimension = 8;
+    this.clusterHdbscanF64Semantics(
+      deterministicWarmupMatrix(
+        hdbscanCount,
+        hdbscanDimension,
+        0xa409_3822,
+      ),
+      hdbscanCount,
+      hdbscanDimension,
+      20,
+      10,
+    );
   }
 
   normalizeRows(
@@ -1481,6 +1531,88 @@ export class WasmClusteringKernels implements ClusteringNumericKernels {
   private observeReturnedJsBytes(bytes: number): void {
     this.peakReturnedJsBytes = Math.max(this.peakReturnedJsBytes, bytes);
   }
+}
+
+const FUZZY_WARMUP_COUNT = 96;
+const FUZZY_WARMUP_NEIGHBORS = 40;
+const SPECTRAL_WARMUP_COUNT = 96;
+const SPECTRAL_WARMUP_EDGES_PER_ROW = 16;
+
+function deterministicWarmupMatrix(
+  count: number,
+  dimension: number,
+  initialState: number,
+): Float32Array {
+  const values = new Float32Array(count * dimension);
+  let state = initialState;
+  for (let index = 0; index < values.length; index += 1) {
+    state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
+    values[index] = ((state >>> 8) / 0x01000000) * 2 - 1;
+  }
+  return values;
+}
+
+function nativeFuzzyWarmupKnn(): NativeUmapKnnGraph {
+  const indices = new Int32Array(
+    FUZZY_WARMUP_COUNT * FUZZY_WARMUP_NEIGHBORS,
+  );
+  const distances = new Float32Array(indices.length);
+  for (let row = 0; row < FUZZY_WARMUP_COUNT; row += 1) {
+    const offset = row * FUZZY_WARMUP_NEIGHBORS;
+    for (
+      let neighbor = 0;
+      neighbor < FUZZY_WARMUP_NEIGHBORS;
+      neighbor += 1
+    ) {
+      indices[offset + neighbor] =
+        (row + neighbor) % FUZZY_WARMUP_COUNT;
+      distances[offset + neighbor] =
+        neighbor / FUZZY_WARMUP_NEIGHBORS;
+    }
+  }
+  return {
+    indices,
+    distances,
+    neighborCount: FUZZY_WARMUP_NEIGHBORS,
+  };
+}
+
+function nativeSpectralWarmupGraph(): Pick<
+  NativeUmapFuzzyGraph,
+  "rowOffsets" | "columnIndices" | "values"
+> {
+  const edgeCount =
+    SPECTRAL_WARMUP_COUNT * SPECTRAL_WARMUP_EDGES_PER_ROW;
+  const rowOffsets = new Int32Array(SPECTRAL_WARMUP_COUNT + 1);
+  const columnIndices = new Int32Array(edgeCount);
+  const values = new Float32Array(edgeCount);
+  for (let row = 0; row < SPECTRAL_WARMUP_COUNT; row += 1) {
+    rowOffsets[row] = row * SPECTRAL_WARMUP_EDGES_PER_ROW;
+    for (
+      let neighbor = 0;
+      neighbor < SPECTRAL_WARMUP_EDGES_PER_ROW;
+      neighbor += 1
+    ) {
+      const distance = (neighbor >>> 1) + 1;
+      const column =
+        (row +
+          (neighbor & 1
+            ? distance
+            : SPECTRAL_WARMUP_COUNT - distance)) %
+        SPECTRAL_WARMUP_COUNT;
+      const edge = row * SPECTRAL_WARMUP_EDGES_PER_ROW + neighbor;
+      const lower = Math.min(row, column);
+      const upper = Math.max(row, column);
+      const hash =
+        (Math.imul(lower + 1, 0x9e37_79b1) ^
+          Math.imul(upper + 3, 0x85eb_ca77)) >>>
+        0;
+      columnIndices[edge] = column;
+      values[edge] = 0.15 + (hash % 850) / 1_000;
+    }
+  }
+  rowOffsets[SPECTRAL_WARMUP_COUNT] = edgeCount;
+  return { rowOffsets, columnIndices, values };
 }
 
 function checkedFloat32View(

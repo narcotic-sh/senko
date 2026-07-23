@@ -167,6 +167,50 @@ describe("WasmClusteringKernels", () => {
     }
   });
 
+  it("warms native-parity branches without heap growth or RNG state leakage", async () => {
+    const kernels = await createKernels();
+    const count = 4_096;
+    const dim = 8;
+    const neighborCount = 40;
+    const randomSeed = 0x3245_3f6a;
+    const values = deterministicMatrix(count, dim);
+    try {
+      const before = kernels.memoryStats;
+      const expected = kernels.buildNativeUmapCosineKnn(
+        values,
+        count,
+        dim,
+        neighborCount,
+        randomSeed,
+      );
+
+      kernels.warmup();
+      const warmed = kernels.memoryStats;
+      expect(warmed.heapBytes).toBe(before.heapBytes);
+      expect(warmed.arenaCapacityBytes).toBe(before.arenaCapacityBytes);
+      expect(warmed.heapBytes).toBe(11 * 1024 * 1024);
+      expect(warmed.arenaCapacityBytes).toBe(10 * 1024 * 1024);
+      expect(warmed.peakArenaUsedBytes).toBeLessThanOrEqual(
+        warmed.arenaCapacityBytes,
+      );
+
+      kernels.warmup();
+      expect(kernels.memoryStats).toEqual(warmed);
+
+      const actual = kernels.buildNativeUmapCosineKnn(
+        values,
+        count,
+        dim,
+        neighborCount,
+        randomSeed,
+      );
+      expect(actual.indices).toEqual(expected.indices);
+      expect(actual.distances).toEqual(expected.distances);
+    } finally {
+      kernels.dispose();
+    }
+  }, 10_000);
+
   it("starts with the compact eleven-megabyte heap and rejects use after disposal", async () => {
     const kernels = await createKernels();
     kernels.normalizeRows(deterministicMatrix(32, 16), 32, 16);
