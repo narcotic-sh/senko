@@ -120,12 +120,12 @@ export function assessRuntimeCapabilities(
     errors.push("No WebGPU adapter is available.");
   }
   if (!capabilities.crossOriginIsolated || !capabilities.wasmThreads) {
-    warnings.push(
-      "Cross-origin isolation or shared WASM memory is unavailable; CPU clustering will be single-threaded.",
+    errors.push(
+      "Native clustering requires cross-origin isolation and shared WASM memory.",
     );
   }
   if (!capabilities.wasmSimd) {
-    warnings.push("WASM SIMD is unavailable; CPU-side stages will be slower.");
+    errors.push("Native clustering requires WASM SIMD.");
   }
   if (!capabilities.webgpu.features.includes("shader-f16")) {
     warnings.push("shader-f16 is unavailable; neural stages will use FP32 kernels.");

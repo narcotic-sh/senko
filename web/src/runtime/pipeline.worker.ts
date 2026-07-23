@@ -13,7 +13,7 @@ import {
   BrowserPipelineStageError,
   runBrowserPipeline,
 } from "../pipeline/browser-pipeline";
-import { WasmClusteringKernels } from "../clustering";
+import { BrowserClusteringResources } from "../clustering";
 import type { PipelineOptions } from "./types";
 import { loadWorkerResources } from "./worker-resources";
 
@@ -22,7 +22,7 @@ const workerScope = self as unknown as DedicatedWorkerGlobalScope;
 let initialized = false;
 let initializing = false;
 let modelSet: BrowserModelSet | undefined;
-let clusteringKernels: WasmClusteringKernels | undefined;
+let clusteringResources: BrowserClusteringResources | undefined;
 let pipelineOptions: PipelineOptions | undefined;
 let activeJob:
   | { readonly requestId: string; readonly controller: AbortController }
@@ -97,10 +97,10 @@ async function initialize(
           });
         },
       }),
-      () => WasmClusteringKernels.create(),
+      () => BrowserClusteringResources.create(),
     );
     modelSet = loaded.models;
-    clusteringKernels = loaded.clustering;
+    clusteringResources = loaded.clustering;
     pipelineOptions = request.options;
     initialized = true;
     observeDeviceLoss(modelSet);
@@ -109,8 +109,8 @@ async function initialize(
     modelSet = undefined;
     pipelineOptions = undefined;
     initialized = false;
-    clusteringKernels?.dispose();
-    clusteringKernels = undefined;
+    clusteringResources?.dispose();
+    clusteringResources = undefined;
     if (failedModels !== undefined) {
       await Promise.allSettled([failedModels.release()]);
     }
@@ -167,10 +167,10 @@ async function handleDeviceLoss(
   modelSet = undefined;
   pipelineOptions = undefined;
   activeJob?.controller.abort();
-  const kernels = clusteringKernels;
-  clusteringKernels = undefined;
+  const clustering = clusteringResources;
+  clusteringResources = undefined;
   try {
-    kernels?.dispose();
+    clustering?.dispose();
   } finally {
     await Promise.allSettled([models.release()]);
   }
@@ -182,7 +182,7 @@ async function diarize(
   if (
     !initialized ||
     modelSet === undefined ||
-    clusteringKernels === undefined ||
+    clusteringResources === undefined ||
     pipelineOptions === undefined
   ) {
     fail(request.requestId, "NOT_INITIALIZED", "Initialize the worker first.");
@@ -199,6 +199,7 @@ async function diarize(
 
   const controller = new AbortController();
   activeJob = { requestId: request.requestId, controller };
+  clusteringResources.resetTransientMemoryStats();
 
   send({
     type: "pipeline-started",
@@ -214,7 +215,8 @@ async function diarize(
       pipelineOptions,
       {
         signal: controller.signal,
-        clusteringKernels,
+        clusteringKernels: clusteringResources.kernels,
+        nativeUmapClustering: clusteringResources,
         onStageStarted: (stage) => {
           send({ type: "stage-started", requestId: request.requestId, stage });
         },

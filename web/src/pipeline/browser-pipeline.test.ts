@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { SenkoFbank } from "../audio";
 import type { ClusteringNumericKernels } from "../clustering";
@@ -8,6 +8,7 @@ import {
   BrowserPipelineCancelledError,
   type BrowserPipelineModels,
   BrowserPipelineStageError,
+  type NativeUmapClusteringBackend,
   runBrowserPipeline,
   selectClusteringAlgorithm,
 } from "./browser-pipeline";
@@ -384,6 +385,56 @@ describe("runBrowserPipeline", () => {
     expect(stage(result, "embedding").metrics.batchCount).toBe(0);
     expect(stage(result, "clustering").metrics.algorithm).toBe("umap-hdbscan");
     expect(fbank.disposeCalls).toBe(1);
+  });
+
+  it("routes the long branch through native threaded clustering", async () => {
+    const vad = new AllSpeechVad();
+    vad.run = async () =>
+      new Float32Array(
+        vad.batchSize * vad.outputFrames * vad.outputClasses,
+      );
+    const nativeUmapClustering = {
+      memoryStats: { heapBytes: 32 * 1024 * 1024 },
+      clusterNativeUmap: vi.fn(async () => ({
+        labels: new Int32Array(),
+        projection: new Float32Array(),
+        stats: {
+          count: 0,
+          outputDimension: 0,
+          epochCount: 0,
+          retainedEdgeCount: 0,
+          neighborMs: 0,
+          fuzzyGraphMs: 0,
+          spectralMs: 0,
+          initializationMs: 0,
+          layoutMs: 0,
+          hdbscanMs: 0,
+          peakWorkingBytes: 1_234,
+          layoutWorkerCount: 8,
+          layoutSharedMemoryBytes: 0,
+        },
+      })),
+    } satisfies NativeUmapClusteringBackend;
+
+    const result = await runBrowserPipeline(
+      wavBlob(1),
+      { vad, embedding: new ConstantEmbedding() },
+      DEFAULT_PIPELINE_OPTIONS,
+      {
+        createFbank: async () => new DisposableTestFbank(),
+        nativeUmapClustering,
+      },
+    );
+
+    expect(nativeUmapClustering.clusterNativeUmap).toHaveBeenCalledOnce();
+    expect(nativeUmapClustering.clusterNativeUmap).toHaveBeenCalledWith(
+      new Float32Array(),
+      0,
+      2,
+      undefined,
+    );
+    expect(result.memory.allocations.clusteringPeakWorkingBytes).toBe(1_234);
+    expect(result.memory.wasmHeapBytes).toBe(32.5 * 1024 * 1024);
   });
 
   it("records the concurrently resident model buffers", async () => {

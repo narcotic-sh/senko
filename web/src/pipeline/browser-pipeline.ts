@@ -12,6 +12,7 @@ import {
   DEFAULT_CLUSTERING_OPTIONS,
   estimatePostUmapPeakWorkingBytes,
   type ClusteringNumericKernels,
+  type NativeUmapThreadedResult,
 } from "../clustering";
 import type {
   AnyStageResult,
@@ -48,6 +49,16 @@ export interface BrowserPipelineModels {
   readonly knownGpuBufferBytes?: number;
 }
 
+export interface NativeUmapClusteringBackend {
+  readonly memoryStats?: { readonly heapBytes: number };
+  clusterNativeUmap(
+    embeddings: Float32Array,
+    count: number,
+    dimension: number,
+    signal?: AbortSignal,
+  ): Promise<NativeUmapThreadedResult>;
+}
+
 export interface BrowserPipelineHooks {
   readonly signal?: AbortSignal;
   readonly onStageStarted?: (stage: PipelineStage) => void;
@@ -58,6 +69,8 @@ export interface BrowserPipelineHooks {
   readonly createFbank?: () => Promise<FbankComputer>;
   /** Preloaded reusable numeric kernels; production supplies one per worker. */
   readonly clusteringKernels?: ClusteringNumericKernels;
+  /** Native-parity UMAP/HDBSCAN plus its threaded layout worker pool. */
+  readonly nativeUmapClustering?: NativeUmapClusteringBackend;
   /** Injectable source for Chromium's non-standard performance.memory probe. */
   readonly memoryPerformance?: MemoryPerformanceSource;
   /** Query-gated correctness harnesses can align embeddings to native windows. */
@@ -150,6 +163,8 @@ export async function runBrowserPipeline(
   memory.checkpoint("pipeline", "start");
   throwIfCancelled(hooks.signal);
   const totalStart = now();
+  const clusteringMemorySource =
+    hooks.nativeUmapClustering ?? hooks.clusteringKernels;
   let fbank: FbankComputer | undefined;
   let extractor: StreamingFbankExtractor | undefined;
   let fbankWasmHeapBytes: number | undefined;
@@ -165,7 +180,7 @@ export async function runBrowserPipeline(
       memory.setWasmHeapBytes(
         sumDefinedBytes(
           fbankWasmHeapBytes,
-          readExposedWasmHeapBytes(hooks.clusteringKernels),
+          readExposedWasmHeapBytes(clusteringMemorySource),
         ),
       );
       throwIfCancelled(hooks.signal);
@@ -619,38 +634,48 @@ export async function runBrowserPipeline(
     };
     let labels: Int32Array;
     try {
-      labels =
-        clusteringAlgorithm === "spectral"
-          ? clusterEmbeddingsSpectral(
-              finalEmbeddings,
-              subsegments.length,
-              embedding.embeddingDim,
-              {
-                onStats(stats) {
-                  recordClusteringMemory(stats.peakWorkingBytes);
-                },
-              },
-            )
-          : clusterEmbeddings(
-              finalEmbeddings,
-              subsegments.length,
-              embedding.embeddingDim,
-              {
-                onUmapStats(stats) {
-                  recordClusteringMemory(
-                    Math.max(
-                      stats.peakWorkingBytes,
-                      estimatePostUmapPeakWorkingBytes(
-                        stats.count,
-                        stats.outputDimension,
-                        DEFAULT_CLUSTERING_OPTIONS.neighborCount,
-                      ),
-                    ),
-                  );
-                },
-              },
-              hooks.clusteringKernels,
-            );
+      if (clusteringAlgorithm === "spectral") {
+        labels = clusterEmbeddingsSpectral(
+          finalEmbeddings,
+          subsegments.length,
+          embedding.embeddingDim,
+          {
+            onStats(stats) {
+              recordClusteringMemory(stats.peakWorkingBytes);
+            },
+          },
+        );
+      } else if (hooks.nativeUmapClustering !== undefined) {
+        const native = await hooks.nativeUmapClustering.clusterNativeUmap(
+          finalEmbeddings,
+          subsegments.length,
+          embedding.embeddingDim,
+          hooks.signal,
+        );
+        labels = native.labels;
+        recordClusteringMemory(native.stats.peakWorkingBytes);
+      } else {
+        labels = clusterEmbeddings(
+          finalEmbeddings,
+          subsegments.length,
+          embedding.embeddingDim,
+          {
+            onUmapStats(stats) {
+              recordClusteringMemory(
+                Math.max(
+                  stats.peakWorkingBytes,
+                  estimatePostUmapPeakWorkingBytes(
+                    stats.count,
+                    stats.outputDimension,
+                    DEFAULT_CLUSTERING_OPTIONS.neighborCount,
+                  ),
+                ),
+              );
+            },
+          },
+          hooks.clusteringKernels,
+        );
+      }
       throwIfCancelled(hooks.signal);
     } catch (error) {
       rethrowForStage("clustering", error, hooks.signal);
@@ -661,7 +686,7 @@ export async function runBrowserPipeline(
     memory.setWasmHeapBytes(
       sumDefinedBytes(
         fbankWasmHeapBytes,
-        readExposedWasmHeapBytes(hooks.clusteringKernels),
+        readExposedWasmHeapBytes(clusteringMemorySource),
       ),
     );
     const labelStats = countLabels(labels);

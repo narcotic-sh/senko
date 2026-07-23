@@ -3,7 +3,7 @@ export interface WorkerModelResources {
 }
 
 export interface WorkerClusteringResources {
-  warmup(): void;
+  warmup(): void | Promise<void>;
   dispose(): void;
 }
 
@@ -45,7 +45,7 @@ export async function loadWorkerResources<
   }
 
   try {
-    clusteringResult.value.warmup();
+    await clusteringResult.value.warmup();
     return {
       models: modelsResult.value,
       clustering: clusteringResult.value,

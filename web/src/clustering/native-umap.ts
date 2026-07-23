@@ -7,6 +7,10 @@ import {
   WasmClusteringKernels,
   type NativeUmapFuzzyGraph,
 } from "./wasm-kernels";
+import type {
+  ThreadedUmapLayoutInput,
+  ThreadedUmapLayoutResult,
+} from "./threaded-umap-layout";
 
 export const NATIVE_UMAP_NEIGHBOR_COUNT = 40;
 export const NATIVE_UMAP_COMPONENT_COUNT = 60;
@@ -27,12 +31,33 @@ export interface NativeUmapSerialStats {
   readonly initializationMs: number;
   readonly layoutMs: number;
   readonly hdbscanMs: number;
+  /** Peak caller-owned typed-array working set, excluding embeddings/WASM. */
+  readonly peakWorkingBytes: number;
 }
 
 export interface NativeUmapSerialResult {
   readonly labels: Int32Array;
   readonly projection: Float32Array;
   readonly stats: NativeUmapSerialStats;
+}
+
+export interface NativeUmapThreadedStats extends NativeUmapSerialStats {
+  readonly layoutWorkerCount: number;
+  readonly layoutSharedMemoryBytes: number;
+}
+
+export interface NativeUmapThreadedResult {
+  readonly labels: Int32Array;
+  readonly projection: Float32Array;
+  readonly stats: NativeUmapThreadedStats;
+}
+
+export interface NativeUmapLayoutExecutor {
+  readonly workerCount: number;
+  optimize(
+    input: ThreadedUmapLayoutInput,
+    signal?: AbortSignal,
+  ): Promise<ThreadedUmapLayoutResult>;
 }
 
 interface LayoutGraph {
@@ -72,6 +97,7 @@ export function clusterEmbeddingsNativeSerial(
         initializationMs: 0,
         layoutMs: 0,
         hdbscanMs: 0,
+        peakWorkingBytes: 0,
       },
     };
   }
@@ -185,6 +211,169 @@ export function clusterEmbeddingsNativeSerial(
       initializationMs,
       layoutMs,
       hdbscanMs,
+      peakWorkingBytes: estimateNativeUmapPeakWorkingBytes(
+        count,
+        outputDimension,
+        layoutGraph.values.length,
+        neighborCount,
+      ),
+    },
+  };
+}
+
+/**
+ * Native Senko UMAP/HDBSCAN orchestration with only UMAP's Hogwild layout
+ * delegated to the persistent shared-memory worker pool.
+ */
+export async function clusterEmbeddingsNativeThreaded(
+  embeddings: Float32Array,
+  count: number,
+  dimension: number,
+  randomSeed: number,
+  kernels: WasmClusteringKernels,
+  layoutPool: NativeUmapLayoutExecutor,
+  signal?: AbortSignal,
+): Promise<NativeUmapThreadedResult> {
+  validateMatrix(embeddings, count, dimension);
+  throwIfAborted(signal);
+  if (count < 10) {
+    return {
+      labels: new Int32Array(count),
+      projection: new Float32Array(),
+      stats: {
+        count,
+        outputDimension: 0,
+        epochCount: 0,
+        retainedEdgeCount: 0,
+        neighborMs: 0,
+        fuzzyGraphMs: 0,
+        spectralMs: 0,
+        initializationMs: 0,
+        layoutMs: 0,
+        hdbscanMs: 0,
+        peakWorkingBytes: 0,
+        layoutWorkerCount: layoutPool.workerCount,
+        layoutSharedMemoryBytes: 0,
+      },
+    };
+  }
+
+  const outputDimension = Math.min(
+    NATIVE_UMAP_COMPONENT_COUNT,
+    count - 2,
+  );
+  const epochCount = count <= 10_000 ? 500 : 200;
+  const neighborCount = Math.min(NATIVE_UMAP_NEIGHBOR_COUNT, count);
+
+  let startedAt = performance.now();
+  let neighbors = kernels.buildNativeUmapCosineKnn(
+    embeddings,
+    count,
+    dimension,
+    neighborCount,
+    randomSeed,
+  );
+  const neighborMs = elapsedSince(startedAt);
+  throwIfAborted(signal);
+
+  startedAt = performance.now();
+  let fuzzy: NativeUmapFuzzyGraph | undefined =
+    kernels.buildNativeUmapFuzzyGraph(neighbors, count);
+  const fuzzyGraphMs = elapsedSince(startedAt);
+  neighbors = {
+    indices: new Int32Array(),
+    distances: new Float32Array(),
+    neighborCount: 0,
+  };
+  const layoutGraph = prepareNativeLayoutGraph(fuzzy, count, epochCount);
+  fuzzy = undefined;
+  throwIfAborted(signal);
+
+  startedAt = performance.now();
+  const spectral = kernels.initializeNativeUmapSpectral(
+    layoutGraph,
+    count,
+    outputDimension,
+  );
+  const spectralMs = elapsedSince(startedAt);
+  throwIfAborted(signal);
+
+  startedAt = performance.now();
+  const initialization = kernels.initializeNativeUmapLayout(
+    spectral.values,
+    count,
+    outputDimension,
+    randomSeed,
+    count >= 4_096,
+  );
+  const initializationMs = elapsedSince(startedAt);
+  throwIfAborted(signal);
+
+  const layout = await layoutPool.optimize(
+    {
+      embedding: initialization.embedding,
+      rngState: initialization.rngState,
+      head: layoutGraph.head,
+      tail: layoutGraph.columnIndices,
+      epochsPerSample: layoutGraph.epochsPerSample,
+      vertexCount: count,
+      dimension: outputDimension,
+      epochCount,
+      a: NATIVE_UMAP_A,
+      b: NATIVE_UMAP_B,
+    },
+    signal,
+  );
+  throwIfAborted(signal);
+
+  startedAt = performance.now();
+  const labels = kernels.clusterHdbscanF64Semantics(
+    layout.projection,
+    count,
+    outputDimension,
+    NATIVE_HDBSCAN_MIN_SAMPLES,
+    NATIVE_HDBSCAN_MIN_CLUSTER_SIZE,
+  );
+  const hdbscanMs = elapsedSince(startedAt);
+  reassignMinorClusters(
+    labels,
+    embeddings,
+    count,
+    dimension,
+    NATIVE_HDBSCAN_MIN_CLUSTER_SIZE,
+  );
+  mergeSimilarCentroids(
+    labels,
+    embeddings,
+    count,
+    dimension,
+    NATIVE_CENTROID_MERGE_THRESHOLD,
+  );
+  normalizeLabels(labels);
+  throwIfAborted(signal);
+
+  return {
+    labels,
+    projection: layout.projection,
+    stats: {
+      count,
+      outputDimension,
+      epochCount,
+      retainedEdgeCount: layoutGraph.values.length,
+      neighborMs,
+      fuzzyGraphMs,
+      spectralMs,
+      initializationMs,
+      layoutMs: layout.layoutMs,
+      hdbscanMs,
+      layoutWorkerCount: layout.workerCount,
+      layoutSharedMemoryBytes: layout.sharedMemoryBytes,
+      peakWorkingBytes: estimateNativeUmapPeakWorkingBytes(
+        count,
+        outputDimension,
+        layoutGraph.values.length,
+        neighborCount,
+      ),
     },
   };
 }
@@ -264,8 +453,76 @@ export function prepareNativeLayoutGraph(
   return { rowOffsets, columnIndices, values, head, epochsPerSample };
 }
 
+/**
+ * Current native-path typed-array high-water outside WebAssembly.
+ *
+ * The largest lifetime is either fuzzy CSR plus the compact layout graph, or
+ * the compact graph plus Float64 spectral and Float32 layout initialization.
+ * The caller-owned CAM++ embeddings and both WASM memories are excluded.
+ */
+export function estimateNativeUmapPeakWorkingBytes(
+  count: number,
+  outputDimension: number,
+  retainedEdgeCount: number,
+  neighborCount: number,
+): number {
+  for (const [name, value] of [
+    ["count", count],
+    ["outputDimension", outputDimension],
+    ["retainedEdgeCount", retainedEdgeCount],
+    ["neighborCount", neighborCount],
+  ] as const) {
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new RangeError(`${name} must be a non-negative safe integer`);
+    }
+  }
+  const matrixValues = count * outputDimension;
+  const knnEntries = count * neighborCount;
+  if (
+    !Number.isSafeInteger(matrixValues) ||
+    !Number.isSafeInteger(knnEntries)
+  ) {
+    throw new RangeError("native UMAP working set exceeds safe integer range");
+  }
+
+  const fuzzyGraphBytes =
+    (count + 1) * Int32Array.BYTES_PER_ELEMENT +
+    retainedEdgeCount *
+      (Int32Array.BYTES_PER_ELEMENT + Float32Array.BYTES_PER_ELEMENT) +
+    count * 2 * Float32Array.BYTES_PER_ELEMENT;
+  const layoutGraphBytes =
+    (count + 1) * Int32Array.BYTES_PER_ELEMENT +
+    retainedEdgeCount *
+      (Int32Array.BYTES_PER_ELEMENT * 2 +
+        Float32Array.BYTES_PER_ELEMENT +
+        Float64Array.BYTES_PER_ELEMENT);
+  const spectralAndInitializationBytes =
+    matrixValues *
+      (Float64Array.BYTES_PER_ELEMENT + Float32Array.BYTES_PER_ELEMENT) +
+    (outputDimension + 1) * Float64Array.BYTES_PER_ELEMENT +
+    3 * BigInt64Array.BYTES_PER_ELEMENT;
+  const knnBytes =
+    knnEntries *
+    (Int32Array.BYTES_PER_ELEMENT + Float32Array.BYTES_PER_ELEMENT);
+  return Math.max(
+    fuzzyGraphBytes + layoutGraphBytes,
+    layoutGraphBytes + spectralAndInitializationBytes,
+    knnBytes + fuzzyGraphBytes,
+  );
+}
+
 function elapsedSince(startedAt: number): number {
   return Math.max(0, performance.now() - startedAt);
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted !== true) return;
+  throw new DOMException(
+    signal.reason instanceof Error
+      ? signal.reason.message
+      : "Native UMAP clustering aborted",
+    "AbortError",
+  );
 }
 
 function validateMatrix(

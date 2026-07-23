@@ -15,7 +15,7 @@ vi.mock("../pipeline/browser-models", () => ({
 }));
 
 vi.mock("../clustering", () => ({
-  WasmClusteringKernels: {
+  BrowserClusteringResources: {
     create: (...arguments_: unknown[]) => fakes.createClustering(...arguments_),
   },
 }));
@@ -70,7 +70,12 @@ describe("pipeline worker dual-device loss handling", () => {
       precision: "float16",
       release,
     };
-    const clustering = { warmup: vi.fn(), dispose };
+    const clustering = {
+      kernels: {},
+      warmup: vi.fn(),
+      resetTransientMemoryStats: vi.fn(),
+      dispose,
+    };
     fakes.loadModels.mockReset();
     fakes.loadModels.mockResolvedValue(models);
     fakes.createClustering.mockReset();

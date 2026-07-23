@@ -40,7 +40,7 @@ describe("assessRuntimeCapabilities", () => {
     expect(assessment.errors).toContain("No WebGPU adapter is available.");
   });
 
-  it("reports optional acceleration features as warnings", () => {
+  it("requires the WASM features used by native clustering", () => {
     const runtime = capableRuntime();
     const assessment = assessRuntimeCapabilities({
       ...runtime,
@@ -51,7 +51,13 @@ describe("assessRuntimeCapabilities", () => {
       webgpu: { available: true, features: [] },
     });
 
-    expect(assessment.canRun).toBe(true);
-    expect(assessment.warnings).toHaveLength(3);
+    expect(assessment.canRun).toBe(false);
+    expect(assessment.errors).toEqual([
+      "Native clustering requires cross-origin isolation and shared WASM memory.",
+      "Native clustering requires WASM SIMD.",
+    ]);
+    expect(assessment.warnings).toEqual([
+      "shader-f16 is unavailable; neural stages will use FP32 kernels.",
+    ]);
   });
 });
