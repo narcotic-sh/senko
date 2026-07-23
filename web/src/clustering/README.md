@@ -87,9 +87,10 @@ native approximate-Borůvka HDBSCAN.
 Worker initialization tiers those native-parity branches before user audio is
 accepted. The bounded fixtures use the first approximate-PyNNDescent shape
 (4,096 rows by 8 dimensions), a 96-row fuzzy graph, a connected 96-row
-60-dimensional spectral solve, and the first KD-Borůvka HDBSCAN shape (1,024
-rows by 8 dimensions). The largest of these native-parity warm operations
-needs about 6.35 MiB, so all four reuse the existing 10 MiB ordinary arena
+60-dimensional spectral solve, and a representative native approximate
+KD-Borůvka HDBSCAN shape (1,024 rows by 8 dimensions). The largest of these
+native-parity warm operations needs about 6.35 MiB, so all four reuse the
+existing 10 MiB ordinary arena
 without growing or retaining another WASM heap. Fresh-process M3 measurements
 moved the one-hour neighbor operation from a 518 ms median to 341 ms and
 spectral initialization from about 622 ms to 285 ms. The smaller fuzzy warmup

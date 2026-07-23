@@ -348,8 +348,8 @@ export class WasmClusteringKernels implements ClusteringNumericKernels {
       60,
     );
 
-    // 1,024 is the first shape that selects the native approximate
-    // KD-Boruvka provider instead of the small exact-Prim path.
+    // A representative 1,024-row shape gives the native approximate
+    // KD-Boruvka provider enough work to tier its production hot loops.
     const hdbscanCount = 1_024;
     const hdbscanDimension = 8;
     this.clusterHdbscanF64Semantics(
