@@ -125,6 +125,17 @@ offline gate with 99.9927% speech IoU and 99.9771% mapped agreement at 10 ms.
 Ordinary WASM high-water increased by 2,031,616 bytes while shared layout
 memory and explicit GPU buffers remained unchanged.
 
+The next accepted checkpoint evaluates UMAP gradient coefficients and
+coordinate updates in float32 and explicitly SIMD-vectorizes three spectral
+reductions. Its isolated production run completed in **13.225440 seconds**,
+with clustering at **4.040865 seconds**: 0.597515 seconds of neighbor search,
+1.101930 seconds of spectral initialization, 1.978615 seconds of layout, and
+0.291310 seconds of HDBSCAN. It returned seven speakers and 131 segments, with
+99.9696% speech IoU and 99.9489% mapped-speaker agreement at 10 ms. Known CPU
+peak (14,481,828 bytes), ordinary/shared WASM high-water (31,522,816 bytes),
+explicit GPU buffers (84,001,024 bytes), and clustering working memory
+(9,775,012 bytes) were unchanged from the preceding checkpoint.
+
 ## Historical browser-specific clustering checkpoint (2026-07-22)
 
 These numbers are the latest cooled checkpoint on the target M3 Mac, not a

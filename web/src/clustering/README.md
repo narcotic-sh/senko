@@ -85,10 +85,15 @@ normalized-Laplacian eigenspace, legacy NumPy RNG/noise, UMAP layout, and
 native approximate-Borůvka HDBSCAN.
 
 The 500/200-epoch Hogwild layout runs in a persistent eight-worker shared-WASM
-pool. ABI v2 passes CSR row offsets rather than a repeated COO head array and
-derives the negative-sample period exactly on active updates. This reduces the
-43,804-row layout allocation from 125,698,048 to 91,815,936 bytes while the
-one-hour shape remains at the 16 MiB minimum.
+pool. ABI v2 passes CSR row offsets rather than a repeated COO head array,
+derives the negative-sample period exactly on active updates, and dynamically
+distributes row-aligned work across heterogeneous CPU cores. The optimizer
+retains float64 sample clocks while evaluating its gradient coefficients and
+coordinate updates in float32. This reduces the 43,804-row layout allocation
+from 125,698,048 to 91,815,936 bytes while the one-hour shape remains at the
+16 MiB minimum. On the one-hour fixture, isolated Chrome layout medians fell
+from about 3.38 seconds to 1.69–1.75 seconds with seven clusters and no noise
+across six stochastic trials.
 
 The serial assembled path remains a correctness oracle, not a production
 fallback. Query-independent differential tests live under
@@ -97,7 +102,9 @@ environment variables. Final isolated-Chrome acceptance produced:
 
 - `test_audio_short.wav`: unchanged spectral branch, 4 speakers/49 segments,
   with exact mapped agreement to offline Senko.
-- `test_audio.wav`: 7 speakers/131 segments, 99.915% mapped agreement at
-  10 ms, and a 15.709-second full-pipeline wall time.
+- `test_audio.wav`: the latest accepted optimization run returned 7
+  speakers/131 segments, 99.949% mapped agreement at 10 ms, and a
+  13.225-second full-pipeline wall time. This is one isolated run rather than
+  a cooled multi-run median.
 - `test_audio_long.wav` (31,054 seconds): 6 speakers/1,084 segments versus
   offline Senko's 6/1,077, with 99.906% mapped agreement at 10 ms.

@@ -12,7 +12,9 @@ the threaded optimizer remains a separate module.
 
 - float32 coordinates and squared-distance reduction, with the same
   16-accumulator reduction shape;
-- float64 sample clocks, alpha, `a`, `b`, gamma, and negative-sample rate;
+- float64 positive/negative sample clocks and negative-sample scheduling;
+- float32 alpha, `a`, `b`, gamma, gradient coefficients, clipping, and
+  coordinate updates in the hot optimizer;
 - UMAP's per-head tau RNG state and signed modulo behavior;
 - row-major CSR edge order, `move_other=true`, and one worker at a time owning
   every edge and RNG update for a claimed head row;
@@ -28,7 +30,7 @@ parallel result is stochastic, just like unseeded native Senko.
 
 ## Execution architecture
 
-The 14,027-byte standalone Wasm has exactly one import, `env.memory`. It does
+The 6,771-byte standalone Wasm has exactly one import, `env.memory`. It does
 not use Emscripten's pthread runtime or generated JavaScript glue. The build
 uses:
 
@@ -176,3 +178,31 @@ wall moved from 17,276.48 to 14,588.16 ms despite the thermally variable
 conditions, and the promoted result passed the offline reference gate with
 seven speakers, 132 segments, 99.9927% speech IoU, and 99.9771% mapped-speaker
 agreement at 10 ms.
+
+## Float32 gradient promotion
+
+The final hot arithmetic path casts the validated `a`, `b`, and gamma header
+parameters to float32 once, then evaluates the UMAP gradient coefficients,
+clipping, alpha schedule, and coordinate updates in float32. Sample clocks,
+negative-sample counts, RNG, CSR traversal, epoch barriers, and the
+16-accumulator distance reduction are unchanged. This uses ordinary
+`-O3 -msimd128`; it does not require fast-math, relaxed SIMD, or another
+optional browser feature.
+
+The deterministic one-worker projection now has SHA-256
+`2e53fcb45290909cd7382f9ba7175f2b1ad30b9df73848adf4906b28b4d41c29`.
+It retains seven clusters, no noise, ARI 0.999068 against the seeded native
+partition, and slightly lower pair-distance error against native than the
+preceding float64-gradient path. The standalone module shrank from 13,640 to
+6,771 bytes because it no longer links the float64 power implementation.
+
+Across two isolated Chrome matrices, six eight-worker trials measured
+1,649–1,904 ms with medians of 1,693 and 1,748 ms. Every trial retained seven
+clusters and no noise. Seeded-native ARI ranged from 0.998839 to 0.999590 and
+unseeded-offline ARI from 0.998519 to 0.999120. Shared memory remains exactly
+16 MiB for the one-hour fixture.
+
+Algebraically reusing one power call was measured and rejected: it provided no
+speedup in either float64 or float32 and changed the float32 trajectory.
+Changing only the power overload while retaining float64 gradient arithmetic
+was substantially slower. Neither experiment remains in production.

@@ -328,6 +328,7 @@ void apply_laplacian_mixed(const std::int32_t* row_offsets,
 
 double dot_mixed(const float* left, const double* right, std::int32_t count) {
   double result = 0.0;
+#pragma clang loop vectorize(enable) interleave(enable)
   for (std::int32_t row = 0; row < count; ++row) {
     result += static_cast<double>(left[row]) * right[row];
   }
@@ -336,6 +337,7 @@ double dot_mixed(const float* left, const double* right, std::int32_t count) {
 
 double squared_norm(const double* values, std::int32_t count) {
   double result = 0.0;
+#pragma clang loop vectorize(enable) interleave(enable)
   for (std::int32_t row = 0; row < count; ++row) {
     result += values[row] * values[row];
   }
@@ -753,6 +755,7 @@ Status initialize_connected_graph(const std::int32_t* row_offsets,
       apply_laplacian(row_offsets, columns, weights, count, candidate,
                       residual_product);
       double squared_residual = 0.0;
+#pragma clang loop vectorize(enable) interleave(enable)
       for (std::int32_t row = 0; row < count; ++row) {
         residual_product[row] -= eigenvalue * candidate[row];
         const double value = residual_product[row];

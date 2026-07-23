@@ -410,9 +410,9 @@ float ReducedSquaredDistance(const float* left,
   return result;
 }
 
-double Clip(double value) {
-  if (value > 4.0) return 4.0;
-  if (value < -4.0) return -4.0;
+float Clip(float value) {
+  if (value > 4.0f) return 4.0f;
+  if (value < -4.0f) return -4.0f;
   return value;
 }
 
@@ -469,25 +469,25 @@ int PositiveModulo(std::int32_t value, std::uint32_t divisor) {
   return result;
 }
 
-double PositiveGradientCoefficient(float distance_squared,
-                                   double a,
-                                   double b) {
-  if (!(distance_squared > 0.0f)) return 0.0;
-  const double distance = static_cast<double>(distance_squared);
-  double result = -2.0 * a * b * std::pow(distance, b - 1.0);
-  result /= a * std::pow(distance, b) + 1.0;
+float PositiveGradientCoefficient(float distance_squared,
+                                  float a,
+                                  float b) {
+  if (!(distance_squared > 0.0f)) return 0.0f;
+  float result =
+      -2.0f * a * b * std::pow(distance_squared, b - 1.0f);
+  result /= a * std::pow(distance_squared, b) + 1.0f;
   return result;
 }
 
-double NegativeGradientCoefficient(float distance_squared,
-                                   double a,
-                                   double b,
-                                   double gamma) {
-  if (!(distance_squared > 0.0f)) return 0.0;
-  const double distance = static_cast<double>(distance_squared);
-  double result = 2.0 * gamma * b;
+float NegativeGradientCoefficient(float distance_squared,
+                                  float a,
+                                  float b,
+                                  float gamma) {
+  if (!(distance_squared > 0.0f)) return 0.0f;
+  float result = 2.0f * gamma * b;
   result /=
-      (0.001 + distance) * (a * std::pow(distance, b) + 1.0);
+      (0.001f + distance_squared) *
+      (a * std::pow(distance_squared, b) + 1.0f);
   return result;
 }
 
@@ -506,7 +506,14 @@ std::int32_t OptimizeShard(std::uint32_t worker_id, RunHeader* header) {
   TauState* rng_state_per_vertex =
       OffsetPointer<TauState>(header->rng_state_per_vertex_offset);
 
-  double alpha = 1.0;
+  const float a = static_cast<float>(header->a);
+  const float b = static_cast<float>(header->b);
+  const float gamma = static_cast<float>(header->gamma);
+  if (!std::isfinite(a) || !std::isfinite(b) || !std::isfinite(gamma) ||
+      a <= 0.0f || b <= 0.0f || gamma < 0.0f) {
+    return kInvalidArgument;
+  }
+  float alpha = 1.0f;
   for (std::uint32_t epoch = 0; epoch < header->epoch_count; ++epoch) {
     while (true) {
       const std::uint32_t row_begin =
@@ -538,20 +545,16 @@ std::int32_t OptimizeShard(std::uint32_t worker_id, RunHeader* header) {
 
           float distance_squared =
               ReducedSquaredDistance(current, other, header->dimension);
-          const double positive_coefficient =
-              PositiveGradientCoefficient(
-                  distance_squared, header->a, header->b);
+          const float positive_coefficient =
+              PositiveGradientCoefficient(distance_squared, a, b);
           for (std::uint32_t coordinate = 0;
                coordinate < header->dimension;
                ++coordinate) {
             const float difference =
                 current[coordinate] - other[coordinate];
-            const double gradient =
-                Clip(positive_coefficient * static_cast<double>(difference));
-            current[coordinate] = static_cast<float>(
-                static_cast<double>(current[coordinate]) + gradient * alpha);
-            other[coordinate] = static_cast<float>(
-                static_cast<double>(other[coordinate]) - gradient * alpha);
+            const float gradient = Clip(positive_coefficient * difference);
+            current[coordinate] += gradient * alpha;
+            other[coordinate] -= gradient * alpha;
           }
           epoch_of_next_sample[edge] += epochs_per_sample[edge];
 
@@ -578,22 +581,18 @@ std::int32_t OptimizeShard(std::uint32_t worker_id, RunHeader* header) {
               continue;
             }
 
-            const double negative_coefficient =
-                NegativeGradientCoefficient(
-                    distance_squared, header->a, header->b, header->gamma);
+            const float negative_coefficient =
+                NegativeGradientCoefficient(distance_squared, a, b, gamma);
             for (std::uint32_t coordinate = 0;
                  coordinate < header->dimension;
                  ++coordinate) {
-              double gradient = 0.0;
-              if (negative_coefficient > 0.0) {
+              float gradient = 0.0f;
+              if (negative_coefficient > 0.0f) {
                 const float difference =
                     current[coordinate] - other[coordinate];
-                gradient = Clip(
-                    negative_coefficient * static_cast<double>(difference));
+                gradient = Clip(negative_coefficient * difference);
               }
-              current[coordinate] = static_cast<float>(
-                  static_cast<double>(current[coordinate]) +
-                  gradient * alpha);
+              current[coordinate] += gradient * alpha;
             }
           }
           epoch_of_next_negative_sample[edge] +=
@@ -607,8 +606,8 @@ std::int32_t OptimizeShard(std::uint32_t worker_id, RunHeader* header) {
       AtomicStore(&header->completed_epochs, epoch + 1);
     }
     alpha =
-        1.0 - (static_cast<double>(epoch) /
-               static_cast<double>(header->epoch_count));
+        1.0f - (static_cast<float>(epoch) /
+                static_cast<float>(header->epoch_count));
   }
   return kSuccess;
 }

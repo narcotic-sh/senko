@@ -97,13 +97,25 @@ the sampled pair-distance error remains `2.0111783696124703e-5`. At the
 complete long spectral operation uses 86,384,480 arena bytes, so it fits
 inside the preceding k-NN reservation of 92,209,152 bytes. In a modeled
 k-NN-then-spectral run, WASM heap high-water fell from 146,407,424 to
-92,340,224 bytes (51.6 MiB) with identical convergence statistics. Native
-one-hour and long outputs are byte-for-byte identical to the pre-refactor
-solver. The long WASM vector hash remains
-`377e541ab2a2fae9bc46d4f2a7af621c5c169321a5146da0a62251c90cffddb8`,
-and the test requires the post-spectral heap to equal the immediately
-post-k-NN-reserve heap exactly. Adjacent long native timings were 5,168.60 ms
-before versus 5,180.31 ms after.
+92,340,224 bytes (51.6 MiB) with identical convergence statistics. The
+compact-arena refactor itself retained byte-for-byte output. Production now
+also explicitly SIMD-vectorizes the three remaining f64 reductions, which
+deliberately changes their last-bit summation grouping. The accepted long WASM
+vector hash is
+`9b7d7ed290d2c497fcb6ad52a7d33913075a85cdb33c35524cc39e3a96ba08e5`,
+and the test still requires the post-spectral heap to equal the immediately
+post-k-NN-reserve heap exactly.
+
+On the one-hour fixture, fresh-process WASM medians moved from 1,283.9 to
+1,135.6 ms. The pair-distance error against offline changed only from
+`2.01117837e-5` to `2.01118548e-5`; all 61 eigenpairs converged with the same
+two restarts. On the 43,804-row fixture, a direct same-process A/B moved from
+12.206 to 10.506 seconds with the same three restarts, 61 converged
+eigenpairs, and 42,492,944-byte scratch. Candidate-versus-predecessor
+pair-distance error was `1.489e-8`. The final serial UMAP/HDBSCAN gate retained
+seven clusters, the exact zero-noise mask, and ARI 0.999399 against the offline
+partition. The earlier compact-arena native timing remained 5,168.60 ms before
+versus 5,180.31 ms after.
 
 Run both spectral acceptance fixtures explicitly with:
 

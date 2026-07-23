@@ -13,8 +13,11 @@ const parityIt =
   process.env.SENKO_RUN_UMAP_SPECTRAL_PARITY === "1" ? it : it.skip;
 const longParityIt =
   process.env.SENKO_RUN_UMAP_SPECTRAL_LONG_PARITY === "1" ? it : it.skip;
-const PRE_REFACTOR_LONG_VECTOR_SHA256 =
-  "377e541ab2a2fae9bc46d4f2a7af621c5c169321a5146da0a62251c90cffddb8";
+// Deterministic output after explicitly SIMD-vectorizing the three f64
+// reductions. The reduction grouping changes only last-bit numerics; the
+// long-fixture eigenspace was separately gated against the scalar predecessor.
+const SIMD_REDUCTION_LONG_VECTOR_SHA256 =
+  "9b7d7ed290d2c497fcb6ad52a7d33913075a85cdb33c35524cc39e3a96ba08e5";
 
 describe("native UMAP spectral-initialization parity", () => {
   parityIt(
@@ -189,7 +192,7 @@ describe("native UMAP spectral-initialization parity", () => {
         expect(candidate.stats.maximumResidual).toBeLessThan(1e-4);
         expect(candidate.stats.peakWorkingBytes).toBe(42_492_944);
         expect(sha256(candidate.values)).toBe(
-          PRE_REFACTOR_LONG_VECTOR_SHA256,
+          SIMD_REDUCTION_LONG_VECTOR_SHA256,
         );
         expect(kernels.memoryStats.peakArenaUsedBytes).toBeLessThan(
           84 * 1024 * 1024,
