@@ -7,6 +7,8 @@
 
 #include "hdbscan.hpp"
 #include "umap_fuzzy_graph.h"
+#include "umap_initialization.hpp"
+#include "umap_layout.hpp"
 #include "umap_neighbors.h"
 #include "umap_spectral.hpp"
 
@@ -745,6 +747,52 @@ EMSCRIPTEN_KEEPALIVE int cluster_umap_spectral(
   *output_peak_working_bytes =
       static_cast<uint32_t>(stats.peak_working_bytes);
   return 1;
+}
+
+EMSCRIPTEN_KEEPALIVE uint32_t
+cluster_umap_initialization_workspace_bytes(int dimension) {
+  const size_t bytes =
+      senko::umap_initialization::WorkspaceBytes(dimension);
+  return bytes <= UINT32_MAX ? static_cast<uint32_t>(bytes) : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE int cluster_umap_initialize_layout(
+    const double* spectral_embedding, int count, int dimension,
+    uint32_t random_seed, int approximate_neighbors,
+    float* output_embedding, int64_t* output_layout_rng_state) {
+  const uint32_t workspace_size =
+      cluster_umap_initialization_workspace_bytes(dimension);
+  if (workspace_size == 0) return -1;
+  void* const workspace = allocate_bytes(workspace_size, 16u);
+  if (!workspace) return -2;
+  return static_cast<int>(senko::umap_initialization::Initialize(
+      spectral_embedding, count, dimension, random_seed,
+      approximate_neighbors != 0, workspace, workspace_size,
+      output_embedding, output_layout_rng_state));
+}
+
+EMSCRIPTEN_KEEPALIVE uint32_t cluster_umap_layout_workspace_bytes(
+    int vertex_count, int edge_count) {
+  const size_t bytes =
+      senko::umap_layout::SerialWorkspaceBytes(vertex_count, edge_count);
+  return bytes <= UINT32_MAX ? static_cast<uint32_t>(bytes) : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE int cluster_umap_optimize_layout_serial(
+    float* embedding, int vertex_count, int dimension,
+    const int32_t* head, const int32_t* tail,
+    const double* epochs_per_sample, int edge_count,
+    const int64_t* rng_state, int epoch_count, double a, double b,
+    double gamma, double negative_sample_rate) {
+  const uint32_t workspace_size =
+      cluster_umap_layout_workspace_bytes(vertex_count, edge_count);
+  if (workspace_size == 0) return -1;
+  void* const workspace = allocate_bytes(workspace_size, 16u);
+  if (!workspace) return -2;
+  return senko::umap_layout::OptimizeSerial(
+      embedding, vertex_count, dimension, head, tail, epochs_per_sample,
+      edge_count, rng_state, epoch_count, a, b, gamma,
+      negative_sample_rate, workspace, workspace_size);
 }
 
 EMSCRIPTEN_KEEPALIVE uint32_t cluster_hdbscan_workspace_bytes(

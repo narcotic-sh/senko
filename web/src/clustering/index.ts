@@ -14,6 +14,12 @@ export type {
   ClusteringNumericKernels,
 } from "./numeric-kernels";
 export { projectWithUmap, type UmapProjection } from "./umap";
+export {
+  clusterEmbeddingsNativeSerial,
+  prepareNativeLayoutGraph,
+  type NativeUmapSerialResult,
+  type NativeUmapSerialStats,
+} from "./native-umap";
 export { WasmClusteringKernels } from "./wasm-kernels";
 export {
   DEFAULT_CLUSTERING_OPTIONS,

@@ -40,6 +40,11 @@ export interface NativeUmapSpectralEmbedding {
   };
 }
 
+export interface NativeUmapLayoutInitialization {
+  readonly embedding: Float32Array;
+  readonly rngState: BigInt64Array;
+}
+
 let compiledModule: Promise<WebAssembly.Module> | undefined;
 const clusteringWasmImports = {
   env: {
@@ -144,6 +149,37 @@ interface ClusteringWasmExports extends WebAssembly.Exports {
     outputIntegerStats: number,
     outputNumericStats: number,
     outputPeakWorkingBytes: number,
+  ) => number;
+  readonly cluster_umap_initialization_workspace_bytes: (
+    dimension: number,
+  ) => number;
+  readonly cluster_umap_initialize_layout: (
+    spectralEmbedding: number,
+    count: number,
+    dimension: number,
+    randomSeed: number,
+    approximateNeighbors: number,
+    outputEmbedding: number,
+    outputLayoutRngState: number,
+  ) => number;
+  readonly cluster_umap_layout_workspace_bytes: (
+    vertexCount: number,
+    edgeCount: number,
+  ) => number;
+  readonly cluster_umap_optimize_layout_serial: (
+    embedding: number,
+    vertexCount: number,
+    dimension: number,
+    head: number,
+    tail: number,
+    epochsPerSample: number,
+    edgeCount: number,
+    rngState: number,
+    epochCount: number,
+    a: number,
+    b: number,
+    gamma: number,
+    negativeSampleRate: number,
   ) => number;
   readonly cluster_hdbscan_workspace_bytes: (
     count: number,
@@ -899,6 +935,209 @@ export class WasmClusteringKernels implements ClusteringNumericKernels {
     };
   }
 
+  /** Prepare native UMAP's noisy Float32 layout coordinates and tau RNG. */
+  initializeNativeUmapLayout(
+    spectralEmbedding: Float64Array,
+    count: number,
+    dimension: number,
+    randomSeed: number,
+    approximateNeighbors: boolean,
+  ): NativeUmapLayoutInitialization {
+    const outputLength = checkedElementCount(
+      "native UMAP layout initialization",
+      count,
+      dimension,
+    );
+    if (spectralEmbedding.length !== outputLength) {
+      throw new RangeError(
+        "native UMAP spectral embedding has an invalid length",
+      );
+    }
+    if (
+      !Number.isSafeInteger(randomSeed) ||
+      randomSeed < 0 ||
+      randomSeed > UINT32_MAX
+    ) {
+      throw new RangeError(
+        "native UMAP random seed must be an unsigned 32-bit integer",
+      );
+    }
+    const exports = this.requireExports();
+    const workspaceBytes =
+      exports.cluster_umap_initialization_workspace_bytes(dimension);
+    if (workspaceBytes === 0) {
+      throw new RangeError(
+        "native UMAP initialization dimensions are unsupported",
+      );
+    }
+    const operationExports = this.beginOperation(
+      nativeUmapInitializationArenaBytes(
+        count,
+        dimension,
+        workspaceBytes,
+      ),
+    );
+    const spectralPointer = this.copyFloat64(
+      operationExports,
+      spectralEmbedding,
+    );
+    const embeddingPointer = this.allocate(
+      operationExports,
+      outputLength * Float32Array.BYTES_PER_ELEMENT,
+      Float32Array.BYTES_PER_ELEMENT,
+    );
+    const rngStatePointer = this.allocate(
+      operationExports,
+      3 * BigInt64Array.BYTES_PER_ELEMENT,
+      BigInt64Array.BYTES_PER_ELEMENT,
+    );
+    this.requireSuccess(
+      "native UMAP layout initialization",
+      operationExports.cluster_umap_initialize_layout(
+        spectralPointer,
+        count,
+        dimension,
+        randomSeed,
+        approximateNeighbors ? 1 : 0,
+        embeddingPointer,
+        rngStatePointer,
+      ),
+      operationExports,
+    );
+    this.observeReturnedJsBytes(
+      outputLength * Float32Array.BYTES_PER_ELEMENT +
+        3 * BigInt64Array.BYTES_PER_ELEMENT,
+    );
+    return {
+      embedding: this.copyFloat32Result(
+        operationExports,
+        embeddingPointer,
+        outputLength,
+      ),
+      rngState: this.copyBigInt64Result(
+        operationExports,
+        rngStatePointer,
+        3,
+      ),
+    };
+  }
+
+  /** Deterministic scalar-order diagnostic and no-thread compatibility path. */
+  reserveNativeUmapLayoutSerial(
+    count: number,
+    dimension: number,
+    edgeCount: number,
+  ): void {
+    const exports = this.requireExports();
+    const workspaceBytes = exports.cluster_umap_layout_workspace_bytes(
+      count,
+      edgeCount,
+    );
+    if (workspaceBytes === 0) {
+      throw new RangeError("native UMAP layout dimensions are unsupported");
+    }
+    this.reserveArena(
+      exports,
+      nativeUmapLayoutArenaBytes(
+        count,
+        dimension,
+        edgeCount,
+        workspaceBytes,
+      ),
+    );
+  }
+
+  /** Deterministic scalar-order diagnostic and no-thread compatibility path. */
+  optimizeNativeUmapLayoutSerial(
+    initialization: NativeUmapLayoutInitialization,
+    count: number,
+    dimension: number,
+    head: Int32Array,
+    tail: Int32Array,
+    epochsPerSample: Float64Array,
+    epochCount: number,
+    a: number,
+    b: number,
+  ): Float32Array {
+    const embeddingLength = checkedElementCount(
+      "native UMAP layout embedding",
+      count,
+      dimension,
+    );
+    if (initialization.embedding.length !== embeddingLength) {
+      throw new RangeError("native UMAP layout embedding length is invalid");
+    }
+    if (initialization.rngState.length !== 3) {
+      throw new RangeError("native UMAP layout RNG state must have 3 values");
+    }
+    const edgeCount = head.length;
+    if (
+      tail.length !== edgeCount ||
+      epochsPerSample.length !== edgeCount ||
+      !Number.isSafeInteger(epochCount) ||
+      epochCount <= 0
+    ) {
+      throw new RangeError("native UMAP layout edge arrays are invalid");
+    }
+    const exports = this.requireExports();
+    const workspaceBytes = exports.cluster_umap_layout_workspace_bytes(
+      count,
+      edgeCount,
+    );
+    if (workspaceBytes === 0) {
+      throw new RangeError("native UMAP layout dimensions are unsupported");
+    }
+    const operationExports = this.beginOperation(
+      nativeUmapLayoutArenaBytes(
+        count,
+        dimension,
+        edgeCount,
+        workspaceBytes,
+      ),
+    );
+    const embeddingPointer = this.copyFloat32(
+      operationExports,
+      initialization.embedding,
+    );
+    const headPointer = this.copyInt32(operationExports, head);
+    const tailPointer = this.copyInt32(operationExports, tail);
+    const epochsPerSamplePointer = this.copyFloat64(
+      operationExports,
+      epochsPerSample,
+    );
+    const rngStatePointer = this.copyBigInt64(
+      operationExports,
+      initialization.rngState,
+    );
+    this.requireSuccess(
+      "native UMAP serial layout",
+      operationExports.cluster_umap_optimize_layout_serial(
+        embeddingPointer,
+        count,
+        dimension,
+        headPointer,
+        tailPointer,
+        epochsPerSamplePointer,
+        edgeCount,
+        rngStatePointer,
+        epochCount,
+        a,
+        b,
+        1,
+        5,
+      ),
+      operationExports,
+    );
+    this.observeReturnedJsBytes(
+      embeddingLength * Float32Array.BYTES_PER_ELEMENT,
+    );
+    return this.copyFloat32Result(
+      operationExports,
+      embeddingPointer,
+      embeddingLength,
+    );
+  }
+
   /**
    * Native-compatible HDBSCAN 0.8.44 Float64 hierarchy semantics. The exact
    * core-distance and native approximate-Boruvka provider remains gated from
@@ -1140,6 +1379,32 @@ export class WasmClusteringKernels implements ClusteringNumericKernels {
     return pointer;
   }
 
+  private copyFloat64(
+    exports: ClusteringWasmExports,
+    input: Float64Array,
+  ): number {
+    const pointer = this.allocate(
+      exports,
+      input.byteLength,
+      Float64Array.BYTES_PER_ELEMENT,
+    );
+    checkedFloat64View(exports.memory, pointer, input.length).set(input);
+    return pointer;
+  }
+
+  private copyBigInt64(
+    exports: ClusteringWasmExports,
+    input: BigInt64Array,
+  ): number {
+    const pointer = this.allocate(
+      exports,
+      input.byteLength,
+      BigInt64Array.BYTES_PER_ELEMENT,
+    );
+    checkedBigInt64View(exports.memory, pointer, input.length).set(input);
+    return pointer;
+  }
+
   private copyFloat32Result(
     exports: ClusteringWasmExports,
     pointer: number,
@@ -1162,6 +1427,14 @@ export class WasmClusteringKernels implements ClusteringNumericKernels {
     length: number,
   ): Float64Array {
     return checkedFloat64View(exports.memory, pointer, length).slice();
+  }
+
+  private copyBigInt64Result(
+    exports: ClusteringWasmExports,
+    pointer: number,
+    length: number,
+  ): BigInt64Array {
+    return checkedBigInt64View(exports.memory, pointer, length).slice();
   }
 
   private copyUint8Result(
@@ -1216,6 +1489,15 @@ function checkedFloat64View(
 ): Float64Array {
   checkedRange(memory, pointer, length, Float64Array.BYTES_PER_ELEMENT);
   return new Float64Array(memory.buffer, pointer, length);
+}
+
+function checkedBigInt64View(
+  memory: WebAssembly.Memory,
+  pointer: number,
+  length: number,
+): BigInt64Array {
+  checkedRange(memory, pointer, length, BigInt64Array.BYTES_PER_ELEMENT);
+  return new BigInt64Array(memory.buffer, pointer, length);
 }
 
 function checkedUint8View(
@@ -1441,6 +1723,64 @@ function nativeUmapSpectralArenaBytes(
   sizer.add(4n, 4n, 4n);
   sizer.add(3n, 8n, 8n);
   sizer.add(1n, 4n, 4n);
+  return sizer.bytes();
+}
+
+function nativeUmapInitializationArenaBytes(
+  count: number,
+  dimension: number,
+  workspaceBytes: number,
+): number {
+  const outputLength = checkedElementCount(
+    "native UMAP layout initialization",
+    count,
+    dimension,
+  );
+  if (
+    !Number.isSafeInteger(workspaceBytes) ||
+    workspaceBytes <= 0 ||
+    workspaceBytes > UINT32_MAX
+  ) {
+    throw new RangeError(
+      `native UMAP initialization workspace ${workspaceBytes} is outside the wasm32 address range`,
+    );
+  }
+  const sizer = new ArenaSizer();
+  sizer.add(BigInt(outputLength), 8n, 8n);
+  sizer.add(BigInt(outputLength), 4n, 4n);
+  sizer.add(3n, 8n, 8n);
+  sizer.add(BigInt(workspaceBytes), 1n, 16n);
+  return sizer.bytes();
+}
+
+function nativeUmapLayoutArenaBytes(
+  count: number,
+  dimension: number,
+  edgeCount: number,
+  workspaceBytes: number,
+): number {
+  const embeddingLength = checkedElementCount(
+    "native UMAP layout embedding",
+    count,
+    dimension,
+  );
+  checkedElementCount("native UMAP layout edges", edgeCount);
+  if (
+    !Number.isSafeInteger(workspaceBytes) ||
+    workspaceBytes <= 0 ||
+    workspaceBytes > UINT32_MAX
+  ) {
+    throw new RangeError(
+      `native UMAP layout workspace ${workspaceBytes} is outside the wasm32 address range`,
+    );
+  }
+  const sizer = new ArenaSizer();
+  sizer.add(BigInt(embeddingLength), 4n, 4n);
+  sizer.add(BigInt(edgeCount), 4n, 4n);
+  sizer.add(BigInt(edgeCount), 4n, 4n);
+  sizer.add(BigInt(edgeCount), 8n, 8n);
+  sizer.add(3n, 8n, 8n);
+  sizer.add(BigInt(workspaceBytes), 1n, 16n);
   return sizer.bytes();
 }
 

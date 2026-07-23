@@ -72,3 +72,21 @@ post-UMAP k-NN run there; TypeScript retains layout, hierarchy selection, and
 Senko's `CommonClustering` orchestration.
 See [`scripts/clustering-wasm/README.md`](../../scripts/clustering-wasm/README.md)
 for the reproducible benchmark and adaptive-memory accounting.
+
+## Native-parity replacement (gated)
+
+`native-umap.ts` assembles the exact offline parameters behind a diagnostic
+gate: cosine k-NN 40, 60 output dimensions, spectral initialization, 500
+epochs through 10,000 embeddings (otherwise 200), native `a`/`b`, HDBSCAN
+20/10, minor-cluster reassignment, and repeated centroid merging at 0.875.
+Its WASM stages independently cover PyNNDescent, fuzzy-union CSR, the
+normalized-Laplacian eigenspace, legacy NumPy RNG/noise, UMAP layout, and
+native approximate-Borůvka HDBSCAN.
+
+The serial assembled path is a correctness oracle and no-thread fallback, not
+the production selector: it takes about 23 seconds for clustering alone on the
+5,713-row fixture. It retains seven native clusters with ARI 0.99959 (one
+assignment differs). Production promotion waits for the same logic running in
+the prewarmed shared-memory worker pool to pass this end-to-end gate. The
+query-independent differential tests live under `scripts/clustering-wasm` and
+are opt-in through their `SENKO_RUN_*_PARITY` environment variables.
