@@ -12,8 +12,14 @@ namespace senko_hdbscan {
 namespace {
 
 constexpr uint64_t kWorkspaceAlignment = 16u;
-constexpr int kKdLeafSize = 13;
+constexpr int kCoreKdLeafSize = 40;
+constexpr int kBoruvkaKdLeafSize = kCoreKdLeafSize / 3;
 constexpr int kKdBoruvkaThreshold = 1024;
+
+enum class MstProvider : uint8_t {
+  kCheckpointExact,
+  kNativeApproximate,
+};
 
 struct MstEdge {
   int32_t from;
@@ -33,6 +39,7 @@ struct KdNode {
   int32_t end;
   int32_t left;
   int32_t right;
+  double radius_squared;
 };
 
 uint64_t align_up(uint64_t value, uint64_t alignment) {
@@ -55,14 +62,21 @@ bool valid_arguments(int count, int dimension, int min_samples,
          min_cluster_size >= 2;
 }
 
-uint64_t kd_node_capacity(uint64_t count) {
-  const uint64_t minimum_leaves =
-      (count + static_cast<uint64_t>(kKdLeafSize) - 1u) /
-      static_cast<uint64_t>(kKdLeafSize);
-  // Repeated median splits produce fewer than twice the theoretical minimum
-  // number of leaves. Four nodes per minimum leaf plus the root is therefore a
-  // conservative bound for the complete binary tree.
-  return minimum_leaves * 4u + 1u;
+uint64_t kd_node_count(uint64_t count, uint64_t leaf_size) {
+  // This is sklearn's BinaryTree allocation rule expressed with integer
+  // arithmetic:
+  //   n_levels = 1 + floor(log2(max(1, (n - 1) / leaf_size)))
+  //   n_nodes = 2**n_levels - 1
+  //
+  // Avoiding floating-point logarithms also avoids a boundary-rounding
+  // difference when n - 1 is an exact power-of-two multiple of leaf_size.
+  const uint64_t leaf_ratio =
+      count > 1u ? (count - 1u) / leaf_size : 0u;
+  uint64_t leaves = 1u;
+  while (leaves <= leaf_ratio / 2u) {
+    leaves *= 2u;
+  }
+  return leaves * 2u - 1u;
 }
 
 uint64_t calculate_workspace_bytes(int count, int dimension, int min_samples,
@@ -78,9 +92,11 @@ uint64_t calculate_workspace_bytes(int count, int dimension, int min_samples,
   const uint64_t cluster_capacity = n * 2u + 1u;
   uint64_t cursor = 0;
 
-  // Input conversion and exact core-distance heaps.
+  // Input conversion, exact core-distance heaps and the native bootstrap's
+  // sorted non-self neighbor indices.
   if (!add_allocation(&cursor, n * d, sizeof(double)) ||
       !add_allocation(&cursor, n * k, sizeof(double)) ||
+      !add_allocation(&cursor, n * k, sizeof(int32_t)) ||
       !add_allocation(&cursor, n, sizeof(int32_t)) ||
       !add_allocation(&cursor, n, sizeof(double))) {
     return 0;
@@ -95,15 +111,24 @@ uint64_t calculate_workspace_bytes(int count, int dimension, int min_samples,
     return 0;
   }
 
-  // Scalable exact KD-tree/Boruvka provider. The exact Prim buffers above
-  // remain available as a small-input correctness oracle.
-  const uint64_t kd_nodes = kd_node_capacity(n);
+  // Native HDBSCAN uses a leaf-40 tree for the core-distance query and a
+  // separate leaf-13 tree for Boruvka traversal. The exact provider reuses the
+  // latter. The exact Prim buffers above remain a small-input oracle.
+  const uint64_t core_kd_nodes = kd_node_count(n, kCoreKdLeafSize);
+  const uint64_t boruvka_kd_nodes =
+      kd_node_count(n, kBoruvkaKdLeafSize);
   if (!add_allocation(&cursor, n, sizeof(int32_t)) ||
-      !add_allocation(&cursor, kd_nodes, sizeof(KdNode)) ||
-      !add_allocation(&cursor, kd_nodes * d * 2u, sizeof(double)) ||
-      !add_allocation(&cursor, kd_nodes, sizeof(double)) ||
-      !add_allocation(&cursor, kd_nodes, sizeof(int32_t)) ||
+      !add_allocation(&cursor, core_kd_nodes, sizeof(KdNode)) ||
+      !add_allocation(&cursor, core_kd_nodes * d * 2u, sizeof(double))) {
+    return 0;
+  }
+  if (!add_allocation(&cursor, n, sizeof(int32_t)) ||
+      !add_allocation(&cursor, boruvka_kd_nodes, sizeof(KdNode)) ||
+      !add_allocation(&cursor, boruvka_kd_nodes * d * 2u, sizeof(double)) ||
+      !add_allocation(&cursor, boruvka_kd_nodes, sizeof(double)) ||
+      !add_allocation(&cursor, boruvka_kd_nodes, sizeof(int32_t)) ||
       !add_allocation(&cursor, k, sizeof(double)) ||
+      !add_allocation(&cursor, k, sizeof(int32_t)) ||
       !add_allocation(&cursor, n, sizeof(int32_t)) ||
       !add_allocation(&cursor, n, sizeof(int32_t)) ||
       !add_allocation(&cursor, n, sizeof(int32_t)) ||
@@ -175,17 +200,10 @@ class Workspace {
 double squared_euclidean(const double* left, const double* right,
                          int dimension) {
   double result = 0.0;
-  int column = 0;
-  const int unrolled_end = dimension - dimension % 4;
-  for (; column < unrolled_end; column += 4) {
-    const double difference0 = left[column] - right[column];
-    const double difference1 = left[column + 1] - right[column + 1];
-    const double difference2 = left[column + 2] - right[column + 2];
-    const double difference3 = left[column + 3] - right[column + 3];
-    result += difference0 * difference0 + difference1 * difference1 +
-              difference2 * difference2 + difference3 * difference3;
-  }
-  for (; column < dimension; ++column) {
+  // sklearn's euclidean_rdist accumulates one coordinate at a time. Preserve
+  // that evaluation order: grouping four products changed two one-hour core
+  // distances by one ULP even though the selected neighbors were identical.
+  for (int column = 0; column < dimension; ++column) {
     const double difference = left[column] - right[column];
     result += difference * difference;
   }
@@ -221,6 +239,70 @@ void max_heap_push(double* heap, int32_t* size, int capacity, double value) {
   heap[position] = value;
 }
 
+void max_heap_push_pair(double* distances, int32_t* indices, int32_t* size,
+                        int capacity, double distance, int32_t index) {
+  if (*size < capacity) {
+    int position = *size;
+    *size += 1;
+    while (position > 0) {
+      const int parent = (position - 1) / 2;
+      if (distances[parent] >= distance) break;
+      distances[position] = distances[parent];
+      indices[position] = indices[parent];
+      position = parent;
+    }
+    distances[position] = distance;
+    indices[position] = index;
+    return;
+  }
+  // sklearn's fixed-size neighbor heap also rejects an equal-distance
+  // candidate. Traversal order therefore controls exact-distance ties.
+  if (distance >= distances[0]) return;
+
+  int position = 0;
+  while (true) {
+    const int left = position * 2 + 1;
+    if (left >= capacity) break;
+    const int right = left + 1;
+    int larger = left;
+    if (right < capacity && distances[right] > distances[left]) {
+      larger = right;
+    }
+    if (distances[larger] <= distance) break;
+    distances[position] = distances[larger];
+    indices[position] = indices[larger];
+    position = larger;
+  }
+  distances[position] = distance;
+  indices[position] = index;
+}
+
+void sort_max_heap_pairs(double* distances, int32_t* indices, int count) {
+  // Extracting a max heap from right to left yields ascending distances. No
+  // tie-break is added: sklearn's simultaneous_sort likewise sorts solely by
+  // distance after the query heap has selected its candidates.
+  for (int end = count - 1; end > 0; --end) {
+    std::swap(distances[0], distances[end]);
+    std::swap(indices[0], indices[end]);
+    const double value = distances[0];
+    const int32_t index = indices[0];
+    int position = 0;
+    while (true) {
+      const int left = position * 2 + 1;
+      if (left >= end) break;
+      const int right = left + 1;
+      int larger = left;
+      if (right < end && distances[right] > distances[left]) larger = right;
+      if (distances[larger] <= value) break;
+      distances[position] = distances[larger];
+      indices[position] = indices[larger];
+      position = larger;
+    }
+    distances[position] = value;
+    indices[position] = index;
+  }
+}
+
 struct KdTreeView {
   const double* points;
   int count;
@@ -250,11 +332,10 @@ const double* node_max_bounds(const KdTreeView& tree, int node) {
   return node_min_bounds(tree, node) + tree.dimension;
 }
 
-int build_kd_node(KdTreeView* tree, int start, int end) {
-  if (tree->node_count >= tree->node_capacity || start >= end) return -1;
-  const int node = tree->node_count++;
+int build_kd_node(KdTreeView* tree, int node, int start, int end) {
+  if (node < 0 || node >= tree->node_capacity || start >= end) return -1;
   KdNode& result = tree->nodes[node];
-  result = {start, end, -1, -1};
+  result = {start, end, -1, -1, 0.0};
   double* minimum = node_min_bounds(tree, node);
   double* maximum = node_max_bounds(tree, node);
   const double* first =
@@ -273,7 +354,13 @@ int build_kd_node(KdTreeView* tree, int start, int end) {
       if (point[column] > maximum[column]) maximum[column] = point[column];
     }
   }
-  if (end - start <= kKdLeafSize) return node;
+  for (int column = 0; column < tree->dimension; ++column) {
+    const double half_span = 0.5 * fabs(maximum[column] - minimum[column]);
+    result.radius_squared += half_span * half_span;
+  }
+
+  const int left = node * 2 + 1;
+  if (left >= tree->node_capacity) return node;
 
   int split_dimension = 0;
   double largest_span = maximum[0] - minimum[0];
@@ -297,8 +384,8 @@ int build_kd_node(KdTreeView* tree, int start, int end) {
         return left_value < right_value ||
                (left_value == right_value && left < right);
       });
-  result.left = build_kd_node(tree, start, middle);
-  result.right = build_kd_node(tree, middle, end);
+  result.left = build_kd_node(tree, left, start, middle);
+  result.right = build_kd_node(tree, left + 1, middle, end);
   return result.left >= 0 && result.right >= 0 ? node : -1;
 }
 
@@ -307,8 +394,8 @@ bool build_kd_tree(const double* points, int count, int dimension,
                    int node_capacity, KdTreeView* result) {
   for (int row = 0; row < count; ++row) indices[row] = row;
   *result = {points, count, dimension, indices, nodes, bounds, node_capacity,
-             0};
-  return build_kd_node(result, 0, count) == 0;
+             node_capacity};
+  return build_kd_node(result, 0, 0, count) == 0;
 }
 
 double point_box_distance_squared(const double* point,
@@ -328,15 +415,34 @@ double point_box_distance_squared(const double* point,
   return result;
 }
 
+double node_box_distance_squared(const KdTreeView& tree, int left_node,
+                                 int right_node) {
+  const double* left_minimum = node_min_bounds(tree, left_node);
+  const double* left_maximum = node_max_bounds(tree, left_node);
+  const double* right_minimum = node_min_bounds(tree, right_node);
+  const double* right_maximum = node_max_bounds(tree, right_node);
+  double result = 0.0;
+  for (int column = 0; column < tree.dimension; ++column) {
+    double difference = 0.0;
+    if (left_minimum[column] > right_maximum[column]) {
+      difference = left_minimum[column] - right_maximum[column];
+    } else if (right_minimum[column] > left_maximum[column]) {
+      difference = right_minimum[column] - left_maximum[column];
+    }
+    result += difference * difference;
+  }
+  return result;
+}
+
 void query_core_neighbors(const KdTreeView& tree, int query_index, int node,
-                          int neighbor_count, double* heap,
-                          int32_t* heap_size) {
+                          int neighbor_count, double* heap_distances,
+                          int32_t* heap_indices, int32_t* heap_size) {
   const KdNode& current = tree.nodes[node];
   const double* query =
       tree.points + static_cast<uint64_t>(query_index) * tree.dimension;
   const double maximum_distance =
       *heap_size == neighbor_count
-          ? heap[0]
+          ? heap_distances[0]
           : std::numeric_limits<double>::infinity();
   if (point_box_distance_squared(query, tree, node) >= maximum_distance) {
     return;
@@ -350,7 +456,8 @@ void query_core_neighbors(const KdTreeView& tree, int query_index, int node,
           tree.points +
               static_cast<uint64_t>(candidate) * tree.dimension,
           tree.dimension);
-      max_heap_push(heap, heap_size, neighbor_count, distance_squared);
+      max_heap_push_pair(heap_distances, heap_indices, heap_size,
+                         neighbor_count, distance_squared, candidate);
     }
     return;
   }
@@ -363,20 +470,31 @@ void query_core_neighbors(const KdTreeView& tree, int query_index, int node,
       left_distance <= right_distance ? current.left : current.right;
   const int second =
       left_distance <= right_distance ? current.right : current.left;
-  query_core_neighbors(tree, query_index, first, neighbor_count, heap,
-                       heap_size);
-  query_core_neighbors(tree, query_index, second, neighbor_count, heap,
-                       heap_size);
+  query_core_neighbors(tree, query_index, first, neighbor_count,
+                       heap_distances, heap_indices, heap_size);
+  query_core_neighbors(tree, query_index, second, neighbor_count,
+                       heap_distances, heap_indices, heap_size);
 }
 
 bool calculate_core_distances_kd(const KdTreeView& tree, int min_samples,
-                                 double* query_heap,
-                                 double* core_distances) {
+                                 double* query_heap_distances,
+                                 int32_t* query_heap_indices,
+                                 double* core_distances,
+                                 int32_t* neighbor_indices) {
   for (int row = 0; row < tree.count; ++row) {
     int32_t heap_size = 0;
-    query_core_neighbors(tree, row, 0, min_samples, query_heap, &heap_size);
+    query_core_neighbors(tree, row, 0, min_samples, query_heap_distances,
+                         query_heap_indices, &heap_size);
     if (heap_size != min_samples) return false;
-    core_distances[row] = sqrt(query_heap[0]);
+    core_distances[row] = sqrt(query_heap_distances[0]);
+    if (neighbor_indices) {
+      sort_max_heap_pairs(query_heap_distances, query_heap_indices,
+                          min_samples);
+      memcpy(neighbor_indices +
+                 static_cast<uint64_t>(row) * min_samples,
+             query_heap_indices,
+             static_cast<size_t>(min_samples) * sizeof(int32_t));
+    }
   }
   return true;
 }
@@ -515,6 +633,33 @@ void update_kd_component_metadata(const KdTreeView& tree,
   }
 }
 
+void update_kd_homogeneous_components(
+    const KdTreeView& tree, const int32_t* point_components,
+    int32_t* homogeneous_component) {
+  for (int node = tree.node_count - 1; node >= 0; --node) {
+    const KdNode& current = tree.nodes[node];
+    if (current.left < 0) {
+      int32_t component =
+          point_components[tree.indices[current.start]];
+      for (int cursor = current.start + 1; cursor < current.end; ++cursor) {
+        if (point_components[tree.indices[cursor]] != component) {
+          component = -1;
+          break;
+        }
+      }
+      homogeneous_component[node] = component;
+      continue;
+    }
+    const int32_t left_component =
+        homogeneous_component[current.left];
+    homogeneous_component[node] =
+        left_component >= 0 &&
+                left_component == homogeneous_component[current.right]
+            ? left_component
+            : -1;
+  }
+}
+
 double external_node_lower_bound(const KdTreeView& tree,
                                  const double* query, int node,
                                  double query_core_squared,
@@ -639,6 +784,300 @@ int build_kd_boruvka_mst(
     if (edge_count == previous_edge_count) return -3;
   }
   return 1;
+}
+
+int update_native_components(
+    const KdTreeView& tree, MstEdge* edges, int* edge_count,
+    int32_t* union_parent, int32_t* union_rank,
+    int32_t* point_components, int32_t* homogeneous_component,
+    int32_t* candidate_source, int32_t* candidate_sink,
+    double* candidate_distance_squared, double* traversal_bounds,
+    bool reset_persisted_bounds_on_stall, int* component_count) {
+  // Native hdbscan iterates a snapshot of the component roots. Reuse the
+  // point-component array as that temporary list: traversal has completed, and
+  // the point mapping is recomputed below before it is needed again.
+  int old_component_count = 0;
+  for (int point = 0; point < tree.count; ++point) {
+    if (union_parent[point] == point) {
+      point_components[old_component_count++] = point;
+    }
+  }
+
+  for (int cursor = 0; cursor < old_component_count; ++cursor) {
+    const int component = point_components[cursor];
+    const int source = candidate_source[component];
+    const int sink = candidate_sink[component];
+    if (source < 0 || sink < 0) continue;
+
+    if (boruvka_find(union_parent, source) ==
+        boruvka_find(union_parent, sink)) {
+      candidate_source[component] = -1;
+      candidate_sink[component] = -1;
+      candidate_distance_squared[component] =
+          std::numeric_limits<double>::infinity();
+      continue;
+    }
+    if (*edge_count >= tree.count - 1) return -3;
+    edges[(*edge_count)++] = {
+        source, sink, sqrt(candidate_distance_squared[component])};
+    boruvka_union(union_parent, union_rank, source, sink);
+    candidate_distance_squared[component] =
+        std::numeric_limits<double>::infinity();
+    if (*edge_count == tree.count - 1) {
+      *component_count = 1;
+      return 1;
+    }
+  }
+
+  int new_component_count = 0;
+  for (int point = 0; point < tree.count; ++point) {
+    point_components[point] = boruvka_find(union_parent, point);
+    if (union_parent[point] == point) ++new_component_count;
+  }
+  update_kd_homogeneous_components(tree, point_components,
+                                   homogeneous_component);
+
+  if (reset_persisted_bounds_on_stall &&
+      new_component_count == old_component_count) {
+    const double infinity = std::numeric_limits<double>::infinity();
+    for (int node = 0; node < tree.node_count; ++node) {
+      traversal_bounds[node] = infinity;
+    }
+  }
+  *component_count = new_component_count;
+  return 1;
+}
+
+void native_dual_tree_traversal(
+    const KdTreeView& tree, int query_node, int reference_node,
+    const double* core_distances, const int32_t* point_components,
+    const int32_t* homogeneous_component, int32_t* candidate_source,
+    int32_t* candidate_sink, double* candidate_distance_squared,
+    double* traversal_bounds) {
+  const double node_distance =
+      node_box_distance_squared(tree, query_node, reference_node);
+  if (node_distance >= traversal_bounds[query_node]) return;
+  if (homogeneous_component[query_node] >= 0 &&
+      homogeneous_component[query_node] ==
+          homogeneous_component[reference_node]) {
+    return;
+  }
+
+  const KdNode& query = tree.nodes[query_node];
+  const KdNode& reference = tree.nodes[reference_node];
+  if (query.left < 0 && reference.left < 0) {
+    double new_upper_bound = 0.0;
+    double new_lower_bound = std::numeric_limits<double>::infinity();
+    for (int query_cursor = query.start; query_cursor < query.end;
+         ++query_cursor) {
+      const int point = tree.indices[query_cursor];
+      const int32_t component = point_components[point];
+      const double point_core_squared =
+          core_distances[point] * core_distances[point];
+      if (point_core_squared >
+          candidate_distance_squared[component]) {
+        continue;
+      }
+
+      const double* point_values =
+          tree.points + static_cast<uint64_t>(point) * tree.dimension;
+      for (int reference_cursor = reference.start;
+           reference_cursor < reference.end; ++reference_cursor) {
+        const int neighbor = tree.indices[reference_cursor];
+        const int32_t neighbor_component =
+            point_components[neighbor];
+        if (neighbor_component == component) continue;
+        const double neighbor_core_squared =
+            core_distances[neighbor] * core_distances[neighbor];
+        if (neighbor_core_squared >
+            candidate_distance_squared[component]) {
+          continue;
+        }
+
+        double mutual_reachability_squared = squared_euclidean(
+            point_values,
+            tree.points +
+                static_cast<uint64_t>(neighbor) * tree.dimension,
+            tree.dimension);
+        if (point_core_squared > mutual_reachability_squared) {
+          mutual_reachability_squared = point_core_squared;
+        }
+        if (neighbor_core_squared > mutual_reachability_squared) {
+          mutual_reachability_squared = neighbor_core_squared;
+        }
+        if (mutual_reachability_squared <
+            candidate_distance_squared[component]) {
+          candidate_distance_squared[component] =
+              mutual_reachability_squared;
+          candidate_source[component] = point;
+          candidate_sink[component] = neighbor;
+        }
+      }
+
+      if (candidate_distance_squared[component] > new_upper_bound) {
+        new_upper_bound = candidate_distance_squared[component];
+      }
+      if (candidate_distance_squared[component] < new_lower_bound) {
+        new_lower_bound = candidate_distance_squared[component];
+      }
+    }
+
+    const double radius_bound =
+        new_lower_bound + 2.0 * query.radius_squared;
+    const double new_bound =
+        new_upper_bound < radius_bound ? new_upper_bound : radius_bound;
+    if (new_bound < traversal_bounds[query_node]) {
+      traversal_bounds[query_node] = new_bound;
+      int node = query_node;
+      while (node > 0) {
+        const int parent = (node - 1) / 2;
+        const int left = parent * 2 + 1;
+        const int right = left + 1;
+        const double parent_bound =
+            traversal_bounds[left] > traversal_bounds[right]
+                ? traversal_bounds[left]
+                : traversal_bounds[right];
+        if (parent_bound < traversal_bounds[parent]) {
+          traversal_bounds[parent] = parent_bound;
+          node = parent;
+        } else {
+          break;
+        }
+      }
+    }
+    return;
+  }
+
+  if (query.left < 0 ||
+      (reference.left >= 0 &&
+       reference.radius_squared > query.radius_squared)) {
+    const double left_distance =
+        node_box_distance_squared(tree, query_node, reference.left);
+    const double right_distance =
+        node_box_distance_squared(tree, query_node, reference.right);
+    if (left_distance < right_distance) {
+      native_dual_tree_traversal(
+          tree, query_node, reference.left, core_distances, point_components,
+          homogeneous_component, candidate_source, candidate_sink,
+          candidate_distance_squared, traversal_bounds);
+      native_dual_tree_traversal(
+          tree, query_node, reference.right, core_distances, point_components,
+          homogeneous_component, candidate_source, candidate_sink,
+          candidate_distance_squared, traversal_bounds);
+    } else {
+      native_dual_tree_traversal(
+          tree, query_node, reference.right, core_distances, point_components,
+          homogeneous_component, candidate_source, candidate_sink,
+          candidate_distance_squared, traversal_bounds);
+      native_dual_tree_traversal(
+          tree, query_node, reference.left, core_distances, point_components,
+          homogeneous_component, candidate_source, candidate_sink,
+          candidate_distance_squared, traversal_bounds);
+    }
+    return;
+  }
+
+  const double left_distance =
+      node_box_distance_squared(tree, query.left, reference_node);
+  const double right_distance =
+      node_box_distance_squared(tree, query.right, reference_node);
+  if (left_distance < right_distance) {
+    native_dual_tree_traversal(
+        tree, query.left, reference_node, core_distances, point_components,
+        homogeneous_component, candidate_source, candidate_sink,
+        candidate_distance_squared, traversal_bounds);
+    native_dual_tree_traversal(
+        tree, query.right, reference_node, core_distances, point_components,
+        homogeneous_component, candidate_source, candidate_sink,
+        candidate_distance_squared, traversal_bounds);
+  } else {
+    native_dual_tree_traversal(
+        tree, query.right, reference_node, core_distances, point_components,
+        homogeneous_component, candidate_source, candidate_sink,
+        candidate_distance_squared, traversal_bounds);
+    native_dual_tree_traversal(
+        tree, query.left, reference_node, core_distances, point_components,
+        homogeneous_component, candidate_source, candidate_sink,
+        candidate_distance_squared, traversal_bounds);
+  }
+}
+
+int build_native_approximate_kd_boruvka_mst(
+    const KdTreeView& tree, const double* core_distances,
+    const int32_t* core_neighbor_indices, int min_samples, MstEdge* edges,
+    double* traversal_bounds, int32_t* homogeneous_component,
+    int32_t* union_parent, int32_t* union_rank,
+    int32_t* point_components, int32_t* candidate_source,
+    int32_t* candidate_sink, double* candidate_distance_squared) {
+  const double infinity = std::numeric_limits<double>::infinity();
+  for (int point = 0; point < tree.count; ++point) {
+    union_parent[point] = point;
+    union_rank[point] = 0;
+    point_components[point] = point;
+    candidate_source[point] = -1;
+    candidate_sink[point] = -1;
+    candidate_distance_squared[point] = infinity;
+  }
+  for (int node = 0; node < tree.node_count; ++node) {
+    homogeneous_component[node] = -1;
+  }
+
+  // hdbscan bootstraps Boruvka from the already-computed core-neighbor
+  // query. The first neighbor whose own core distance is no greater than the
+  // query point's core distance gives an edge at exactly the query core
+  // distance.
+  for (int point = 0; point < tree.count; ++point) {
+    const double core_squared =
+        core_distances[point] * core_distances[point];
+    const int32_t* neighbors =
+        core_neighbor_indices +
+        static_cast<uint64_t>(point) * min_samples;
+    for (int neighbor_index = 0; neighbor_index < min_samples;
+         ++neighbor_index) {
+      const int neighbor = neighbors[neighbor_index];
+      const double neighbor_core_squared =
+          core_distances[neighbor] * core_distances[neighbor];
+      if (neighbor_core_squared <= core_squared) {
+        candidate_source[point] = point;
+        candidate_sink[point] = neighbor;
+        candidate_distance_squared[point] = core_squared;
+        break;
+      }
+    }
+  }
+
+  int edge_count = 0;
+  int component_count = tree.count;
+  int status = update_native_components(
+      tree, edges, &edge_count, union_parent, union_rank, point_components,
+      homogeneous_component, candidate_source, candidate_sink,
+      candidate_distance_squared, traversal_bounds, false,
+      &component_count);
+  if (status != 1) return status;
+  for (int node = 0; node < tree.node_count; ++node) {
+    traversal_bounds[node] = infinity;
+  }
+
+  int consecutive_stalls = 0;
+  while (component_count > 1) {
+    native_dual_tree_traversal(
+        tree, 0, 0, core_distances, point_components,
+        homogeneous_component, candidate_source, candidate_sink,
+        candidate_distance_squared, traversal_bounds);
+    const int previous_component_count = component_count;
+    status = update_native_components(
+        tree, edges, &edge_count, union_parent, union_rank,
+        point_components, homogeneous_component, candidate_source,
+        candidate_sink, candidate_distance_squared, traversal_bounds, true,
+        &component_count);
+    if (status != 1) return status;
+    if (component_count == previous_component_count) {
+      if (++consecutive_stalls > 1) return -3;
+    } else {
+      consecutive_stalls = 0;
+    }
+  }
+  return edge_count == tree.count - 1 ? 1 : -3;
 }
 
 void stable_sort_mst_edges(MstEdge* edges, MstEdge* temporary, int count) {
@@ -965,11 +1404,11 @@ uint32_t workspace_bytes(int count, int dimension, int min_samples,
   return bytes == 0 || bytes > UINT32_MAX ? 0 : static_cast<uint32_t>(bytes);
 }
 
-int run_f64_semantics_diagnostic(
+int run_f64_semantics_diagnostic_impl(
     const float* projection, int count, int dimension, int min_samples,
     int min_cluster_size, int32_t* labels, double* diagnostic_core_distances,
     double* diagnostic_mst_rows, void* workspace_memory,
-    uint32_t workspace_size) {
+    uint32_t workspace_size, MstProvider provider) {
   if (!projection || !labels || !workspace_memory ||
       !valid_arguments(count, dimension, min_samples, min_cluster_size)) {
     return -1;
@@ -986,6 +1425,8 @@ int run_f64_semantics_diagnostic(
 
   double* points = workspace.allocate<double>(n * dimension);
   double* core_heaps = workspace.allocate<double>(n * min_samples);
+  int32_t* core_neighbor_indices =
+      workspace.allocate<int32_t>(n * min_samples);
   int32_t* core_heap_sizes = workspace.allocate<int32_t>(n);
   double* core_distances = workspace.allocate<double>(n);
   MstEdge* mst = workspace.allocate<MstEdge>(n - 1u);
@@ -993,16 +1434,27 @@ int run_f64_semantics_diagnostic(
   double* current_distances = workspace.allocate<double>(n);
   int32_t* current_sources = workspace.allocate<int32_t>(n);
   uint8_t* in_tree = workspace.allocate<uint8_t>(n);
-  const uint64_t kd_node_count = kd_node_capacity(n);
+  const uint64_t core_kd_node_count =
+      kd_node_count(n, kCoreKdLeafSize);
+  int32_t* core_kd_indices = workspace.allocate<int32_t>(n);
+  KdNode* core_kd_nodes =
+      workspace.allocate<KdNode>(core_kd_node_count);
+  double* core_kd_bounds =
+      workspace.allocate<double>(core_kd_node_count * dimension * 2u);
+  const uint64_t boruvka_kd_node_count =
+      kd_node_count(n, kBoruvkaKdLeafSize);
   int32_t* kd_indices = workspace.allocate<int32_t>(n);
-  KdNode* kd_nodes = workspace.allocate<KdNode>(kd_node_count);
+  KdNode* kd_nodes =
+      workspace.allocate<KdNode>(boruvka_kd_node_count);
   double* kd_bounds =
-      workspace.allocate<double>(kd_node_count * dimension * 2u);
+      workspace.allocate<double>(boruvka_kd_node_count * dimension * 2u);
   double* kd_minimum_core_squared =
-      workspace.allocate<double>(kd_node_count);
+      workspace.allocate<double>(boruvka_kd_node_count);
   int32_t* kd_homogeneous_component =
-      workspace.allocate<int32_t>(kd_node_count);
+      workspace.allocate<int32_t>(boruvka_kd_node_count);
   double* kd_query_heap = workspace.allocate<double>(min_samples);
+  int32_t* kd_query_heap_indices =
+      workspace.allocate<int32_t>(min_samples);
   int32_t* boruvka_parent = workspace.allocate<int32_t>(n);
   int32_t* boruvka_rank = workspace.allocate<int32_t>(n);
   int32_t* point_components = workspace.allocate<int32_t>(n);
@@ -1031,18 +1483,20 @@ int run_f64_semantics_diagnostic(
   int32_t* label_union_parent =
       workspace.allocate<int32_t>(cluster_capacity);
   int32_t* label_union_rank = workspace.allocate<int32_t>(cluster_capacity);
-  if (!points || !core_heaps || !core_heap_sizes || !core_distances || !mst ||
-      !temporary_mst || !current_distances || !current_sources || !in_tree ||
-      !kd_indices || !kd_nodes || !kd_bounds || !kd_minimum_core_squared ||
-      !kd_homogeneous_component || !kd_query_heap || !boruvka_parent ||
-      !boruvka_rank || !point_components || !candidate_source ||
-      !candidate_sink || !candidate_distance_squared || !linkage_left ||
-      !linkage_right || !linkage_sizes || !linkage_distances ||
-      !linkage_union_parent || !linkage_union_size || !condensed ||
-      !main_queue || !subtree_queue || !ignore || !relabel || !births ||
-      !stability || !cluster_sizes || !first_child || !second_child ||
-      !is_cluster || !stack || !label_map || !label_union_parent ||
-      !label_union_rank) {
+  if (!points || !core_heaps || !core_neighbor_indices ||
+      !core_heap_sizes || !core_distances || !mst || !temporary_mst ||
+      !current_distances || !current_sources || !in_tree ||
+      !core_kd_indices || !core_kd_nodes || !core_kd_bounds || !kd_indices ||
+      !kd_nodes || !kd_bounds || !kd_minimum_core_squared ||
+      !kd_homogeneous_component || !kd_query_heap ||
+      !kd_query_heap_indices || !boruvka_parent || !boruvka_rank ||
+      !point_components || !candidate_source || !candidate_sink ||
+      !candidate_distance_squared || !linkage_left || !linkage_right ||
+      !linkage_sizes || !linkage_distances || !linkage_union_parent ||
+      !linkage_union_size || !condensed || !main_queue || !subtree_queue ||
+      !ignore || !relabel || !births || !stability || !cluster_sizes ||
+      !first_child || !second_child || !is_cluster || !stack || !label_map ||
+      !label_union_parent || !label_union_rank) {
     return -2;
   }
 
@@ -1051,13 +1505,41 @@ int run_f64_semantics_diagnostic(
     points[value] = static_cast<double>(projection[value]);
   }
   int mst_status = 1;
-  if (count >= kKdBoruvkaThreshold) {
-    if (kd_node_count > INT32_MAX) return -2;
+  if (provider == MstProvider::kNativeApproximate) {
+    if (core_kd_node_count > INT32_MAX ||
+        boruvka_kd_node_count > INT32_MAX) {
+      return -2;
+    }
+    KdTreeView core_kd_tree{};
+    KdTreeView boruvka_kd_tree{};
+    if (!build_kd_tree(
+            points, count, dimension, core_kd_indices, core_kd_nodes,
+            core_kd_bounds, static_cast<int>(core_kd_node_count),
+            &core_kd_tree) ||
+        !calculate_core_distances_kd(
+            core_kd_tree, min_samples, kd_query_heap,
+            kd_query_heap_indices, core_distances,
+            core_neighbor_indices) ||
+        !build_kd_tree(
+            points, count, dimension, kd_indices, kd_nodes, kd_bounds,
+            static_cast<int>(boruvka_kd_node_count),
+            &boruvka_kd_tree)) {
+      return -3;
+    }
+    mst_status = build_native_approximate_kd_boruvka_mst(
+        boruvka_kd_tree, core_distances, core_neighbor_indices, min_samples,
+        mst, kd_minimum_core_squared, kd_homogeneous_component,
+        boruvka_parent, boruvka_rank, point_components, candidate_source,
+        candidate_sink, candidate_distance_squared);
+  } else if (count >= kKdBoruvkaThreshold) {
+    if (boruvka_kd_node_count > INT32_MAX) return -2;
     KdTreeView kd_tree{};
     if (!build_kd_tree(points, count, dimension, kd_indices, kd_nodes,
-                       kd_bounds, static_cast<int>(kd_node_count), &kd_tree) ||
-        !calculate_core_distances_kd(kd_tree, min_samples, kd_query_heap,
-                                     core_distances)) {
+                       kd_bounds,
+                       static_cast<int>(boruvka_kd_node_count), &kd_tree) ||
+        !calculate_core_distances_kd(
+            kd_tree, min_samples, kd_query_heap, kd_query_heap_indices,
+            core_distances, nullptr)) {
       return -3;
     }
     mst_status = build_kd_boruvka_mst(
@@ -1097,6 +1579,28 @@ int run_f64_semantics_diagnostic(
       condensed, condensed_size, count, labels, births, stability,
       cluster_sizes, first_child, second_child, is_cluster, stack, label_map,
       label_union_parent, label_union_rank);
+}
+
+int run_f64_semantics_diagnostic(
+    const float* projection, int count, int dimension, int min_samples,
+    int min_cluster_size, int32_t* labels, double* diagnostic_core_distances,
+    double* diagnostic_mst_rows, void* workspace_memory,
+    uint32_t workspace_size) {
+  return run_f64_semantics_diagnostic_impl(
+      projection, count, dimension, min_samples, min_cluster_size, labels,
+      diagnostic_core_distances, diagnostic_mst_rows, workspace_memory,
+      workspace_size, MstProvider::kNativeApproximate);
+}
+
+int run_f64_semantics_exact_diagnostic(
+    const float* projection, int count, int dimension, int min_samples,
+    int min_cluster_size, int32_t* labels, double* diagnostic_core_distances,
+    double* diagnostic_mst_rows, void* workspace_memory,
+    uint32_t workspace_size) {
+  return run_f64_semantics_diagnostic_impl(
+      projection, count, dimension, min_samples, min_cluster_size, labels,
+      diagnostic_core_distances, diagnostic_mst_rows, workspace_memory,
+      workspace_size, MstProvider::kCheckpointExact);
 }
 
 int run_f64_semantics(const float* projection, int count, int dimension,

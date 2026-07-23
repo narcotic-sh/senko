@@ -6,7 +6,9 @@
 #include <emscripten/emscripten.h>
 
 #include "hdbscan.hpp"
+#include "umap_fuzzy_graph.h"
 #include "umap_neighbors.h"
+#include "umap_spectral.hpp"
 
 namespace {
 
@@ -673,6 +675,76 @@ EMSCRIPTEN_KEEPALIVE int cluster_umap_cosine_knn(
                    values, count, dimension, neighbor_count, options,
                    workspace, workspace_size, output_indices,
                    output_distances);
+}
+
+EMSCRIPTEN_KEEPALIVE uint32_t cluster_umap_fuzzy_workspace_bytes(
+    int count, int neighbor_count) {
+  const size_t bytes =
+      senko::umap_fuzzy_graph::WorkspaceBytes(count, neighbor_count);
+  return bytes <= UINT32_MAX ? static_cast<uint32_t>(bytes) : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE uint32_t cluster_umap_fuzzy_max_entries(
+    int count, int neighbor_count) {
+  const size_t entries =
+      senko::umap_fuzzy_graph::MaximumCsrEntries(count, neighbor_count);
+  return entries <= UINT32_MAX ? static_cast<uint32_t>(entries) : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE int cluster_umap_fuzzy_graph(
+    const int32_t* knn_indices, const float* knn_distances, int count,
+    int neighbor_count, float* output_sigmas, float* output_rhos,
+    int32_t* output_row_offsets, int32_t* output_column_indices,
+    float* output_values, uint32_t* output_entry_count) {
+  if (!output_entry_count) return -1;
+  const uint32_t workspace_size =
+      cluster_umap_fuzzy_workspace_bytes(count, neighbor_count);
+  const uint32_t output_capacity =
+      cluster_umap_fuzzy_max_entries(count, neighbor_count);
+  if (workspace_size == 0 || output_capacity == 0) return -1;
+  void* const workspace = allocate_bytes(workspace_size, 16u);
+  if (!workspace) return -2;
+  size_t entry_count = 0;
+  const int status = senko::umap_fuzzy_graph::BuildCsr(
+      knn_indices, knn_distances, count, neighbor_count, workspace,
+      workspace_size, output_sigmas, output_rhos, output_row_offsets,
+      output_column_indices, output_values, output_capacity, &entry_count);
+  if (status != senko::umap_fuzzy_graph::kSuccess) return status;
+  if (entry_count > UINT32_MAX) return -4;
+  *output_entry_count = static_cast<uint32_t>(entry_count);
+  return 1;
+}
+
+EMSCRIPTEN_KEEPALIVE int cluster_umap_spectral(
+    const int32_t* row_offsets, const int32_t* column_indices,
+    const float* values, int count, int edge_count, int dimension,
+    double* output_vectors, double* output_eigenvalues,
+    int32_t* output_integer_stats, double* output_numeric_stats,
+    uint32_t* output_peak_working_bytes) {
+  if (!output_integer_stats || !output_numeric_stats ||
+      !output_peak_working_bytes) {
+    return -1;
+  }
+  senko::umap_spectral::Options options;
+  senko::umap_spectral::Stats stats;
+  const senko::umap_spectral::Status status =
+      senko::umap_spectral::initialize_connected_graph(
+          row_offsets, column_indices, values, count, edge_count, dimension,
+          output_vectors, output_eigenvalues, options, &stats);
+  if (status != senko::umap_spectral::Status::kSuccess) {
+    return static_cast<int>(status);
+  }
+  if (stats.peak_working_bytes > UINT32_MAX) return -1;
+  output_integer_stats[0] = stats.requested_eigenpairs;
+  output_integer_stats[1] = stats.basis_size;
+  output_integer_stats[2] = stats.restart_count;
+  output_integer_stats[3] = stats.converged_eigenpairs;
+  output_numeric_stats[0] = stats.maximum_residual;
+  output_numeric_stats[1] = stats.smallest_eigenvalue;
+  output_numeric_stats[2] = stats.largest_returned_eigenvalue;
+  *output_peak_working_bytes =
+      static_cast<uint32_t>(stats.peak_working_bytes);
+  return 1;
 }
 
 EMSCRIPTEN_KEEPALIVE uint32_t cluster_hdbscan_workspace_bytes(

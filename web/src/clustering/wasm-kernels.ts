@@ -17,6 +17,29 @@ export interface NativeUmapKnnGraph {
   readonly neighborCount: number;
 }
 
+export interface NativeUmapFuzzyGraph {
+  readonly rowOffsets: Int32Array;
+  readonly columnIndices: Int32Array;
+  readonly values: Float32Array;
+  readonly sigmas: Float32Array;
+  readonly rhos: Float32Array;
+}
+
+export interface NativeUmapSpectralEmbedding {
+  readonly values: Float64Array;
+  readonly eigenvalues: Float64Array;
+  readonly stats: {
+    readonly requestedEigenpairs: number;
+    readonly basisSize: number;
+    readonly restartCount: number;
+    readonly convergedEigenpairs: number;
+    readonly maximumResidual: number;
+    readonly smallestEigenvalue: number;
+    readonly largestReturnedEigenvalue: number;
+    readonly peakWorkingBytes: number;
+  };
+}
+
 let compiledModule: Promise<WebAssembly.Module> | undefined;
 const clusteringWasmImports = {
   env: {
@@ -88,6 +111,39 @@ interface ClusteringWasmExports extends WebAssembly.Exports {
     randomSeed: number,
     outputIndices: number,
     outputDistances: number,
+  ) => number;
+  readonly cluster_umap_fuzzy_workspace_bytes: (
+    count: number,
+    neighborCount: number,
+  ) => number;
+  readonly cluster_umap_fuzzy_max_entries: (
+    count: number,
+    neighborCount: number,
+  ) => number;
+  readonly cluster_umap_fuzzy_graph: (
+    knnIndices: number,
+    knnDistances: number,
+    count: number,
+    neighborCount: number,
+    outputSigmas: number,
+    outputRhos: number,
+    outputRowOffsets: number,
+    outputColumnIndices: number,
+    outputValues: number,
+    outputEntryCount: number,
+  ) => number;
+  readonly cluster_umap_spectral: (
+    rowOffsets: number,
+    columnIndices: number,
+    values: number,
+    count: number,
+    edgeCount: number,
+    dimension: number,
+    outputVectors: number,
+    outputEigenvalues: number,
+    outputIntegerStats: number,
+    outputNumericStats: number,
+    outputPeakWorkingBytes: number,
   ) => number;
   readonly cluster_hdbscan_workspace_bytes: (
     count: number,
@@ -583,10 +639,270 @@ export class WasmClusteringKernels implements ClusteringNumericKernels {
     };
   }
 
+  /** Native UMAP smooth-kNN membership strengths and fuzzy-union CSR graph. */
+  buildNativeUmapFuzzyGraph(
+    knn: NativeUmapKnnGraph,
+    count: number,
+  ): NativeUmapFuzzyGraph {
+    const neighborCount = knn.neighborCount;
+    const inputLength = checkedElementCount(
+      "native UMAP fuzzy k-NN input",
+      count,
+      neighborCount,
+    );
+    if (
+      knn.indices.length !== inputLength ||
+      knn.distances.length !== inputLength
+    ) {
+      throw new RangeError("native UMAP fuzzy k-NN arrays have invalid lengths");
+    }
+    const exports = this.requireExports();
+    const workspaceBytes = exports.cluster_umap_fuzzy_workspace_bytes(
+      count,
+      neighborCount,
+    );
+    const maximumEntries = exports.cluster_umap_fuzzy_max_entries(
+      count,
+      neighborCount,
+    );
+    if (workspaceBytes === 0 || maximumEntries === 0) {
+      throw new RangeError(
+        "native UMAP fuzzy graph dimensions are unsupported",
+      );
+    }
+    const operationExports = this.beginOperation(
+      nativeUmapFuzzyArenaBytes(
+        count,
+        neighborCount,
+        workspaceBytes,
+        maximumEntries,
+      ),
+    );
+    const indicesPointer = this.copyInt32(operationExports, knn.indices);
+    const distancesPointer = this.copyFloat32(
+      operationExports,
+      knn.distances,
+    );
+    const sigmasPointer = this.allocate(
+      operationExports,
+      count * Float32Array.BYTES_PER_ELEMENT,
+      Float32Array.BYTES_PER_ELEMENT,
+    );
+    const rhosPointer = this.allocate(
+      operationExports,
+      count * Float32Array.BYTES_PER_ELEMENT,
+      Float32Array.BYTES_PER_ELEMENT,
+    );
+    const rowOffsetsPointer = this.allocate(
+      operationExports,
+      (count + 1) * Int32Array.BYTES_PER_ELEMENT,
+      Int32Array.BYTES_PER_ELEMENT,
+    );
+    const columnIndicesPointer = this.allocate(
+      operationExports,
+      maximumEntries * Int32Array.BYTES_PER_ELEMENT,
+      Int32Array.BYTES_PER_ELEMENT,
+    );
+    const valuesPointer = this.allocate(
+      operationExports,
+      maximumEntries * Float32Array.BYTES_PER_ELEMENT,
+      Float32Array.BYTES_PER_ELEMENT,
+    );
+    const entryCountPointer = this.allocate(
+      operationExports,
+      Uint32Array.BYTES_PER_ELEMENT,
+      Uint32Array.BYTES_PER_ELEMENT,
+    );
+    this.requireSuccess(
+      "native UMAP fuzzy graph",
+      operationExports.cluster_umap_fuzzy_graph(
+        indicesPointer,
+        distancesPointer,
+        count,
+        neighborCount,
+        sigmasPointer,
+        rhosPointer,
+        rowOffsetsPointer,
+        columnIndicesPointer,
+        valuesPointer,
+        entryCountPointer,
+      ),
+      operationExports,
+    );
+    const memory = new Uint32Array(operationExports.memory.buffer);
+    const entryCount =
+      memory[entryCountPointer / Uint32Array.BYTES_PER_ELEMENT]!;
+    if (entryCount > maximumEntries) {
+      throw new Error("native UMAP fuzzy graph returned an invalid edge count");
+    }
+    this.observeReturnedJsBytes(
+      (count * 2 + entryCount) * Float32Array.BYTES_PER_ELEMENT +
+        (count + 1 + entryCount) * Int32Array.BYTES_PER_ELEMENT,
+    );
+    return {
+      rowOffsets: this.copyInt32Result(
+        operationExports,
+        rowOffsetsPointer,
+        count + 1,
+      ),
+      columnIndices: this.copyInt32Result(
+        operationExports,
+        columnIndicesPointer,
+        entryCount,
+      ),
+      values: this.copyFloat32Result(
+        operationExports,
+        valuesPointer,
+        entryCount,
+      ),
+      sigmas: this.copyFloat32Result(
+        operationExports,
+        sigmasPointer,
+        count,
+      ),
+      rhos: this.copyFloat32Result(
+        operationExports,
+        rhosPointer,
+        count,
+      ),
+    };
+  }
+
+  /**
+   * Native UMAP connected-graph spectral initialization. The graph must
+   * already have UMAP's max-weight / epoch cutoff compacted out.
+   */
+  initializeNativeUmapSpectral(
+    graph: Pick<
+      NativeUmapFuzzyGraph,
+      "rowOffsets" | "columnIndices" | "values"
+    >,
+    count: number,
+    dimension: number,
+  ): NativeUmapSpectralEmbedding {
+    if (
+      !Number.isSafeInteger(count) ||
+      count < 3 ||
+      !Number.isSafeInteger(dimension) ||
+      dimension < 1 ||
+      dimension > count - 2 ||
+      graph.rowOffsets.length !== count + 1 ||
+      graph.columnIndices.length !== graph.values.length
+    ) {
+      throw new RangeError("native UMAP spectral graph shape is invalid");
+    }
+    const edgeCount = graph.values.length;
+    if (
+      graph.rowOffsets[0] !== 0 ||
+      graph.rowOffsets[count] !== edgeCount
+    ) {
+      throw new RangeError("native UMAP spectral CSR offsets are invalid");
+    }
+    const outputLength = checkedElementCount(
+      "native UMAP spectral output",
+      count,
+      dimension,
+    );
+    const operationExports = this.beginOperation(
+      nativeUmapSpectralArenaBytes(count, dimension, edgeCount),
+    );
+    const rowOffsetsPointer = this.copyInt32(
+      operationExports,
+      graph.rowOffsets,
+    );
+    const columnIndicesPointer = this.copyInt32(
+      operationExports,
+      graph.columnIndices,
+    );
+    const valuesPointer = this.copyFloat32(operationExports, graph.values);
+    const vectorsPointer = this.allocate(
+      operationExports,
+      outputLength * Float64Array.BYTES_PER_ELEMENT,
+      Float64Array.BYTES_PER_ELEMENT,
+    );
+    const eigenvaluesPointer = this.allocate(
+      operationExports,
+      dimension * Float64Array.BYTES_PER_ELEMENT,
+      Float64Array.BYTES_PER_ELEMENT,
+    );
+    const integerStatsPointer = this.allocate(
+      operationExports,
+      4 * Int32Array.BYTES_PER_ELEMENT,
+      Int32Array.BYTES_PER_ELEMENT,
+    );
+    const numericStatsPointer = this.allocate(
+      operationExports,
+      3 * Float64Array.BYTES_PER_ELEMENT,
+      Float64Array.BYTES_PER_ELEMENT,
+    );
+    const peakWorkingBytesPointer = this.allocate(
+      operationExports,
+      Uint32Array.BYTES_PER_ELEMENT,
+      Uint32Array.BYTES_PER_ELEMENT,
+    );
+    this.requireSuccess(
+      "native UMAP spectral initialization",
+      operationExports.cluster_umap_spectral(
+        rowOffsetsPointer,
+        columnIndicesPointer,
+        valuesPointer,
+        count,
+        edgeCount,
+        dimension,
+        vectorsPointer,
+        eigenvaluesPointer,
+        integerStatsPointer,
+        numericStatsPointer,
+        peakWorkingBytesPointer,
+      ),
+      operationExports,
+    );
+    const integerStats = checkedInt32View(
+      operationExports.memory,
+      integerStatsPointer,
+      4,
+    );
+    const numericStats = checkedFloat64View(
+      operationExports.memory,
+      numericStatsPointer,
+      3,
+    );
+    const peakWorkingBytes = new Uint32Array(
+      operationExports.memory.buffer,
+      peakWorkingBytesPointer,
+      1,
+    )[0]!;
+    this.observeReturnedJsBytes(
+      (outputLength + dimension) * Float64Array.BYTES_PER_ELEMENT,
+    );
+    return {
+      values: this.copyFloat64Result(
+        operationExports,
+        vectorsPointer,
+        outputLength,
+      ),
+      eigenvalues: this.copyFloat64Result(
+        operationExports,
+        eigenvaluesPointer,
+        dimension,
+      ),
+      stats: {
+        requestedEigenpairs: integerStats[0]!,
+        basisSize: integerStats[1]!,
+        restartCount: integerStats[2]!,
+        convergedEigenpairs: integerStats[3]!,
+        maximumResidual: numericStats[0]!,
+        smallestEigenvalue: numericStats[1]!,
+        largestReturnedEigenvalue: numericStats[2]!,
+        peakWorkingBytes,
+      },
+    };
+  }
+
   /**
    * Native-compatible HDBSCAN 0.8.44 Float64 hierarchy semantics. The exact
-   * KD-tree/Boruvka provider is still parity-gated and is not selected by the
-   * production pipeline until the native UMAP path is ready.
+   * core-distance and native approximate-Boruvka provider remains gated from
+   * production until the native UMAP path is ready.
    */
   clusterHdbscanF64Semantics(
     projection: Float32Array,
@@ -1068,6 +1384,63 @@ function nativeUmapKnnArenaBytes(
   sizer.add(BigInt(outputLength), 4n, 4n);
   sizer.add(BigInt(outputLength), 4n, 4n);
   sizer.add(BigInt(workspaceBytes), 1n, 16n);
+  return sizer.bytes();
+}
+
+function nativeUmapFuzzyArenaBytes(
+  count: number,
+  neighborCount: number,
+  workspaceBytes: number,
+  maximumEntries: number,
+): number {
+  const inputLength = checkedElementCount(
+    "native UMAP fuzzy k-NN input",
+    count,
+    neighborCount,
+  );
+  checkedElementCount("native UMAP fuzzy maximum entries", maximumEntries);
+  if (
+    !Number.isSafeInteger(workspaceBytes) ||
+    workspaceBytes <= 0 ||
+    workspaceBytes > UINT32_MAX
+  ) {
+    throw new RangeError(
+      `native UMAP fuzzy workspace ${workspaceBytes} is outside the wasm32 address range`,
+    );
+  }
+  const sizer = new ArenaSizer();
+  sizer.add(BigInt(inputLength), 4n, 4n);
+  sizer.add(BigInt(inputLength), 4n, 4n);
+  sizer.add(BigInt(count), 4n, 4n);
+  sizer.add(BigInt(count), 4n, 4n);
+  sizer.add(BigInt(count + 1), 4n, 4n);
+  sizer.add(BigInt(maximumEntries), 4n, 4n);
+  sizer.add(BigInt(maximumEntries), 4n, 4n);
+  sizer.add(1n, 4n, 4n);
+  sizer.add(BigInt(workspaceBytes), 1n, 16n);
+  return sizer.bytes();
+}
+
+function nativeUmapSpectralArenaBytes(
+  count: number,
+  dimension: number,
+  edgeCount: number,
+): number {
+  const outputLength = checkedElementCount(
+    "native UMAP spectral output",
+    count,
+    dimension,
+  );
+  checkedElementCount("native UMAP spectral edges", edgeCount);
+  const sizer = new ArenaSizer();
+  sizer.add(BigInt(count + 1), 4n, 4n);
+  sizer.add(BigInt(edgeCount), 4n, 4n);
+  sizer.add(BigInt(edgeCount), 4n, 4n);
+  sizer.add(BigInt(outputLength), 8n, 8n);
+  sizer.add(BigInt(dimension), 8n, 8n);
+  sizer.add(4n, 4n, 4n);
+  sizer.add(3n, 8n, 8n);
+  sizer.add(1n, 4n, 4n);
   return sizer.bytes();
 }
 

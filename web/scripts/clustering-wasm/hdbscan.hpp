@@ -17,10 +17,11 @@ uint32_t workspace_bytes(int count, int dimension, int min_samples,
 //   * allow_single_cluster = false
 //   * cluster_selection_epsilon = 0
 //
-// Inputs with at least 1,024 rows use an exact KD-tree/Boruvka provider;
-// smaller inputs retain the implicit complete-graph Prim implementation as a
-// compact correctness oracle. Both feed the same condensed-tree and label
-// implementation.
+// The production provider matches native hdbscan 0.8.44's boruvka_kdtree
+// path: leaf-40 core-distance query, leaf-13 dual-tree traversal, core-kNN
+// bootstrap, and approx_min_span_tree=true's persisted node bounds with reset
+// only when a round stalls. It feeds the shared condensed-tree and label
+// implementation below.
 //
 // Returns 1 on success, -1 for invalid arguments, -2 when the supplied
 // workspace is too small, and -3 if an internal tree invariant is violated.
@@ -33,6 +34,14 @@ int run_f64_semantics(const float* projection, int count, int dimension,
 // endpoints are represented exactly as Float64 values to match the upstream
 // fixture format.
 int run_f64_semantics_diagnostic(
+    const float* projection, int count, int dimension, int min_samples,
+    int min_cluster_size, int32_t* labels, double* core_distances,
+    double* mst_rows, void* workspace, uint32_t workspace_size);
+
+// Exact diagnostic oracle retained for differential testing. It uses an exact
+// KD-tree/Boruvka provider for inputs with at least 1,024 rows and an implicit
+// complete-graph Prim provider for smaller inputs.
+int run_f64_semantics_exact_diagnostic(
     const float* projection, int count, int dimension, int min_samples,
     int min_cluster_size, int32_t* labels, double* core_distances,
     double* mst_rows, void* workspace, uint32_t workspace_size);

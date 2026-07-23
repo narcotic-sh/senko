@@ -57,6 +57,7 @@ LITTLE_ENDIAN_DTYPES = {
     "float32": np.dtype("<f4"),
     "float64": np.dtype("<f8"),
     "int32": np.dtype("<i4"),
+    "int64": np.dtype("<i8"),
 }
 
 
@@ -242,7 +243,7 @@ def run_umap(
     config: dict[str, Any],
     *,
     random_state: int | None,
-) -> tuple[umap.UMAP, np.ndarray, float]:
+) -> tuple[umap.UMAP, np.ndarray, dict[str, np.ndarray], float]:
     components = min(int(config["n_components"]), embeddings.shape[0] - 2)
     # random_state makes UMAP's optimizer deterministic and disables parallel
     # execution. Setting n_jobs=1 explicitly avoids an avoidable warning while
@@ -256,16 +257,66 @@ def run_umap(
         random_state=random_state,
         n_jobs=n_jobs,
     )
-    started = time.perf_counter()
-    projection = model.fit_transform(embeddings)
-    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    captures: dict[str, np.ndarray] = {}
+    umap_module = importlib.import_module("umap.umap_")
+    native_spectral_layout = umap_module.spectral_layout
+    native_optimize_layout = umap_module.optimize_layout_euclidean
+
+    def capture_spectral_layout(*args: Any, **kwargs: Any) -> np.ndarray:
+        result = native_spectral_layout(*args, **kwargs)
+        captures["spectralEmbedding"] = np.ascontiguousarray(
+            result, dtype=np.float64
+        )
+        return result
+
+    def capture_optimize_layout(*args: Any, **kwargs: Any) -> np.ndarray:
+        if len(args) < 10:
+            raise AssertionError("Unexpected optimize_layout_euclidean call")
+        captures["layoutInitialEmbedding"] = np.ascontiguousarray(
+            args[0], dtype=np.float32
+        ).copy()
+        captures["layoutHead"] = np.ascontiguousarray(
+            args[2], dtype=np.int32
+        ).copy()
+        captures["layoutTail"] = np.ascontiguousarray(
+            args[3], dtype=np.int32
+        ).copy()
+        captures["layoutEpochsPerSample"] = np.ascontiguousarray(
+            args[6], dtype=np.float64
+        ).copy()
+        captures["layoutRngState"] = np.ascontiguousarray(
+            args[9], dtype=np.int64
+        ).copy()
+        return native_optimize_layout(*args, **kwargs)
+
+    umap_module.spectral_layout = capture_spectral_layout
+    umap_module.optimize_layout_euclidean = capture_optimize_layout
+    try:
+        started = time.perf_counter()
+        projection = model.fit_transform(embeddings)
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+    finally:
+        umap_module.spectral_layout = native_spectral_layout
+        umap_module.optimize_layout_euclidean = native_optimize_layout
     if projection.dtype != np.float32:
         raise AssertionError(f"Unexpected UMAP output dtype {projection.dtype}")
     if projection.shape != (embeddings.shape[0], components):
         raise AssertionError(f"Unexpected UMAP output shape {projection.shape}")
     if not np.isfinite(projection).all():
         raise AssertionError("UMAP projection contains non-finite values")
-    return model, np.ascontiguousarray(projection), elapsed_ms
+    expected_captures = {
+        "spectralEmbedding",
+        "layoutInitialEmbedding",
+        "layoutHead",
+        "layoutTail",
+        "layoutEpochsPerSample",
+        "layoutRngState",
+    }
+    if captures.keys() != expected_captures:
+        raise AssertionError(
+            f"Missing UMAP layout captures: {sorted(expected_captures - captures.keys())}"
+        )
+    return model, np.ascontiguousarray(projection), captures, elapsed_ms
 
 
 def run_native_hdbscan_stages(
@@ -502,7 +553,7 @@ def write_fixture(
 
     generated_at = datetime.now(UTC).isoformat()
     total_started = time.perf_counter()
-    umap_model, projection, umap_ms = run_umap(
+    umap_model, projection, umap_captures, umap_ms = run_umap(
         embeddings, config, random_state=random_state
     )
     hdb_arrays, hdb_validations, hdb_ms = run_native_hdbscan_stages(
@@ -540,6 +591,42 @@ def write_fixture(
         projection,
         "float32",
         columns=[f"component-{index}" for index in range(projection.shape[1])],
+    )
+    add(
+        "umapSpectralEmbedding",
+        "umap-spectral-embedding.f64",
+        umap_captures["spectralEmbedding"],
+        "float64",
+    )
+    add(
+        "umapLayoutInitialEmbedding",
+        "umap-layout-initial-embedding.f32",
+        umap_captures["layoutInitialEmbedding"],
+        "float32",
+    )
+    add(
+        "umapLayoutHead",
+        "umap-layout-head.i32",
+        umap_captures["layoutHead"],
+        "int32",
+    )
+    add(
+        "umapLayoutTail",
+        "umap-layout-tail.i32",
+        umap_captures["layoutTail"],
+        "int32",
+    )
+    add(
+        "umapLayoutEpochsPerSample",
+        "umap-layout-epochs-per-sample.f64",
+        umap_captures["layoutEpochsPerSample"],
+        "float64",
+    )
+    add(
+        "umapLayoutRngState",
+        "umap-layout-rng-state.i64",
+        umap_captures["layoutRngState"],
+        "int64",
     )
     graph = umap_model.graph_.tocsr()
     add("umapGraphIndptr", "umap-graph-indptr.i32", graph.indptr, "int32")

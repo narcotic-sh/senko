@@ -60,6 +60,9 @@ The main artifacts are:
 
 - UMAP projection, fuzzy-graph CSR arrays, sigmas/rhos, and (when retained by
   `umap-learn`) the native k-NN arrays.
+- The connected-graph spectral embedding and the exact input state handed to
+  UMAP's layout optimizer: initial Float32 coordinates, row-major COO edges,
+  Float64 sample clocks, and the three-word base RNG state.
 - HDBSCAN Euclidean core distances and its internal squared-distance values.
 - The sorted approximate Borůvka KD-tree MST, single-linkage tree, condensed
   tree, probabilities, stability scores, and raw noise-preserving labels.

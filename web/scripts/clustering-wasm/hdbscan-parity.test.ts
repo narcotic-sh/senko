@@ -66,7 +66,7 @@ describe("HDBSCAN native parity", () => {
   );
 
   diagnosticIt(
-    "matches one-hour native core distances and reports MST topology drift",
+    "matches one-hour native core distances and approximate MST exactly",
     async () => {
       const fixture = await loadHdbscanParityFixture(
         new URL(
@@ -136,13 +136,9 @@ describe("HDBSCAN native parity", () => {
           }),
         );
         expect(coreParity.mismatchCount).toBe(0);
-        // The browser provider deliberately computes an exact Boruvka MST,
-        // while native Senko currently accepts hdbscan's approximate-MST
-        // shortcut. Record that intermediate drift explicitly; the fixed
-        // projection must nevertheless retain the exact flat partition and
-        // noise mask below.
-        expect(mstParity.exactEndpoints).toBe(false);
-        expect(mstWeightMultisetParity.maxRelativeError).toBeLessThan(0.03);
+        expect(mstParity.exactEndpoints).toBe(true);
+        expect(mstParity.weights.mismatchCount).toBe(0);
+        expect(mstWeightMultisetParity.mismatchCount).toBe(0);
         expect(labels.exactPartition).toBe(true);
         expect(labels.exactNoiseMask).toBe(true);
       } finally {
