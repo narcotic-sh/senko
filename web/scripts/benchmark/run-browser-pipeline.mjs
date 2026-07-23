@@ -241,6 +241,7 @@ export function summarizePipelineRun(result, exactResultCapture) {
   }
 
   const stagesMs = {};
+  const stageMetrics = {};
   if (result.stages.length !== REQUIRED_STAGES.length) {
     throw new Error(
       `Pipeline result must contain exactly ${REQUIRED_STAGES.length} stages`,
@@ -259,6 +260,7 @@ export function summarizePipelineRun(result, exactResultCapture) {
       throw new Error("The page returned a malformed stage result");
     }
     stagesMs[stage.stage] = stage.elapsedMs;
+    stageMetrics[stage.stage] = stage.metrics;
   }
   if (!REQUIRED_STAGES.every((stage) => Object.hasOwn(stagesMs, stage))) {
     throw new Error("Pipeline result is missing a required stage");
@@ -312,6 +314,7 @@ export function summarizePipelineRun(result, exactResultCapture) {
   return {
     wallMs: result.totalElapsedMs,
     stagesMs,
+    stageMetrics,
     stageAttributedTotalMs: Object.values(stagesMs).reduce(
       (sum, elapsedMs) => sum + elapsedMs,
       0,

@@ -95,6 +95,21 @@ export interface ClusteringStageMetrics {
    * non-negative integer, so it is not reported here as raw HDBSCAN noise.
    */
   readonly noiseCount: number;
+  readonly nativeUmap?: {
+    readonly count: number;
+    readonly outputDimension: number;
+    readonly epochCount: number;
+    readonly retainedEdgeCount: number;
+    readonly neighborMs: number;
+    readonly fuzzyGraphMs: number;
+    readonly spectralMs: number;
+    readonly initializationMs: number;
+    readonly layoutMs: number;
+    readonly hdbscanMs: number;
+    readonly layoutWorkerCount: number;
+    readonly layoutSharedMemoryBytes: number;
+    readonly peakWorkingBytes: number;
+  };
 }
 
 export interface PostprocessStageMetrics {

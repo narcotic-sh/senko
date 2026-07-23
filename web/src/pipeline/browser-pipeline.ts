@@ -633,6 +633,9 @@ export async function runBrowserPipeline(
       );
     };
     let labels: Int32Array;
+    let nativeUmapStats:
+      | NativeUmapThreadedResult["stats"]
+      | undefined;
     try {
       if (clusteringAlgorithm === "spectral") {
         labels = clusterEmbeddingsSpectral(
@@ -653,6 +656,7 @@ export async function runBrowserPipeline(
           hooks.signal,
         );
         labels = native.labels;
+        nativeUmapStats = native.stats;
         recordClusteringMemory(native.stats.peakWorkingBytes);
       } else {
         labels = clusterEmbeddings(
@@ -697,6 +701,9 @@ export async function runBrowserPipeline(
         algorithm: clusteringAlgorithm,
         clusterCount: labelStats.clusterCount,
         noiseCount: labelStats.noiseCount,
+        ...(nativeUmapStats === undefined
+          ? {}
+          : { nativeUmap: nativeUmapStats }),
       },
     };
     completeStage(clusteringResult, stages, hooks);
