@@ -853,6 +853,8 @@ class Diarizer:
         return raw_segments, merged_segments, centroids
 
     def _merge_segments(self, segments):
+        # Copy each dictionary so merging does not mutate the raw segments returned to the caller.
+        segments = [segment.copy() for segment in segments]
         merged_segments = []
         current_segment = None
 
